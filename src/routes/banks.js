@@ -281,7 +281,11 @@ banksRouter.get('/', async (req, res, next) => {
 
     const result = await fetchBankList({ includeInactive, includeProducts, loanTypeFilter });
 
-    res.set('Cache-Control', 'public, max-age=60, stale-while-revalidate=120');
+    if (includeInactive) {
+      res.set('Cache-Control', 'private, no-cache, no-store, must-revalidate');
+    } else {
+      res.set('Cache-Control', 'public, max-age=60, stale-while-revalidate=120');
+    }
     res.json(result);
   } catch (err) {
     next(err);
