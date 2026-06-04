@@ -67,6 +67,29 @@ export async function ensureStaffExtrasSchema() {
     ) ON DUPLICATE KEY UPDATE id = id
   `);
 
+  const commissionAlters = [
+    'ADD COLUMN agent_code VARCHAR(64) NULL AFTER agent_user_id',
+    'ADD COLUMN agent_name VARCHAR(255) NULL AFTER agent_code',
+    'ADD COLUMN circular_title VARCHAR(255) NULL AFTER effective_to',
+    'ADD COLUMN circular_file_url TEXT NULL AFTER circular_title',
+  ];
+  for (const ddl of commissionAlters) {
+    try {
+      await pool.execute(`ALTER TABLE agent_commission_config ${ddl}`);
+    } catch (err) {
+      if (err.code !== 'ER_DUP_FIELDNAME') throw err;
+    }
+  }
+
+  try {
+    await pool.execute(
+      `ALTER TABLE agent_commission_config
+       ADD UNIQUE KEY uq_agent_commission_agent_loan (agent_user_id, loan_type)`,
+    );
+  } catch (err) {
+    if (err.code !== 'ER_DUP_KEYNAME') throw err;
+  }
+
   await pool.execute(`
     CREATE TABLE IF NOT EXISTS agent_commission_circulars (
       id CHAR(36) NOT NULL,

@@ -52,9 +52,8 @@ function computeRowCommission(row, config) {
 export async function buildAgentCommissionReport(agentId, filters = {}) {
   await ensureMilestone4Schema();
   const pool = getPool();
-  const [[config]] = await pool.execute(
-    `SELECT * FROM global_commission_config WHERE id = 'default' LIMIT 1`,
-  );
+  const { resolveAgentCommissionConfig } = await import('./agentCommission.js');
+  const config = await resolveAgentCommissionConfig(pool, agentId);
 
   const conditions = ['la.agent_id = :agentId'];
   const params = { agentId };

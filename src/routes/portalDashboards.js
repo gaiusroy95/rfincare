@@ -83,9 +83,8 @@ portalDashboardsRouter.get('/agent/dashboard', authenticate, async (req, res, ne
     const conversionRate = total > 0 ? Math.round((approved / total) * 100) : 0;
 
     await ensureStaffExtrasSchema();
-    const [[commissionConfig]] = await pool.execute(
-      `SELECT * FROM global_commission_config WHERE id = 'default' LIMIT 1`,
-    );
+    const { resolveAgentCommissionConfig } = await import('../lib/agentCommission.js');
+    const commissionConfig = await resolveAgentCommissionConfig(pool, agentId);
 
     const commissionEntries = apps.map((row) => {
       const data = typeof row.data === 'string' ? JSON.parse(row.data || '{}') : row.data || {};

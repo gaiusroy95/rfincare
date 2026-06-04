@@ -1,12 +1,12 @@
 import { Router } from 'express';
 import multer from 'multer';
-import { mkdirSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { basename, resolve } from 'node:path';
 
 import { getPool } from '../db/pool.js';
 import { ensureOnboardingSchema } from '../db/ensureOnboardingSchema.js';
 import { createAgentAccount, createEmployeeAccount } from '../lib/staffOnboarding.js';
-import { backfillMissingAgentCodes } from '../lib/agentCode.js';
+import { backfillMissingAgentCodes, ensureAgentCodeForUser } from '../lib/agentCode.js';
 import { ensureMilestone3Schema } from '../db/ensureMilestone3Schema.js';
 import { assignUniqueCustomerCode } from '../lib/customerCode.js';
 import { writeAuditLog } from '../lib/audit.js';
@@ -24,6 +24,14 @@ import {
   updateEmployeeDetails,
   resetStaffPassword,
 } from '../lib/adminStaffManage.js';
+import { parseCsvToRows } from '../lib/parseCsv.js';
+import {
+  buildAgentCommissionTemplateCsv,
+  importAgentCommissionRows,
+  mapCommissionConfigRow,
+  normalizeCommissionCsvRow,
+  upsertAgentCommissionConfig,
+} from '../lib/agentCommission.js';
 
 export const adminRouter = Router();
 
@@ -46,6 +54,37 @@ const circularUpload = multer({
   },
   limits: { fileSize: 20 * 1024 * 1024 },
 });
+
+const commissionBulkUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 },
+});
+
+function wrapMulter(uploadMiddleware) {
+  return (req, res, next) => {
+    uploadMiddleware(req, res, (err) => {
+      if (!err) return next();
+      err.status = err.status || 400;
+      next(err);
+    });
+  };
+}
+
+function storeCircularUploads(files = []) {
+  const map = {};
+  for (const f of files) {
+    const safe = f.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
+    const filename = `${Date.now()}-${Math.random().toString(36).slice(2)}-${safe}`;
+    const fullPath = resolve(circularDir, filename);
+    writeFileSync(fullPath, f.buffer);
+    const storedUrl = `/uploads/commission-circulars/${filename}`;
+    map[f.originalname] = { storedUrl, filename };
+    map[f.originalname.toLowerCase()] = { storedUrl, filename };
+    map[basename(f.originalname)] = { storedUrl, filename };
+    map[basename(f.originalname).toLowerCase()] = { storedUrl, filename };
+  }
+  return map;
+}
 
 adminRouter.use('/status-check', statusCheckAdminRouter);
 
@@ -560,6 +599,57 @@ adminRouter.patch(
 );
 
 adminRouter.get(
+  '/agents/commission/csv-template',
+  authenticate,
+  authorize({ resource: 'agents', action: 'read' }),
+  (_req, res) => {
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="agent-commission-template.csv"');
+    res.send(buildAgentCommissionTemplateCsv());
+  },
+);
+
+adminRouter.post(
+  '/agents/commission/bulk-csv',
+  authenticate,
+  authorize({ resource: 'agents', action: 'update' }),
+  wrapMulter(
+    commissionBulkUpload.fields([
+      { name: 'file', maxCount: 1 },
+      { name: 'circulars', maxCount: 50 },
+    ]),
+  ),
+  async (req, res, next) => {
+    try {
+      await ensureStaffExtrasSchema();
+      const csvFile = req.files?.file?.[0];
+      if (!csvFile) return res.status(400).json({ error: 'CSV file is required (field name: file)' });
+
+      const text = csvFile.buffer.toString('utf8');
+      const rawRows = parseCsvToRows(text);
+      const circularFilesByName = storeCircularUploads(req.files?.circulars || []);
+      const pool = getPool();
+      const summary = await importAgentCommissionRows(pool, rawRows, {
+        updatedBy: req.auth.userId,
+        circularFilesByName,
+      });
+
+      await writeAuditLog({
+        userId: req.auth.userId,
+        actionType: 'BULK_IMPORT',
+        tableName: 'agent_commission_config',
+        recordId: null,
+        newValues: { imported: summary.imported, failed: summary.failed },
+      });
+
+      res.json(summary);
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+adminRouter.get(
   '/agents/:id/commission',
   authenticate,
   authorize({ resource: 'agents', action: 'read' }),
@@ -567,8 +657,19 @@ adminRouter.get(
     try {
       await ensureStaffExtrasSchema();
       const pool = getPool();
-      const [rows] = await pool.execute(`SELECT * FROM global_commission_config WHERE id = 'default' LIMIT 1`);
-      res.json(rows);
+      const [rows] = await pool.execute(
+        `SELECT * FROM agent_commission_config
+         WHERE agent_user_id = :id
+         ORDER BY loan_type ASC, updated_at DESC`,
+        { id: req.params.id },
+      );
+      if (rows.length) {
+        return res.json(rows.map(mapCommissionConfigRow));
+      }
+      const [[fallback]] = await pool.execute(
+        `SELECT * FROM global_commission_config WHERE id = 'default' LIMIT 1`,
+      );
+      res.json(fallback ? [mapCommissionConfigRow({ ...fallback, agent_user_id: req.params.id })] : []);
     } catch (err) {
       next(err);
     }
@@ -583,45 +684,45 @@ adminRouter.put(
     try {
       await ensureStaffExtrasSchema();
       const pool = getPool();
-      const body = req.body || {};
-      await pool.execute(
-        `INSERT INTO global_commission_config (
-           id, loan_type, commission_type, commission_value,
-           min_loan_amount, max_loan_amount, effective_from, effective_to, updated_by
-         ) VALUES (
-           'default', :loan_type, :commission_type, :commission_value,
-           :min_loan_amount, :max_loan_amount, :effective_from, :effective_to, :updated_by
-         )
-         ON DUPLICATE KEY UPDATE
-           loan_type = VALUES(loan_type),
-           commission_type = VALUES(commission_type),
-           commission_value = VALUES(commission_value),
-           min_loan_amount = VALUES(min_loan_amount),
-           max_loan_amount = VALUES(max_loan_amount),
-           effective_from = VALUES(effective_from),
-           effective_to = VALUES(effective_to),
-           updated_by = VALUES(updated_by)`,
-        {
-          loan_type: body.loanType || body.loan_type || null,
-          commission_type: body.commissionType || body.commission_type || 'percentage',
-          commission_value: body.commissionValue ?? body.commission_value ?? 2.5,
-          min_loan_amount: body.minLoanAmount ?? body.min_loan_amount ?? null,
-          max_loan_amount: body.maxLoanAmount ?? body.max_loan_amount ?? null,
-          effective_from: body.effectiveFrom || body.effective_from || null,
-          effective_to: body.effectiveTo || body.effective_to || null,
-          updated_by: req.auth.userId,
-        },
+      const [[agent]] = await pool.execute(
+        `SELECT ao.agent_code, ao.agent_name, up.id
+         FROM user_profiles up
+         LEFT JOIN agent_onboarding ao ON ao.user_id = up.id
+         WHERE up.id = :id AND up.role = 'agent' LIMIT 1`,
+        { id: req.params.id },
       );
+      if (!agent) return res.status(404).json({ error: 'Agent not found' });
+
+      const agentCode =
+        (await ensureAgentCodeForUser(pool, req.params.id)) || agent.agent_code || '';
+      const body = req.body || {};
+      const row = normalizeCommissionCsvRow({
+        agent_code: agentCode || body.agentCode || body.agent_code || '',
+        agent_name: agent.agent_name || body.agentName || body.agent_name || '',
+        loan_type: body.loanType || body.loan_type || 'home_loan',
+        commission_type: body.commissionType || body.commission_type || 'percentage',
+        commission_value: String(body.commissionValue ?? body.commission_value ?? 2.5),
+        min_loan_amount: body.minLoanAmount ?? body.min_loan_amount ?? '',
+        max_loan_amount: body.maxLoanAmount ?? body.max_loan_amount ?? '',
+        effective_from: body.effectiveFrom || body.effective_from || '',
+        effective_to: body.effectiveTo || body.effective_to || '',
+        circular_title: body.circularTitle || body.circular_title || '',
+        upload: body.circularFileUrl || body.circular_file_url || body.upload || '',
+      });
+
+      const configId = await upsertAgentCommissionConfig(pool, req.params.id, row, {
+        updatedBy: req.auth.userId,
+      });
 
       await writeAuditLog({
         userId: req.auth.userId,
         actionType: 'UPDATE',
-        tableName: 'global_commission_config',
-        recordId: 'default',
+        tableName: 'agent_commission_config',
+        recordId: configId,
         newValues: body,
       });
 
-      res.json({ ok: true });
+      res.json({ ok: true, configId });
     } catch (err) {
       next(err);
     }
@@ -720,6 +821,34 @@ adminRouter.get(
   },
 );
 
+async function upsertEmployeeModuleAccess(pool, employeeUserId, entry, { isActive, expiresAt, updatedBy }) {
+  const moduleName = entry.moduleName || entry.module_name;
+  const permissions = entry.permissions || [];
+  const rowActive = isActive && permissions.length > 0;
+
+  await pool.execute(
+    `INSERT INTO employee_access_controls (
+       id, employee_user_id, module_name, permissions_json, is_active, expires_at, updated_by
+     ) VALUES (
+       :id, :employee_user_id, :module_name, :permissions_json, :is_active, :expires_at, :updated_by
+     )
+     ON DUPLICATE KEY UPDATE
+       permissions_json = VALUES(permissions_json),
+       is_active = VALUES(is_active),
+       expires_at = VALUES(expires_at),
+       updated_by = VALUES(updated_by)`,
+    {
+      id: newId(),
+      employee_user_id: employeeUserId,
+      module_name: moduleName,
+      permissions_json: JSON.stringify(permissions),
+      is_active: rowActive ? 1 : 0,
+      expires_at: expiresAt,
+      updated_by: updatedBy,
+    },
+  );
+}
+
 adminRouter.put(
   '/employees/:id/access-controls',
   authenticate,
@@ -729,42 +858,36 @@ adminRouter.put(
       await ensureStaffExtrasSchema();
       const pool = getPool();
       const input = req.body || {};
-      const moduleName = input.moduleName || input.module_name || 'applications';
-      const permissions = input.permissions || [];
       const isActive = input.isActive !== false && input.is_active !== false;
       const expiresAt = input.expiresAt || input.expires_at || null;
 
-      await pool.execute(
-        `INSERT INTO employee_access_controls (
-           id, employee_user_id, module_name, permissions_json, is_active, expires_at, updated_by
-         ) VALUES (
-           :id, :employee_user_id, :module_name, :permissions_json, :is_active, :expires_at, :updated_by
-         )
-         ON DUPLICATE KEY UPDATE
-           permissions_json = VALUES(permissions_json),
-           is_active = VALUES(is_active),
-           expires_at = VALUES(expires_at),
-           updated_by = VALUES(updated_by)`,
-        {
-          id: newId(),
-          employee_user_id: req.params.id,
-          module_name: moduleName,
-          permissions_json: JSON.stringify(permissions),
-          is_active: isActive ? 1 : 0,
-          expires_at: expiresAt,
-          updated_by: req.auth.userId,
-        },
-      );
+      const modules = Array.isArray(input.modules)
+        ? input.modules
+        : [
+            {
+              moduleName: input.moduleName || input.module_name || 'applications',
+              permissions: input.permissions || [],
+            },
+          ];
+
+      for (const entry of modules) {
+        if (!entry?.moduleName && !entry?.module_name) continue;
+        await upsertEmployeeModuleAccess(pool, req.params.id, entry, {
+          isActive,
+          expiresAt,
+          updatedBy: req.auth.userId,
+        });
+      }
 
       await writeAuditLog({
         userId: req.auth.userId,
         actionType: 'UPDATE',
         tableName: 'employee_access_controls',
         recordId: req.params.id,
-        newValues: { moduleName, permissions },
+        newValues: { modules: modules.map((m) => ({ module: m.moduleName || m.module_name, permissions: m.permissions })) },
       });
 
-      res.json({ ok: true });
+      res.json({ ok: true, updated: modules.length });
     } catch (err) {
       next(err);
     }
