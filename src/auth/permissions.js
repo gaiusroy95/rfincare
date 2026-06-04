@@ -81,13 +81,13 @@ export function hasPermission(userRole, requiredPermission) {
 
 export function canAccessResource({ userRole, userId, resource, action, resourceOwnerId }) {
   const permission = `${action}:${resource}`;
-  if (!hasPermission(userRole, permission)) {
-    const ownPermission = `${action}:own_${resource}`;
-    if (hasPermission(userRole, ownPermission) && resourceOwnerId && resourceOwnerId === userId) {
-      return true;
-    }
-    return false;
+  if (hasPermission(userRole, permission)) return true;
+  if (hasPermission(userRole, `manage:${resource}`)) return true;
+
+  const ownPermission = `${action}:own_${resource}`;
+  if (hasPermission(userRole, ownPermission) && resourceOwnerId && resourceOwnerId === userId) {
+    return true;
   }
-  return true;
+  return false;
 }
 
