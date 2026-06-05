@@ -3,7 +3,7 @@
  * Falls back to console when SMTP is not configured (same pattern as OTP).
  */
 
-function smtpConfigured() {
+export function smtpConfigured() {
   return Boolean(process.env.SMTP_HOST && process.env.SMTP_FROM);
 }
 

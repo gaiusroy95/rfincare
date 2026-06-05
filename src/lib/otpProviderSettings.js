@@ -22,6 +22,9 @@ const DEFAULTS = {
   providerConfig: {
     msg91SenderId: '',
     msg91TemplateId: '',
+    msg91OtpTemplateId: '',
+    msg91FlowTemplateId: '',
+    msg91WhatsappTemplateId: '',
     otpMessageTemplate: 'Your Rfincare verification code is {{otp}}. Valid for 10 minutes.',
   },
 };

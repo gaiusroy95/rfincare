@@ -1,6 +1,12 @@
 import crypto from 'node:crypto';
 
-import { sendEmail } from './email.js';
+import { sendEmail, smtpConfigured } from './email.js';
+import {
+  getMsg91Config,
+  isMsg91Configured,
+  sendMsg91Otp,
+  sendMsg91Whatsapp,
+} from './msg91.js';
 import { getOtpProviderSettings } from './otpProviderSettings.js';
 
 export function generateOtp() {
@@ -23,12 +29,36 @@ function formatOtpMessage(template, otp) {
   return tpl.replace(/\{\{otp\}\}/g, otp);
 }
 
+/** Readiness flags for admin (no secrets). */
+export function getOtpInfrastructureStatus() {
+  return {
+    msg91: {
+      configured: isMsg91Configured(),
+      senderId: process.env.MSG91_SENDER_ID || null,
+      otpTemplateId:
+        process.env.MSG91_OTP_TEMPLATE_ID || process.env.MSG91_TEMPLATE_ID || null,
+      whatsappTemplateId: process.env.MSG91_WHATSAPP_TEMPLATE_ID || null,
+    },
+    twilio: {
+      configured: Boolean(
+        process.env.TWILIO_ACCOUNT_SID &&
+          process.env.TWILIO_AUTH_TOKEN &&
+          process.env.TWILIO_PHONE_NUMBER,
+      ),
+    },
+    smtp: { configured: smtpConfigured() },
+    logOtp: process.env.LOG_OTP === 'true',
+  };
+}
+
 async function sendViaTwilio({ phone, message }) {
   const sid = process.env.TWILIO_ACCOUNT_SID;
   const token = process.env.TWILIO_AUTH_TOKEN;
   const from = process.env.TWILIO_PHONE_NUMBER;
   if (!sid || !token || !from) {
-    throw new Error('Twilio is not configured. Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER.');
+    throw new Error(
+      'Twilio is not configured. Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER.',
+    );
   }
 
   const auth = Buffer.from(`${sid}:${token}`).toString('base64');
@@ -91,44 +121,18 @@ async function sendViaTwilioWhatsapp({ phone, message }) {
 }
 
 async function sendViaMsg91({ phone, otp, config }) {
-  const authKey = process.env.MSG91_AUTH_KEY;
-  if (!authKey) {
-    throw new Error('MSG91 is not configured. Set MSG91_AUTH_KEY in server environment.');
-  }
-
-  const mobile = phone.replace(/\D/g, '').slice(-10);
-  const senderId = config?.msg91SenderId || process.env.MSG91_SENDER_ID || 'RFINCR';
-  const templateId = config?.msg91TemplateId || process.env.MSG91_TEMPLATE_ID;
-
-  if (templateId) {
-    const res = await fetch('https://control.msg91.com/api/v5/flow/', {
-      method: 'POST',
-      headers: {
-        authkey: authKey,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        template_id: templateId,
-        short_url: '0',
-        recipients: [{ mobiles: `91${mobile}`, otp }],
-      }),
-    });
-    if (!res.ok) {
-      const errText = await res.text();
-      throw new Error(`MSG91 flow failed: ${errText.slice(0, 200)}`);
-    }
-    return { sent: true, provider: 'msg91', mode: 'template' };
-  }
-
-  const message = formatOtpMessage(config?.otpMessageTemplate, otp);
-  const res = await fetch(
-    `https://control.msg91.com/api/sendhttp.php?authkey=${encodeURIComponent(authKey)}&mobiles=91${mobile}&message=${encodeURIComponent(message)}&sender=${encodeURIComponent(senderId)}&route=4&country=91`,
-  );
-  if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`MSG91 SMS failed: ${errText.slice(0, 200)}`);
-  }
-  return { sent: true, provider: 'msg91', mode: 'text' };
+  const providerConfig = config || {};
+  return sendMsg91Otp({
+    phone,
+    otp,
+    config: {
+      msg91SenderId: providerConfig.msg91SenderId,
+      msg91OtpTemplateId:
+        providerConfig.msg91OtpTemplateId || providerConfig.msg91TemplateId,
+      msg91FlowTemplateId: providerConfig.msg91FlowTemplateId,
+      msg91WhatsappTemplateId: providerConfig.msg91WhatsappTemplateId,
+    },
+  });
 }
 
 async function sendSmsOtp({ phone, otp, settings }) {
@@ -136,7 +140,11 @@ async function sendSmsOtp({ phone, otp, settings }) {
   const message = formatOtpMessage(settings?.providerConfig?.otpMessageTemplate, otp);
 
   if (provider === 'console') {
-    console.log('[otp:sms]', { phone: maskPhone(phone), provider }, process.env.LOG_OTP === 'true' ? otp : '(hidden)');
+    console.log(
+      '[otp:sms]',
+      { phone: maskPhone(phone), provider },
+      process.env.LOG_OTP === 'true' ? otp : '(hidden)',
+    );
     return { sent: true, provider: 'console' };
   }
 
@@ -145,6 +153,13 @@ async function sendSmsOtp({ phone, otp, settings }) {
   }
 
   if (provider === 'msg91') {
+    if (!isMsg91Configured()) {
+      const err = new Error(
+        'SMS operator is MSG91 but MSG91_AUTH_KEY is not set on the server. Add it in hosting env vars or switch SMS operator to Console in Admin → OTP settings.',
+      );
+      err.status = 503;
+      throw err;
+    }
     return sendViaMsg91({ phone, otp, config: settings?.providerConfig });
   }
 
@@ -158,12 +173,24 @@ async function sendEmailOtp({ email, otp, settings }) {
   const html = `<p>${text}</p><p>If you did not request this, please ignore this email.</p>`;
 
   if (provider === 'console') {
-    console.log('[otp:email]', { email, provider }, process.env.LOG_OTP === 'true' ? otp : '(hidden)');
+    console.log(
+      '[otp:email]',
+      { email, provider },
+      process.env.LOG_OTP === 'true' ? otp : '(hidden)',
+    );
     return { sent: true, provider: 'console' };
   }
 
   if (provider === 'smtp') {
-    return sendEmail({ to: email, subject, text, html });
+    const result = await sendEmail({ to: email, subject, text, html });
+    if (!smtpConfigured()) {
+      console.log(
+        '[otp:email]',
+        { email, provider: 'console-fallback' },
+        process.env.LOG_OTP === 'true' ? otp : '(hidden)',
+      );
+    }
+    return { ...result, provider: result.channel === 'smtp' ? 'smtp' : 'console' };
   }
 
   throw new Error(`Unknown email provider: ${provider}`);
@@ -174,25 +201,50 @@ async function sendWhatsappOtp({ phone, otp, settings }) {
   const message = formatOtpMessage(settings?.providerConfig?.otpMessageTemplate, otp);
 
   if (provider === 'console') {
-    console.log('[otp:whatsapp]', { phone: maskPhone(phone), provider }, process.env.LOG_OTP === 'true' ? otp : '(hidden)');
+    console.log(
+      '[otp:whatsapp]',
+      { phone: maskPhone(phone), provider },
+      process.env.LOG_OTP === 'true' ? otp : '(hidden)',
+    );
     return { sent: true, provider: 'console' };
   }
   if (provider === 'twilio') {
     return sendViaTwilioWhatsapp({ phone, message });
   }
   if (provider === 'msg91') {
-    // Fallback through MSG91 message API; provider route decides WhatsApp template routing if configured.
-    return sendViaMsg91({ phone, otp, config: settings?.providerConfig });
+    if (!isMsg91Configured()) {
+      const err = new Error(
+        'WhatsApp operator is MSG91 but MSG91_AUTH_KEY is not set on the server.',
+      );
+      err.status = 503;
+      throw err;
+    }
+    return sendMsg91Whatsapp({ phone, otp, config: settings?.providerConfig });
   }
   throw new Error(`Unknown WhatsApp provider: ${provider}`);
 }
 
+function aggregateChannelErrors(results) {
+  const failures = results
+    .filter((r) => r.status === 'rejected')
+    .map((r) => r.reason?.message || 'Send failed');
+  if (!failures.length) return null;
+  return failures.join('; ');
+}
+
 /**
- * Send OTP via configured operators. `channel` may be sms | email | both (default both when settings require it).
+ * Send OTP via configured operators. `channel` may be sms | email | whatsapp | both.
  */
-export async function sendOtpNotification({ email, phone, otp, channel, settings: settingsOverride }) {
+export async function sendOtpNotification({
+  email,
+  phone,
+  otp,
+  channel,
+  settings: settingsOverride,
+}) {
   const settings = settingsOverride || (await getOtpProviderSettings());
-  const channels = [];
+  const tasks = [];
+  const labels = [];
 
   const wantSms =
     channel === 'sms' ||
@@ -207,28 +259,41 @@ export async function sendOtpNotification({ email, phone, otp, channel, settings
     channel === 'both' ||
     (!channel && settings.requireWhatsappOtp);
 
-  const results = {};
-
   if (wantSms && phone) {
-    results.sms = await sendSmsOtp({ phone, otp, settings });
-    channels.push('sms');
+    tasks.push(sendSmsOtp({ phone, otp, settings }));
+    labels.push('sms');
   }
-
   if (wantEmail && email) {
-    results.email = await sendEmailOtp({ email, otp, settings });
-    channels.push('email');
+    tasks.push(sendEmailOtp({ email, otp, settings }));
+    labels.push('email');
   }
-
   if (wantWhatsapp && phone) {
-    results.whatsapp = await sendWhatsappOtp({ phone, otp, settings });
-    channels.push('whatsapp');
+    tasks.push(sendWhatsappOtp({ phone, otp, settings }));
+    labels.push('whatsapp');
   }
 
-  if (!channels.length) {
-    console.log('[otp]', { email, phone: maskPhone(phone), channel }, process.env.LOG_OTP === 'true' ? otp : '(hidden)');
+  if (!tasks.length) {
+    console.log(
+      '[otp]',
+      { email, phone: maskPhone(phone), channel },
+      process.env.LOG_OTP === 'true' ? otp : '(hidden)',
+    );
+    return { sent: true, channels: [] };
   }
 
-  return { sent: true, channels, ...results };
+  const results = await Promise.allSettled(tasks);
+  const errMsg = aggregateChannelErrors(results);
+  if (errMsg) {
+    const err = new Error(errMsg);
+    err.status = results.find((r) => r.reason?.status)?.reason?.status || 502;
+    throw err;
+  }
+
+  const out = { sent: true, channels: labels };
+  results.forEach((r, i) => {
+    if (r.status === 'fulfilled') out[labels[i]] = r.value;
+  });
+  return out;
 }
 
 /**
@@ -240,20 +305,36 @@ export async function sendDualChannelOtp({ email, phone, settings: settingsOverr
   const emailOtp = generateOtp();
 
   const tasks = [];
+  const keys = [];
 
   if (settings.requireMobileOtp !== false && phone) {
     tasks.push(sendSmsOtp({ phone, otp: mobileOtp, settings }));
+    keys.push('sms');
+  }
+  if (settings.requireWhatsappOtp && phone) {
+    tasks.push(sendWhatsappOtp({ phone, otp: mobileOtp, settings }));
+    keys.push('whatsapp');
   }
   if (settings.requireEmailOtp !== false && email) {
     tasks.push(sendEmailOtp({ email, otp: emailOtp, settings }));
+    keys.push('email');
   }
 
-  await Promise.all(tasks);
+  const results = await Promise.allSettled(tasks);
+  const errMsg = aggregateChannelErrors(results);
+  if (errMsg) {
+    const err = new Error(errMsg);
+    err.status = results.find((r) => r.reason?.status)?.reason?.status || 502;
+    throw err;
+  }
 
   return {
     mobileOtp: settings.requireMobileOtp !== false ? mobileOtp : null,
     emailOtp: settings.requireEmailOtp !== false ? emailOtp : null,
     smsProvider: settings.smsProvider,
     emailProvider: settings.emailProvider,
+    whatsappProvider: settings.whatsappProvider,
+    msg91Configured: isMsg91Configured(),
   };
 }
+
