@@ -103,6 +103,9 @@ export function createApp({ serveStatic = true } = {}) {
   app.use('/admin/document-requirements', documentRequirementsRouter);
 
   app.use('/uploads', express.static(getUploadDir()));
+  app.use('/uploads', (_req, res) => {
+    res.status(404).json({ error: 'Upload not found' });
+  });
 
   app.use(errorMiddleware);
 
@@ -122,6 +125,8 @@ export function createApp({ serveStatic = true } = {}) {
       || req.path.startsWith('/auth')
       || req.path.startsWith('/development-panel')
       || req.path.startsWith('/public')
+      || req.path.startsWith('/uploads')
+      || req.path.startsWith('/documents')
     ) {
       return res.status(404).json({ message: 'Not Found' });
     }

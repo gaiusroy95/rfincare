@@ -11,6 +11,10 @@ import { cacheDeletePrefix, cacheGet, cacheSet } from '../lib/simpleCache.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { authorize } from '../middleware/authorize.js';
 import { newId } from '../lib/ids.js';
+import {
+  bankProductMatchesCategory,
+  resolveProductCategoryQuery,
+} from '../lib/bankProductMatching.js';
 import { listRulesForBank } from './approvalMatrixRules.js';
 
 const BANK_LIST_CACHE_PREFIX = 'banks:list:';
@@ -221,12 +225,15 @@ function slimProductForList(product) {
   };
 }
 
-async function fetchBankList({ includeInactive, includeProducts, loanTypeFilter }) {
-  const cacheKey = `${BANK_LIST_CACHE_PREFIX}${includeInactive}:${includeProducts}:${loanTypeFilter || 'all'}`;
+async function fetchBankList({ includeInactive, includeProducts, categoryQuery }) {
+  const cacheKey = `${BANK_LIST_CACHE_PREFIX}${includeInactive}:${includeProducts}:${categoryQuery || 'all'}`;
   const cached = cacheGet(cacheKey);
   if (cached) return cached;
 
   const pool = getPool();
+  const category = categoryQuery
+    ? await resolveProductCategoryQuery(pool, categoryQuery)
+    : null;
   const [rows] = await pool.execute(
     `SELECT ${BANK_LIST_COLUMNS}
      FROM banks
@@ -254,20 +261,27 @@ async function fetchBankList({ includeInactive, includeProducts, loanTypeFilter 
     }
     const entry = productsByBank.get(product.bank_id);
     entry.all.push(slim);
-    if (!loanTypeFilter || slim.loan_type === loanTypeFilter) {
+    if (!category || bankProductMatchesCategory(product, category)) {
       entry.matched.push(slim);
     }
   }
 
-  const result = rows.map((bank) => {
-    const entry = productsByBank.get(bank.id) || { all: [], matched: [] };
-    const bankProducts =
-      loanTypeFilter && entry.matched.length > 0 ? entry.matched : entry.all;
-    return {
-      ...formatBankRow(bank),
-      bank_products: bankProducts,
-    };
-  });
+  const result = rows
+    .map((bank) => {
+      const entry = productsByBank.get(bank.id) || { all: [], matched: [] };
+      if (category) {
+        if (entry.matched.length === 0) return null;
+        return {
+          ...formatBankRow(bank),
+          bank_products: entry.matched,
+        };
+      }
+      return {
+        ...formatBankRow(bank),
+        bank_products: entry.all,
+      };
+    })
+    .filter(Boolean);
 
   cacheSet(cacheKey, result, BANK_LIST_CACHE_TTL_MS);
   return result;
@@ -277,9 +291,9 @@ banksRouter.get('/', async (req, res, next) => {
   try {
     const includeInactive = req.query.includeInactive === 'true';
     const includeProducts = req.query.includeProducts !== 'false';
-    const loanTypeFilter = normalizeLoanTypeQuery(req.query.loanType);
+    const categoryQuery = req.query.loanType || null;
 
-    const result = await fetchBankList({ includeInactive, includeProducts, loanTypeFilter });
+    const result = await fetchBankList({ includeInactive, includeProducts, categoryQuery });
 
     if (includeInactive) {
       res.set('Cache-Control', 'private, no-cache, no-store, must-revalidate');

@@ -5,6 +5,16 @@ import { authenticate } from '../middleware/authenticate.js';
 import { requireRoles } from '../middleware/requireRoles.js';
 import { getPool } from '../db/pool.js';
 import { newId } from '../lib/ids.js';
+import {
+  createProductCategory,
+  ensureProductCategorySchema,
+  getProductCategoryById,
+  listProductCategories,
+} from '../lib/productCategories.js';
+import {
+  ensureCategoryLandingCatalog,
+  syncCatalogBankProduct,
+} from '../lib/syncCatalogBankProduct.js';
 
 export const loanProductCatalogRouter = Router();
 
@@ -44,10 +54,26 @@ function formatRow(row) {
     color: row.color || 'var(--color-primary)',
     sort_order: row.sort_order ?? 0,
     is_active: Boolean(row.is_active),
+    category_id: row.category_id || null,
+    category_label: row.category_label || null,
+    category_slug: row.category_slug || null,
+    bank_id: row.bank_id || null,
+    bank_name: row.bank_name || null,
+    bank_product_id: row.bank_product_id || null,
     created_at: row.created_at,
     updated_at: row.updated_at,
   };
 }
+
+const CATALOG_SELECT = `
+  SELECT c.*,
+         pc.label AS category_label,
+         pc.slug AS category_slug,
+         b.name AS bank_name
+  FROM loan_product_catalog c
+  LEFT JOIN product_categories pc ON pc.id = c.category_id
+  LEFT JOIN banks b ON b.id = c.bank_id
+`;
 
 function slugify(input) {
   return String(input || '')
@@ -63,6 +89,8 @@ function toApiKey(slug) {
   return s.endsWith('_loan') ? s : `${s}_loan`;
 }
 
+const emptyToNull = (value) => (value === '' || value === undefined ? null : value);
+
 const ProductSchema = z.object({
   slug: z.string().min(1).max(64).optional(),
   api_key: z.string().min(1).max(64).optional(),
@@ -76,22 +104,62 @@ const ProductSchema = z.object({
   color: z.string().max(32).optional(),
   sort_order: z.coerce.number().int().optional(),
   is_active: z.boolean().optional(),
+  category_id: z.preprocess(emptyToNull, z.string().uuid().nullable().optional()),
+  bank_id: z.preprocess(emptyToNull, z.string().uuid().nullable().optional()),
+});
+
+const CategorySchema = z.object({
+  label: z.string().min(1).max(255),
+  slug: z.string().max(64).optional(),
+  parent_loan_type: z.string().max(64).optional().nullable(),
 });
 
 /** Public: active catalog products for homepage and forms */
 loanProductCatalogRouter.get('/', async (req, res, next) => {
   try {
+    await ensureProductCategorySchema();
     const pool = getPool();
     const [rows] = await pool.execute(
-      `SELECT * FROM loan_product_catalog
-       WHERE is_active = 1
-       ORDER BY sort_order ASC, label ASC`,
+      `${CATALOG_SELECT}
+       WHERE c.is_active = 1 AND c.bank_id IS NULL
+       ORDER BY c.sort_order ASC, c.label ASC`,
     );
     res.json(rows.map(formatRow));
   } catch (err) {
     next(err);
   }
 });
+
+/** Product category taxonomy for admin dropdowns */
+loanProductCatalogRouter.get('/categories', async (_req, res, next) => {
+  try {
+    const categories = await listProductCategories();
+    res.json(categories);
+  } catch (err) {
+    next(err);
+  }
+});
+
+loanProductCatalogRouter.post(
+  '/categories',
+  authenticate,
+  requireRoles('admin', 'super_admin'),
+  async (req, res, next) => {
+    try {
+      const body = CategorySchema.parse(req.body);
+      const category = await createProductCategory({
+        label: body.label,
+        slug: body.slug,
+        parentLoanType: body.parent_loan_type,
+      });
+      const pool = getPool();
+      await ensureCategoryLandingCatalog(pool, category);
+      res.status(201).json(category);
+    } catch (err) {
+      next(err);
+    }
+  },
+);
 
 /** Admin: all catalog products */
 loanProductCatalogRouter.get(
@@ -100,9 +168,10 @@ loanProductCatalogRouter.get(
   requireRoles('admin', 'super_admin'),
   async (req, res, next) => {
     try {
+      await ensureProductCategorySchema();
       const pool = getPool();
       const [rows] = await pool.execute(
-        `SELECT * FROM loan_product_catalog ORDER BY sort_order ASC, label ASC`,
+        `${CATALOG_SELECT} ORDER BY c.sort_order ASC, c.label ASC`,
       );
       res.json(rows.map(formatRow));
     } catch (err) {
@@ -117,9 +186,18 @@ loanProductCatalogRouter.post(
   requireRoles('admin', 'super_admin'),
   async (req, res, next) => {
     try {
+      await ensureProductCategorySchema();
       const body = ProductSchema.parse(req.body);
-      const slug = slugify(body.slug || body.label);
-      const apiKey = body.api_key ? slugify(body.api_key) : toApiKey(slug);
+      const category = body.category_id ? await getProductCategoryById(body.category_id) : null;
+      const slugBase = slugify(body.slug || body.label);
+      const slug = body.bank_id && category
+        ? slugify(`${slugBase}_${category.slug}`)
+        : slugBase;
+      const apiKey = body.api_key
+        ? slugify(body.api_key)
+        : category
+          ? (category.slug.endsWith('_loan') ? category.slug : `${category.slug}_loan`)
+          : toApiKey(slug);
       if (!slug || !apiKey) {
         const e = new Error('Invalid slug or API key');
         e.status = 400;
@@ -133,19 +211,23 @@ loanProductCatalogRouter.post(
       await pool.execute(
         `INSERT INTO loan_product_catalog (
           id, slug, api_key, label, short_label, icon, description,
+          category_id, bank_id,
           interest_rate_min, interest_rate_max, features, color, sort_order, is_active
         ) VALUES (
           :id, :slug, :api_key, :label, :short_label, :icon, :description,
+          :category_id, :bank_id,
           :interest_rate_min, :interest_rate_max, :features, :color, :sort_order, :is_active
         )`,
         {
           id,
           slug,
-          api_key: apiKey,
+          api_key: body.bank_id ? `${slug}_${id.replace(/-/g, '').slice(0, 12)}` : apiKey,
           label: body.label,
           short_label: body.short_label || body.label.split(' ')[0],
           icon: body.icon || 'Wallet',
           description: body.description || null,
+          category_id: body.category_id || null,
+          bank_id: body.bank_id || null,
           interest_rate_min: body.interest_rate_min ?? null,
           interest_rate_max: body.interest_rate_max ?? null,
           features: JSON.stringify(features),
@@ -155,10 +237,23 @@ loanProductCatalogRouter.post(
         },
       );
 
-      const [[row]] = await pool.execute(
-        `SELECT * FROM loan_product_catalog WHERE id = :id LIMIT 1`,
-        { id },
-      );
+      if (category) {
+        await ensureCategoryLandingCatalog(pool, category);
+      }
+
+      if (body.bank_id && category) {
+        await syncCatalogBankProduct({
+          catalogId: id,
+          bankId: body.bank_id,
+          category,
+          label: body.label,
+          features,
+          interestRateMin: body.interest_rate_min,
+          interestRateMax: body.interest_rate_max,
+        });
+      }
+
+      const [[row]] = await pool.execute(`${CATALOG_SELECT} WHERE c.id = :id LIMIT 1`, { id });
       res.status(201).json(formatRow(row));
     } catch (err) {
       if (err?.code === 'ER_DUP_ENTRY') {
@@ -176,6 +271,7 @@ loanProductCatalogRouter.patch(
   requireRoles('admin', 'super_admin'),
   async (req, res, next) => {
     try {
+      await ensureProductCategorySchema();
       const pool = getPool();
       const [[existing]] = await pool.execute(
         `SELECT * FROM loan_product_catalog WHERE id = :id LIMIT 1`,
@@ -188,12 +284,16 @@ loanProductCatalogRouter.patch(
       }
 
       const body = ProductSchema.partial().parse(req.body);
+      const categoryId = body.category_id !== undefined ? body.category_id : existing.category_id;
+      const bankId = body.bank_id !== undefined ? body.bank_id : existing.bank_id;
+      const category = categoryId ? await getProductCategoryById(categoryId) : null;
       const slug = body.slug != null ? slugify(body.slug) : existing.slug;
       const apiKey = body.api_key != null ? slugify(body.api_key) : existing.api_key;
       const features =
         body.features !== undefined
           ? parseFeatures(body.features)
           : parseFeatures(existing.features);
+      const label = body.label ?? existing.label;
 
       await pool.execute(
         `UPDATE loan_product_catalog SET
@@ -203,6 +303,8 @@ loanProductCatalogRouter.patch(
           short_label = COALESCE(:short_label, short_label),
           icon = COALESCE(:icon, icon),
           description = COALESCE(:description, description),
+          category_id = :category_id,
+          bank_id = :bank_id,
           interest_rate_min = COALESCE(:interest_rate_min, interest_rate_min),
           interest_rate_max = COALESCE(:interest_rate_max, interest_rate_max),
           features = :features,
@@ -218,6 +320,8 @@ loanProductCatalogRouter.patch(
           short_label: body.short_label ?? null,
           icon: body.icon ?? null,
           description: body.description ?? null,
+          category_id: categoryId,
+          bank_id: bankId,
           interest_rate_min: body.interest_rate_min ?? null,
           interest_rate_max: body.interest_rate_max ?? null,
           features: JSON.stringify(features),
@@ -227,10 +331,26 @@ loanProductCatalogRouter.patch(
         },
       );
 
-      const [[row]] = await pool.execute(
-        `SELECT * FROM loan_product_catalog WHERE id = :id LIMIT 1`,
-        { id: req.params.id },
-      );
+      if (category) {
+        await ensureCategoryLandingCatalog(pool, category);
+      }
+
+      if (bankId && category) {
+        await syncCatalogBankProduct({
+          catalogId: req.params.id,
+          bankId,
+          category,
+          label,
+          features,
+          interestRateMin: body.interest_rate_min ?? existing.interest_rate_min,
+          interestRateMax: body.interest_rate_max ?? existing.interest_rate_max,
+          bankProductId: existing.bank_product_id,
+        });
+      }
+
+      const [[row]] = await pool.execute(`${CATALOG_SELECT} WHERE c.id = :id LIMIT 1`, {
+        id: req.params.id,
+      });
       res.json(formatRow(row));
     } catch (err) {
       if (err?.code === 'ER_DUP_ENTRY') {

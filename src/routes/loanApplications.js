@@ -586,21 +586,21 @@ loanApplicationsRouter.post(
   authorize({ resource: 'loan_application', action: 'create' }),
   async (req, res, next) => {
     try {
-      const pool = getPool();
+    const pool = getPool();
       const body = req.body || {};
-      const id = newId();
+    const id = newId();
       const customerId = body.customer_id || req.auth.userId;
       const payload = normalizeApplicationPayload({
         ...body,
         customer_id: customerId,
       });
-
-      await pool.execute(
-        `INSERT INTO loan_applications (
+    
+    await pool.execute(
+      `INSERT INTO loan_applications (
           id, application_number, customer_id, agent_id, sourced_agent_code, assigned_employee_id,
           qc_employee_id, qc_admin_id, selected_bank_id, status, document_stage_status,
           bank_approval_status, eligibility_status, data
-        ) VALUES (
+      ) VALUES (
           :id, :application_number, :customer_id, :agent_id, :sourced_agent_code, :assigned_employee_id,
           :qc_employee_id, :qc_admin_id, :selected_bank_id, :status, :document_stage_status,
           :bank_approval_status, :eligibility_status, :data
