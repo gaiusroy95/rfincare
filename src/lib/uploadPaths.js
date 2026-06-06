@@ -12,20 +12,43 @@ export function getUploadDir() {
   return resolve(backendRoot, 'uploads');
 }
 
-/** Resolve a stored path from DB to an existing file on disk. */
-export function resolveUploadFilePath(storedPath) {
+/** Normalize DB-stored paths to a bare filename when possible. */
+export function normalizeStoredUploadName(storedPath) {
   if (!storedPath) return null;
+  const trimmed = String(storedPath).trim();
+  if (!trimmed) return null;
+  if (/^https?:\/\//i.test(trimmed)) return null;
+  const withoutUploadsPrefix = trimmed.replace(/^\/uploads\//i, '').replace(/^uploads[\\/]/i, '');
+  return basename(withoutUploadsPrefix);
+}
+
+/** Resolve a stored path from DB to an existing file on disk. */
+export function resolveUploadFilePath(storedPath, extraNames = []) {
+  if (!storedPath && !extraNames.length) return null;
 
   const uploadDir = getUploadDir();
-  const fileName = basename(storedPath);
-  const candidates = [
-    storedPath,
-    resolve(storedPath),
-    join(uploadDir, fileName),
-    join(backendRoot, 'uploads', fileName),
-    join(process.cwd(), 'uploads', fileName),
-    join(process.cwd(), 'backend', 'uploads', fileName),
-  ];
+  const names = new Set();
+  for (const value of [storedPath, ...extraNames]) {
+    const normalized = normalizeStoredUploadName(value);
+    if (normalized) names.add(normalized);
+  }
+
+  const candidates = [];
+  if (storedPath) {
+    candidates.push(storedPath, resolve(storedPath));
+    const trimmed = String(storedPath).trim();
+    if (trimmed.startsWith('/uploads/')) {
+      candidates.push(join(uploadDir, basename(trimmed)));
+    }
+  }
+  for (const name of names) {
+    candidates.push(
+      join(uploadDir, name),
+      join(backendRoot, 'uploads', name),
+      join(process.cwd(), 'uploads', name),
+      join(process.cwd(), 'backend', 'uploads', name),
+    );
+  }
 
   for (const candidate of candidates) {
     if (candidate && existsSync(candidate)) return candidate;

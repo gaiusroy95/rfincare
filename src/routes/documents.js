@@ -3,7 +3,11 @@ import multer from 'multer';
 import { z } from 'zod';
 import { basename } from 'node:path';
 import { createReadStream } from 'node:fs';
-import { getUploadDir, resolveUploadFilePath } from '../lib/uploadPaths.js';
+import {
+  getUploadDir,
+  normalizeStoredUploadName,
+  resolveUploadFilePath,
+} from '../lib/uploadPaths.js';
 
 import { authenticate } from '../middleware/authenticate.js';
 import { authorize } from '../middleware/authorize.js';
@@ -15,6 +19,7 @@ import { newId } from '../lib/ids.js';
 import { writeAuditLog } from '../lib/audit.js';
 import { dispatchFileUpdateNotification } from '../lib/fileNotificationService.js';
 import { createCustomerNotification } from './notifications.js';
+import { ensureAgentCodeForUser } from '../lib/agentCode.js';
 
 export const documentsRouter = Router();
 
@@ -24,11 +29,30 @@ function isStaffRole(role) {
   return STAFF_ROLES.has(role) || hasPermission(role, 'read:*');
 }
 
-async function agentCanAccessApplication(pool, agentId, applicationId) {
+function agentApplicationScopeSql(alias = 'la') {
+  return `(
+    ${alias}.agent_id = :agent_id
+    OR (
+      :agent_code IS NOT NULL
+      AND ${alias}.sourced_agent_code IS NOT NULL
+      AND ${alias}.sourced_agent_code = :agent_code
+    )
+  )`;
+}
+
+async function resolveAgentScopeParams(pool, agentUserId) {
+  const agentCode = (await ensureAgentCodeForUser(pool, agentUserId)) || null;
+  return { agent_id: agentUserId, agent_code: agentCode };
+}
+
+async function agentCanAccessApplication(pool, agentUserId, applicationId) {
   if (!applicationId) return false;
+  const scope = await resolveAgentScopeParams(pool, agentUserId);
   const [[row]] = await pool.execute(
-    `SELECT id, customer_id FROM loan_applications WHERE id = :id AND agent_id = :agentId LIMIT 1`,
-    { id: applicationId, agentId },
+    `SELECT id, customer_id FROM loan_applications
+     WHERE id = :id AND ${agentApplicationScopeSql('loan_applications')}
+     LIMIT 1`,
+    { id: applicationId, ...scope },
   );
   return row || null;
 }
@@ -54,11 +78,20 @@ function inferMimeType(row) {
 }
 
 function formatDocumentRow(row) {
-  const fileName = basename(row.file_path);
+  const fileName =
+    normalizeStoredUploadName(row.file_path) ||
+    basename(row.file_path || '') ||
+    row.document_name ||
+    null;
   const mimeType = inferMimeType(row);
   const isImage = mimeType.startsWith('image/');
   const isPdf = mimeType.includes('pdf');
-  const previewUrl = fileName && (isImage || isPdf) ? `/uploads/${fileName}` : null;
+  const previewUrl =
+    fileName && (isImage || isPdf)
+      ? `/uploads/${encodeURIComponent(fileName)}`
+      : row.document_url?.startsWith('/uploads/')
+        ? row.document_url
+        : null;
   const verificationStatus = normalizeDocStatus(row);
   return {
     ...row,
@@ -181,7 +214,8 @@ async function resolveRequirementsForApplication(pool, applicationId) {
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, getUploadDir()),
   filename: (_req, file, cb) => {
-    const safe = `${Date.now()}-${Math.random().toString(36).slice(2)}-${file.originalname}`;
+    const original = String(file.originalname || 'document').replace(/[^a-zA-Z0-9._-]/g, '_');
+    const safe = `${Date.now()}-${Math.random().toString(36).slice(2)}-${original}`;
     cb(null, safe);
   },
 });
@@ -227,9 +261,9 @@ documentsRouter.get(
         params.phone_digits = `%${phoneDigits || search}%`;
       }
 
-      const agentClause = isAgent ? 'AND la.agent_id = :agent_id' : '';
+      const agentClause = isAgent ? `AND ${agentApplicationScopeSql('la')}` : '';
       if (isAgent) {
-        params.agent_id = req.auth.userId;
+        Object.assign(params, await resolveAgentScopeParams(pool, req.auth.userId));
       }
 
       const [rows] = await pool.execute(
@@ -324,10 +358,11 @@ documentsRouter.get(
           }
         }
       } else if (req.auth.role === 'agent') {
+        const scope = await resolveAgentScopeParams(pool, req.auth.userId);
         conditions.push(
-          `application_id IN (SELECT id FROM loan_applications WHERE agent_id = :agent_id)`,
+          `application_id IN (SELECT id FROM loan_applications WHERE ${agentApplicationScopeSql('loan_applications')})`,
         );
-        params.agent_id = req.auth.userId;
+        Object.assign(params, scope);
       } else if (isStaff && customerId) {
         conditions.push('customer_id = :customer_id');
         params.customer_id = customerId;
@@ -413,7 +448,8 @@ documentsRouter.post(
         }
       }
 
-      const filePath = file.path;
+      const storedFileName = file.filename || basename(file.path || '');
+      const filePath = storedFileName;
       const documentUrl = `/documents/${docId}/download`;
 
       await pool.execute(
@@ -485,12 +521,21 @@ documentsRouter.get(
         }
       }
 
-      const resolvedPath = resolveUploadFilePath(doc.file_path);
+      const resolvedPath = resolveUploadFilePath(doc.file_path, [
+        doc.document_name,
+        doc.document_url,
+      ]);
       if (!resolvedPath) {
-        return res.status(404).json({ error: 'Document file not found on server' });
+        return res.status(404).json({
+          error: 'Document file not found on server. The file may need to be re-uploaded by the customer.',
+        });
       }
 
-      const filename = basename(resolvedPath) || doc.document_name || 'document';
+      const filename =
+        doc.document_name ||
+        normalizeStoredUploadName(doc.file_path) ||
+        basename(resolvedPath) ||
+        'document';
       const inline = req.query.inline === '1' || req.query.inline === 'true';
       res.setHeader('Content-Type', doc.mime_type || 'application/octet-stream');
       res.setHeader(

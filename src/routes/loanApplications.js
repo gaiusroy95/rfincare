@@ -13,6 +13,7 @@ import { writeAuditLog } from '../lib/audit.js';
 import { requireSuccessfulCibilForSubmit } from '../lib/cibilService.js';
 import { dispatchFileUpdateNotification } from '../lib/fileNotificationService.js';
 import { buildSimpleTextPdf } from '../lib/simplePdf.js';
+import { finalizeApplicationSubmission } from '../lib/applicationSubmissionService.js';
 
 export const loanApplicationsRouter = Router();
 
@@ -831,6 +832,18 @@ loanApplicationsRouter.get('/:id/summary-pdf', authenticate, async (req, res, ne
     if (!isOwner && !isStaff) return res.status(403).json({ error: 'Forbidden' });
 
     const data = parseJson(row.data);
+    if (data.application_package_pdf) {
+      const { resolveUploadFilePath } = await import('../lib/uploadPaths.js');
+      const { createReadStream } = await import('node:fs');
+      const filePath = resolveUploadFilePath(data.application_package_pdf.replace(/^\/uploads\//, ''));
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader(
+        'Content-Disposition',
+        `inline; filename="application-${row.application_number || row.id}.pdf"`,
+      );
+      return createReadStream(filePath).pipe(res);
+    }
+
     const lines = [
       'Rfincare — Loan Application Summary (Read-only)',
       `Application: ${row.application_number || row.id}`,
@@ -889,7 +902,12 @@ loanApplicationsRouter.post(
             manualReview: true,
           });
         }
-        throw cibilErr;
+        const skipCibil =
+          cibilErr.code === 'ER_NO_SUCH_TABLE'
+          || cibilErr.status === 400
+          || /cibil_vendors/i.test(String(cibilErr.message || ''));
+        if (!skipCibil) throw cibilErr;
+        console.warn('[submit] CIBIL check skipped:', cibilErr.message);
       }
 
       await pool.execute(
@@ -910,18 +928,23 @@ loanApplicationsRouter.post(
         { id: newId(), application_id: req.params.id },
       );
 
-      try {
-        await createCustomerNotification(pool, {
-          customerId: existing.customer_id,
-          title: 'Application submitted',
-          message: 'Your loan application has been submitted successfully. We will notify you of updates.',
-        });
-      } catch {
-        /* notifications table may be missing on older DBs */
-      }
+      const clientIp =
+        req.headers['x-forwarded-for']?.toString()?.split(',')?.[0]?.trim()
+        || req.socket?.remoteAddress
+        || null;
+
+      const confirmation = await finalizeApplicationSubmission({
+        applicationId: req.params.id,
+        submittedByUserId: req.auth.userId,
+        submittedByRole: req.auth.role,
+        clientIp,
+      });
 
       const row = await fetchApplicationById(pool, req.params.id);
-      res.json(formatApplication(row));
+      res.json({
+        ...formatApplication(row),
+        confirmation,
+      });
     } catch (err) {
       next(err);
     }

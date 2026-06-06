@@ -16,6 +16,8 @@ import {
   buildAgentPerformanceAnalytics,
   buildAgentMetricTrends,
 } from '../lib/agentPerformanceAnalytics.js';
+import { fetchAgentCommissionCirculars } from '../lib/agentCommission.js';
+import { buildAgentRecentActivities } from '../lib/agentRecentActivities.js';
 
 export const portalDashboardsRouter = Router();
 
@@ -115,14 +117,15 @@ portalDashboardsRouter.get('/agent/dashboard', authenticate, async (req, res, ne
 
     const trends = buildAgentMetricTrends(apps, commissionEntries);
     const performanceAnalytics = buildAgentPerformanceAnalytics(apps, commissionEntries);
-    const [circulars] = await pool.execute(
-      `SELECT id, title, description, file_name, file_url, created_at
-       FROM agent_commission_circulars
-       WHERE is_active = 1
-       ORDER BY created_at DESC`,
-    );
+    const circulars = await fetchAgentCommissionCirculars(pool);
 
     const learningResources = await getAgentLearningFeed(pool, agentId);
+    const recentActivities = await buildAgentRecentActivities(pool, {
+      agentId,
+      agentCode,
+      commissionConfig,
+      limit: 15,
+    });
 
     res.json({
       profile: {
@@ -183,6 +186,7 @@ portalDashboardsRouter.get('/agent/dashboard', authenticate, async (req, res, ne
       },
       circulars,
       learningResources,
+      recentActivities,
       performanceAnalytics,
       weeklyPerformance: performanceAnalytics.month,
     });

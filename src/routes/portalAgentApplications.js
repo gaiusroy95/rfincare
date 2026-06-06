@@ -12,6 +12,7 @@ import {
   commissionStatusForApplication,
 } from '../lib/agentCustomerProvision.js';
 import { writeAuditLog } from '../lib/audit.js';
+import { finalizeApplicationSubmission } from '../lib/applicationSubmissionService.js';
 import { ensureAgentCodeForUser } from '../lib/agentCode.js';
 
 export const portalAgentApplicationsRouter = Router();
@@ -259,7 +260,19 @@ portalAgentApplicationsRouter.post('/applications/:id/submit', async (req, res, 
       },
     );
 
-    res.json({ ok: true, id: req.params.id, status: 'submitted' });
+    const clientIp =
+      req.headers['x-forwarded-for']?.toString()?.split(',')?.[0]?.trim()
+      || req.socket?.remoteAddress
+      || null;
+
+    const confirmation = await finalizeApplicationSubmission({
+      applicationId: req.params.id,
+      submittedByUserId: agentId,
+      submittedByRole: 'agent',
+      clientIp,
+    });
+
+    res.json({ ok: true, id: req.params.id, status: 'submitted', confirmation });
   } catch (err) {
     next(err);
   }

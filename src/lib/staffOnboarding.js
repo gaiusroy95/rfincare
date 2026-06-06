@@ -6,7 +6,7 @@ import { ensureOnboardingSchema } from '../db/ensureOnboardingSchema.js';
 import { newId } from './ids.js';
 import { sendStaffWelcomeEmail } from './email.js';
 import { reserveUniqueAgentCode } from './agentCode.js';
-import { ensureMilestone4Schema } from '../db/ensureMilestone4Schema.js';
+import { ensureAgentOnboardingQcSchema } from '../db/ensureMilestone4Schema.js';
 
 const baseStaffFields = {
   username: z.string().min(3).max(128),
@@ -52,7 +52,7 @@ function normalizeBody(body = {}) {
 
 export async function createAgentAccount(input, createdByUserId) {
   await ensureOnboardingSchema();
-  await ensureMilestone4Schema();
+  await ensureAgentOnboardingQcSchema();
   const data = CreateAgentSchema.parse(normalizeBody(input));
   const pool = getPool();
   const userId = newId();

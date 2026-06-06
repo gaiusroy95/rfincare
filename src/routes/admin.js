@@ -27,6 +27,7 @@ import {
 import { parseCsvToRows } from '../lib/parseCsv.js';
 import {
   buildAgentCommissionTemplateCsv,
+  fetchAgentCommissionCirculars,
   importAgentCommissionRows,
   mapCommissionConfigRow,
   normalizeCommissionCsvRow,
@@ -78,10 +79,11 @@ function storeCircularUploads(files = []) {
     const fullPath = resolve(circularDir, filename);
     writeFileSync(fullPath, f.buffer);
     const storedUrl = `/uploads/commission-circulars/${filename}`;
-    map[f.originalname] = { storedUrl, filename };
-    map[f.originalname.toLowerCase()] = { storedUrl, filename };
-    map[basename(f.originalname)] = { storedUrl, filename };
-    map[basename(f.originalname).toLowerCase()] = { storedUrl, filename };
+    const entry = { storedUrl, filename, filePath: fullPath, originalName: f.originalname };
+    map[f.originalname] = entry;
+    map[f.originalname.toLowerCase()] = entry;
+    map[basename(f.originalname)] = entry;
+    map[basename(f.originalname).toLowerCase()] = entry;
   }
   return map;
 }
@@ -737,12 +739,7 @@ adminRouter.get(
     try {
       await ensureStaffExtrasSchema();
       const pool = getPool();
-      const [rows] = await pool.execute(
-        `SELECT id, title, description, file_name, file_url, is_active, created_at
-         FROM agent_commission_circulars
-         WHERE is_active = 1
-         ORDER BY created_at DESC`,
-      );
+      const rows = await fetchAgentCommissionCirculars(pool);
       res.json(rows);
     } catch (err) {
       next(err);

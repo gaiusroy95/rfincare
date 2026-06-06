@@ -251,10 +251,14 @@ async function updateAgentProfileFromRow(pool, agent, row, updatedBy) {
   }
 }
 
-async function resolveCircularFileUrl(pool, row, circularFilesByName, updatedBy) {
+async function resolveCircularFileUrl(pool, row, circularFilesByName) {
   const uploadVal = row.upload;
   if (uploadVal) {
-    const matched = circularFilesByName[uploadVal] || circularFilesByName[uploadVal.toLowerCase()];
+    const matched =
+      circularFilesByName[uploadVal] ||
+      circularFilesByName[uploadVal.toLowerCase()] ||
+      circularFilesByName[uploadVal.split(/[/\\]/).pop()] ||
+      circularFilesByName[uploadVal.split(/[/\\]/).pop()?.toLowerCase()];
     if (matched?.storedUrl) return matched.storedUrl;
     if (/^https?:\/\//i.test(uploadVal) || uploadVal.startsWith('/uploads/')) {
       return uploadVal;
@@ -274,8 +278,126 @@ async function resolveCircularFileUrl(pool, row, circularFilesByName, updatedBy)
   return uploadVal || null;
 }
 
+function resolveCircularUploadMeta(row, circularFilesByName) {
+  const uploadVal = row.upload;
+  if (!uploadVal) return null;
+  return (
+    circularFilesByName[uploadVal] ||
+    circularFilesByName[uploadVal.toLowerCase()] ||
+    circularFilesByName[uploadVal.split(/[/\\]/).pop()] ||
+    circularFilesByName[uploadVal.split(/[/\\]/).pop()?.toLowerCase()] ||
+    null
+  );
+}
+
+export async function ensureCommissionCircularRecord(
+  pool,
+  { title, fileUrl, fileName, filePath, uploadedBy },
+) {
+  if (!fileUrl) return null;
+
+  const circularTitle = (title || fileName || 'Commission circular').trim();
+  const safeFileName = fileName || `${circularTitle}.pdf`;
+
+  const [[existingByUrl]] = await pool.execute(
+    `SELECT id FROM agent_commission_circulars
+     WHERE file_url = :url AND is_active = 1
+     LIMIT 1`,
+    { url: fileUrl },
+  );
+  if (existingByUrl?.id) return existingByUrl.id;
+
+  const [[existingByTitle]] = await pool.execute(
+    `SELECT id FROM agent_commission_circulars
+     WHERE title = :title AND is_active = 1
+     LIMIT 1`,
+    { title: circularTitle },
+  );
+  if (existingByTitle?.id) {
+    await pool.execute(
+      `UPDATE agent_commission_circulars
+       SET file_name = :file_name, file_path = :file_path, file_url = :file_url, uploaded_by = :uploaded_by
+       WHERE id = :id`,
+      {
+        id: existingByTitle.id,
+        file_name: safeFileName,
+        file_path: filePath || fileUrl,
+        file_url: fileUrl,
+        uploaded_by: uploadedBy || null,
+      },
+    );
+    return existingByTitle.id;
+  }
+
+  const id = newId();
+  await pool.execute(
+    `INSERT INTO agent_commission_circulars
+     (id, title, description, file_name, file_path, file_url, uploaded_by)
+     VALUES (:id, :title, NULL, :file_name, :file_path, :file_url, :uploaded_by)`,
+    {
+      id,
+      title: circularTitle,
+      file_name: safeFileName,
+      file_path: filePath || fileUrl,
+      file_url: fileUrl,
+      uploaded_by: uploadedBy || null,
+    },
+  );
+  return id;
+}
+
+/** Circulars for agent dashboard — table rows plus legacy config-only uploads. */
+export async function fetchAgentCommissionCirculars(pool) {
+  const [rows] = await pool.execute(
+    `SELECT id, title, description, file_name, file_url, created_at
+     FROM agent_commission_circulars
+     WHERE is_active = 1
+     ORDER BY created_at DESC`,
+  );
+
+  const seenUrls = new Set((rows || []).map((row) => row.file_url).filter(Boolean));
+  const circulars = [...(rows || [])];
+
+  const [configRows] = await pool.execute(
+    `SELECT DISTINCT circular_title, circular_file_url, updated_at
+     FROM agent_commission_config
+     WHERE circular_file_url IS NOT NULL AND TRIM(circular_file_url) != ''
+     ORDER BY updated_at DESC`,
+  );
+
+  for (const cfg of configRows || []) {
+    const fileUrl = cfg.circular_file_url;
+    if (!fileUrl || seenUrls.has(fileUrl)) continue;
+    seenUrls.add(fileUrl);
+    circulars.push({
+      id: `cfg-${Buffer.from(fileUrl).toString('base64url').slice(0, 12)}`,
+      title: cfg.circular_title || 'Commission circular',
+      description: null,
+      file_name: cfg.circular_title || 'circular.pdf',
+      file_url: fileUrl,
+      created_at: cfg.updated_at,
+    });
+  }
+
+  circulars.sort(
+    (a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime(),
+  );
+  return circulars;
+}
+
 export async function upsertAgentCommissionConfig(pool, agentUserId, row, { updatedBy, circularFilesByName = {} }) {
-  const circularFileUrl = await resolveCircularFileUrl(pool, row, circularFilesByName, updatedBy);
+  const circularFileUrl = await resolveCircularFileUrl(pool, row, circularFilesByName);
+  const uploadMeta = resolveCircularUploadMeta(row, circularFilesByName);
+
+  if (circularFileUrl) {
+    await ensureCommissionCircularRecord(pool, {
+      title: row.circularTitle || uploadMeta?.originalName || row.upload || 'Commission circular',
+      fileUrl: circularFileUrl,
+      fileName: uploadMeta?.filename || row.upload || 'circular.pdf',
+      filePath: uploadMeta?.filePath || circularFileUrl,
+      uploadedBy: updatedBy,
+    });
+  }
 
   const [[existing]] = await pool.execute(
     `SELECT id FROM agent_commission_config

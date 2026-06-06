@@ -9,6 +9,7 @@ import { newId } from '../lib/ids.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { authorize } from '../middleware/authorize.js';
 import { ensureAgentLearningSchema } from '../db/ensureAgentLearningSchema.js';
+import { fetchAgentCommissionCirculars } from '../lib/agentCommission.js';
 
 export const adminAgentLearningRouter = Router();
 export const portalAgentLearningRouter = Router();
@@ -94,12 +95,7 @@ async function fetchLearningForAgent(pool, agentUserId) {
 /** Include legacy commission circulars in agent feed */
 async function fetchLegacyCirculars(pool) {
   try {
-    const [rows] = await pool.execute(
-      `SELECT id, title, description, file_name, file_url, created_at
-       FROM agent_commission_circulars
-       WHERE is_active = 1
-       ORDER BY created_at DESC`,
-    );
+    const rows = await fetchAgentCommissionCirculars(pool);
     return rows.map((r) => ({
       id: `circular-${r.id}`,
       contentType: 'circular',

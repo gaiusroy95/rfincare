@@ -8,15 +8,80 @@ import { authorize } from '../middleware/authorize.js';
 import { ensureStaffMessagingSchema } from '../db/ensureStaffMessagingSchema.js';
 import { sendEmail } from '../lib/email.js';
 import { writeAuditLog } from '../lib/audit.js';
+import { ensureAgentCodeForUser } from '../lib/agentCode.js';
 
 export const staffCommunicationRouter = Router();
 export const adminHierarchyRouter = Router();
 
 const STAFF_ROLES = new Set(['admin', 'super_admin', 'employee', 'agent']);
 
-function threadKeyForPair(userIdA, userIdB, applicationId = null) {
+function agentApplicationScopeSql(alias = 'la') {
+  return `(
+    ${alias}.agent_id = :agent_id
+    OR (
+      :agent_code IS NOT NULL
+      AND ${alias}.sourced_agent_code IS NOT NULL
+      AND ${alias}.sourced_agent_code = :agent_code
+    )
+  )`;
+}
+
+async function resolveAgentScopeParams(pool, agentUserId) {
+  const agentCode = (await ensureAgentCodeForUser(pool, agentUserId)) || null;
+  return { agent_id: agentUserId, agent_code: agentCode };
+}
+
+async function resolveAgentUserIdFromApplication(pool, app) {
+  if (app?.agent_id) return app.agent_id;
+  if (!app?.sourced_agent_code) return null;
+  const [[row]] = await pool.execute(
+    `SELECT user_id FROM agent_onboarding WHERE agent_code = :code LIMIT 1`,
+    { code: app.sourced_agent_code },
+  );
+  return row?.user_id || null;
+}
+
+async function agentCanAccessApplication(pool, agentUserId, applicationId) {
+  if (!applicationId) return null;
+  const scope = await resolveAgentScopeParams(pool, agentUserId);
+  const [[row]] = await pool.execute(
+    `SELECT agent_id, assigned_employee_id, sourced_agent_code
+     FROM loan_applications
+     WHERE id = :id AND ${agentApplicationScopeSql('loan_applications')}
+     LIMIT 1`,
+    { id: applicationId, ...scope },
+  );
+  return row || null;
+}
+
+function pairThreadKey(userIdA, userIdB) {
   const sorted = [userIdA, userIdB].sort().join(':');
-  return applicationId ? `app:${applicationId}:${sorted}` : `pair:${sorted}`;
+  return `pair:${sorted}`;
+}
+
+function threadKeyForPair(userIdA, userIdB) {
+  return pairThreadKey(userIdA, userIdB);
+}
+
+function messagePairParams(userId, peerId) {
+  const sorted = [userId, peerId].sort().join(':');
+  return {
+    pairKey: pairThreadKey(userId, peerId),
+    appThreadPattern: `app:%:${sorted}`,
+    userId,
+    peerId,
+  };
+}
+
+function messagePairSql() {
+  return `(
+    thread_key = :pairKey
+    OR thread_key LIKE :appThreadPattern
+    OR (
+      sender_id IN (:userId, :peerId)
+      AND recipient_id IN (:userId, :peerId)
+    )
+  )`;
 }
 
 async function fetchHierarchyMapping(pool, agentUserId, employeeUserId = null) {
@@ -42,40 +107,66 @@ async function fetchHierarchyMapping(pool, agentUserId, employeeUserId = null) {
 
 async function resolvePeerForUser(pool, userId, role, applicationId = null) {
   if (applicationId) {
-    const [[app]] = await pool.execute(
-      `SELECT agent_id, assigned_employee_id FROM loan_applications WHERE id = :id LIMIT 1`,
-      { id: applicationId },
-    );
-    if (!app) return null;
-    if (role === 'agent' && app.assigned_employee_id) {
-      const mappings = await fetchHierarchyMapping(pool, userId, app.assigned_employee_id);
-      const map = mappings[0];
-      const [[emp]] = await pool.execute(
-        `SELECT id, full_name, email FROM user_profiles WHERE id = :id LIMIT 1`,
-        { id: app.assigned_employee_id },
+    let app = null;
+    if (role === 'agent') {
+      app = await agentCanAccessApplication(pool, userId, applicationId);
+    } else if (role === 'employee') {
+      const [[row]] = await pool.execute(
+        `SELECT agent_id, assigned_employee_id, sourced_agent_code
+         FROM loan_applications
+         WHERE id = :applicationId AND assigned_employee_id = :employeeId
+         LIMIT 1`,
+        { applicationId, employeeId: userId },
       );
-      return {
-        peerId: emp?.id,
-        peerName: emp?.full_name,
-        peerEmail: emp?.email,
-        communicationEmail: map?.communication_email || emp?.email,
-        applicationId,
-      };
+      app = row || null;
+    } else {
+      const [[row]] = await pool.execute(
+        `SELECT agent_id, assigned_employee_id, sourced_agent_code
+         FROM loan_applications WHERE id = :id LIMIT 1`,
+        { id: applicationId },
+      );
+      app = row || null;
     }
-    if (role === 'employee' && app.agent_id) {
-      const mappings = await fetchHierarchyMapping(pool, app.agent_id, userId);
-      const map = mappings[0];
-      const [[agent]] = await pool.execute(
-        `SELECT id, full_name, email FROM user_profiles WHERE id = :id LIMIT 1`,
-        { id: app.agent_id },
-      );
-      return {
-        peerId: agent?.id,
-        peerName: agent?.full_name,
-        peerEmail: agent?.email,
-        communicationEmail: map?.communication_email || agent?.email,
-        applicationId,
-      };
+
+    if (app) {
+      if (role === 'agent' && app.assigned_employee_id) {
+        const mappings = await fetchHierarchyMapping(pool, userId, app.assigned_employee_id);
+        const map = mappings[0];
+        const [[emp]] = await pool.execute(
+          `SELECT id, full_name, email FROM user_profiles WHERE id = :id LIMIT 1`,
+          { id: app.assigned_employee_id },
+        );
+        if (emp?.id) {
+          return {
+            peerId: emp.id,
+            peerName: emp.full_name,
+            peerEmail: emp.email,
+            communicationEmail: map?.communication_email || emp.email,
+            applicationId,
+          };
+        }
+      }
+
+      if (role === 'employee') {
+        const agentUserId = await resolveAgentUserIdFromApplication(pool, app);
+        if (agentUserId) {
+          const mappings = await fetchHierarchyMapping(pool, agentUserId, userId);
+          const map = mappings[0];
+          const [[agent]] = await pool.execute(
+            `SELECT id, full_name, email FROM user_profiles WHERE id = :id LIMIT 1`,
+            { id: agentUserId },
+          );
+          if (agent?.id) {
+            return {
+              peerId: agent.id,
+              peerName: agent.full_name,
+              peerEmail: agent.email,
+              communicationEmail: map?.communication_email || agent.email,
+              applicationId,
+            };
+          }
+        }
+      }
     }
   }
 
@@ -326,13 +417,14 @@ staffCommunicationRouter.get('/context', async (req, res, next) => {
 
     let applications = [];
     if (req.auth.role === 'agent') {
+      const scope = await resolveAgentScopeParams(pool, req.auth.userId);
       const [apps] = await pool.execute(
         `SELECT la.id, la.application_number, c.full_name AS customer_name
          FROM loan_applications la
          LEFT JOIN user_profiles c ON c.id = la.customer_id
-         WHERE la.agent_id = :id
+         WHERE ${agentApplicationScopeSql('la')}
          ORDER BY la.updated_at DESC LIMIT 50`,
-        { id: req.auth.userId },
+        scope,
       );
       applications = apps.map((a) => ({
         id: a.id,
@@ -396,19 +488,18 @@ staffCommunicationRouter.get('/messages', async (req, res, next) => {
     await ensureStaffMessagingSchema();
     const pool = getPool();
     const peerId = req.query.peerId;
-    const applicationId = req.query.applicationId || null;
 
     if (!peerId) {
       return res.status(400).json({ error: 'peerId is required' });
     }
 
-    const threadKey = threadKeyForPair(req.auth.userId, peerId, applicationId);
+    const threadParams = messagePairParams(req.auth.userId, peerId);
     const [rows] = await pool.execute(
       `SELECT * FROM staff_messages
-       WHERE thread_key = :threadKey
+       WHERE ${messagePairSql()}
        ORDER BY created_at ASC
        LIMIT 200`,
-      { threadKey },
+      threadParams,
     );
 
     const messageIds = rows.map((r) => r.id);
@@ -436,8 +527,9 @@ staffCommunicationRouter.get('/messages', async (req, res, next) => {
 
     await pool.execute(
       `UPDATE staff_messages SET read_at = NOW(3)
-       WHERE thread_key = :threadKey AND recipient_id = :userId AND read_at IS NULL`,
-      { threadKey, userId: req.auth.userId },
+       WHERE recipient_id = :userId AND read_at IS NULL
+       AND ${messagePairSql()}`,
+      { ...threadParams, userId: req.auth.userId },
     );
 
     res.json(rows.map((r) => formatMessageRow(r, attachmentsByMessage[r.id] || [])));
@@ -509,7 +601,7 @@ staffCommunicationRouter.post('/messages', async (req, res, next) => {
 
     const channel = input.channel || 'internal';
     const messageId = newId();
-    const threadKey = threadKeyForPair(req.auth.userId, input.peerId, input.applicationId || null);
+    const threadKey = threadKeyForPair(req.auth.userId, input.peerId);
 
     await pool.execute(
       `INSERT INTO staff_messages
@@ -533,18 +625,27 @@ staffCommunicationRouter.post('/messages', async (req, res, next) => {
     const attachments = [];
     for (const docId of documentIds) {
       const [[doc]] = await pool.execute(
-        `SELECT cd.*, la.agent_id, la.assigned_employee_id
+        `SELECT cd.*, la.agent_id, la.assigned_employee_id, la.sourced_agent_code
          FROM customer_documents cd
          LEFT JOIN loan_applications la ON la.id = cd.application_id
          WHERE cd.id = :id LIMIT 1`,
         { id: docId },
       );
       if (!doc) continue;
-      const canAttach =
+      let canAttach =
         req.auth.role === 'admin'
         || req.auth.role === 'super_admin'
-        || (req.auth.role === 'agent' && doc.agent_id === req.auth.userId)
         || (req.auth.role === 'employee' && doc.assigned_employee_id === req.auth.userId);
+      if (!canAttach && req.auth.role === 'agent') {
+        const scope = await resolveAgentScopeParams(pool, req.auth.userId);
+        canAttach =
+          doc.agent_id === req.auth.userId
+          || (
+            scope.agent_code
+            && doc.sourced_agent_code
+            && doc.sourced_agent_code === scope.agent_code
+          );
+      }
       if (!canAttach) continue;
 
       const attId = newId();
@@ -611,16 +712,23 @@ staffCommunicationRouter.get('/documents', async (req, res, next) => {
     }
 
     const pool = getPool();
-    const [[app]] = await pool.execute(
-      `SELECT agent_id, assigned_employee_id, customer_id FROM loan_applications WHERE id = :id LIMIT 1`,
-      { id: applicationId },
-    );
+    let app = null;
+    if (req.auth.role === 'agent') {
+      app = await agentCanAccessApplication(pool, req.auth.userId, applicationId);
+    } else {
+      const [[row]] = await pool.execute(
+        `SELECT agent_id, assigned_employee_id, customer_id
+         FROM loan_applications WHERE id = :id LIMIT 1`,
+        { id: applicationId },
+      );
+      app = row || null;
+    }
     if (!app) return res.status(404).json({ error: 'Application not found' });
 
     const allowed =
       ['admin', 'super_admin'].includes(req.auth.role)
-      || (req.auth.role === 'agent' && app.agent_id === req.auth.userId)
-      || (req.auth.role === 'employee' && app.assigned_employee_id === req.auth.userId);
+      || (req.auth.role === 'employee' && app.assigned_employee_id === req.auth.userId)
+      || req.auth.role === 'agent';
     if (!allowed) {
       return res.status(403).json({ error: 'Insufficient permissions for this application' });
     }
@@ -644,6 +752,26 @@ staffCommunicationRouter.get('/documents', async (req, res, next) => {
         uploadedAt: r.uploaded_at,
       })),
     );
+  } catch (err) {
+    next(err);
+  }
+});
+
+staffCommunicationRouter.get('/unread-count', async (req, res, next) => {
+  try {
+    if (!STAFF_ROLES.has(req.auth.role)) {
+      const e = new Error('Staff access only');
+      e.status = 403;
+      throw e;
+    }
+    await ensureStaffMessagingSchema();
+    const pool = getPool();
+    const [[row]] = await pool.execute(
+      `SELECT COUNT(*) AS cnt FROM staff_messages
+       WHERE recipient_id = :userId AND read_at IS NULL`,
+      { userId: req.auth.userId },
+    );
+    res.json({ count: Number(row?.cnt || 0) });
   } catch (err) {
     next(err);
   }

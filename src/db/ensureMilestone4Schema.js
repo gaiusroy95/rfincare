@@ -16,14 +16,77 @@ async function tryAlter(sql) {
   }
 }
 
-export async function ensureMilestone4Schema() {
-  if (ensured) return;
+function stripSqlComments(sql) {
+  return sql
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*--[^\n]*\n/gm, '\n')
+    .trim();
+}
+
+export async function ensureCibilCoreTables(pool = getPool()) {
+  await pool.execute(
+    `CREATE TABLE IF NOT EXISTS cibil_vendors (
+      vendor_key VARCHAR(32) NOT NULL PRIMARY KEY,
+      display_name VARCHAR(128) NOT NULL,
+      api_key VARCHAR(512) NULL,
+      api_secret VARCHAR(512) NULL,
+      sandbox_mode TINYINT(1) NOT NULL DEFAULT 1,
+      is_active TINYINT(1) NOT NULL DEFAULT 0,
+      updated_by CHAR(36) NULL,
+      updated_at DATETIME(3) NULL,
+      created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+    )`,
+  );
+  await pool.execute(
+    `INSERT INTO cibil_vendors (vendor_key, display_name, sandbox_mode, is_active) VALUES
+      ('transunion_cibil', 'TransUnion CIBIL', 1, 1),
+      ('experian', 'Experian', 1, 0),
+      ('equifax', 'Equifax', 1, 0),
+      ('crif_high_mark', 'CRIF High Mark', 1, 0)
+     ON DUPLICATE KEY UPDATE display_name = VALUES(display_name)`,
+  );
+  await pool.execute(
+    `CREATE TABLE IF NOT EXISTS cibil_checks (
+      id CHAR(36) NOT NULL PRIMARY KEY,
+      application_id CHAR(36) NOT NULL,
+      customer_id CHAR(36) NOT NULL,
+      vendor_key VARCHAR(32) NOT NULL,
+      status VARCHAR(32) NOT NULL,
+      credit_score INT NULL,
+      report_path TEXT NULL,
+      error_message TEXT NULL,
+      request_payload JSON NULL,
+      response_payload JSON NULL,
+      checked_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+      KEY idx_cibil_app (application_id),
+      KEY idx_cibil_customer (customer_id)
+    )`,
+  );
+}
+
+export async function ensureAgentOnboardingQcSchema() {
   const pool = getPool();
-  const sql = readFileSync(join(__dirname, '../../migrations/026_milestone4.sql'), 'utf8');
+  await tryAlter(
+    `ALTER TABLE agent_onboarding ADD COLUMN qc_status VARCHAR(32) NOT NULL DEFAULT 'pending_qc'`,
+  );
+  await tryAlter(`ALTER TABLE agent_onboarding ADD COLUMN qc_employee_id CHAR(36) NULL`);
+  await tryAlter(`ALTER TABLE agent_onboarding ADD COLUMN qc_notes TEXT NULL`);
+  await tryAlter(`ALTER TABLE agent_onboarding ADD COLUMN qc_at DATETIME(3) NULL`);
+  await tryAlter(`ALTER TABLE agent_onboarding ADD COLUMN qc_approved_by CHAR(36) NULL`);
+}
+
+export async function ensureMilestone4Schema() {
+  const pool = getPool();
+  await ensureCibilCoreTables(pool);
+  if (ensured) return;
+
+  const sql = stripSqlComments(
+    readFileSync(join(__dirname, '../../migrations/026_milestone4.sql'), 'utf8'),
+  );
   const statements = sql
     .split(';')
     .map((s) => s.trim())
-    .filter((s) => s && !s.startsWith('--') && !s.startsWith('ALTER TABLE'));
+    .filter((s) => s && !s.startsWith('ALTER TABLE'));
 
   for (const statement of statements) {
     try {

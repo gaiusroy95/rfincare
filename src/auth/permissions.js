@@ -43,6 +43,7 @@ export const PERMISSIONS = {
     'read:approval_matrix',
     'read:documents',
     'update:documents',
+    'read:reports',
   ],
   admin: [
     'read:*',

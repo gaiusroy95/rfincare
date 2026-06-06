@@ -63,6 +63,7 @@ export function createApp({ serveStatic = true } = {}) {
   app.use('/banks', banksRouter);
   app.use('/bank-products', bankProductsRouter);
   app.use('/documents', documentsRouter);
+  app.use('/api/documents', documentsRouter);
   app.use('/states', statesRouter);
   app.use('/loan-applications', loanApplicationsRouter);
   app.use('/admin', adminRouter);
