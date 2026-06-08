@@ -363,7 +363,17 @@ authRouter.get('/me', async (req, res, next) => {
       throw e;
     }
 
-    res.json({ user: { id: profile.id, email: profile.email }, profile });
+    let employeeAccess = null;
+    if (profile.role === 'employee') {
+      const { getEffectiveEmployeeAccess } = await import('../lib/employeeAccessControls.js');
+      employeeAccess = await getEffectiveEmployeeAccess(profile.id);
+    }
+
+    res.json({
+      user: { id: profile.id, email: profile.email, role: profile.role },
+      profile,
+      employeeAccess,
+    });
   } catch (err) {
     next(err);
   }

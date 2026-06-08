@@ -7,6 +7,11 @@ import { getPool } from '../db/pool.js';
 import { ensureMilestone4Schema } from '../db/ensureMilestone4Schema.js';
 import { dispatchFileUpdateNotification } from '../lib/fileNotificationService.js';
 import { ensureAgentCodeForUser } from '../lib/agentCode.js';
+import {
+  assertEmployeeAccess,
+  getEffectiveEmployeeAccess,
+  requireEmployeeModuleAccess,
+} from '../lib/employeeAccessControls.js';
 
 export const portalEmployeeMilestone4Router = Router();
 
@@ -23,6 +28,7 @@ portalEmployeeMilestone4Router.use(authenticate);
 portalEmployeeMilestone4Router.get('/customers/:customerId', async (req, res, next) => {
   try {
     requireEmployee(req);
+    await assertEmployeeAccess(req, 'customers', 'read');
     const pool = getPool();
     const [[customer]] = await pool.execute(
       `SELECT id, full_name, email, phone, avatar_url, customer_code, created_at
@@ -56,6 +62,10 @@ portalEmployeeMilestone4Router.get('/customers/:customerId', async (req, res, ne
 portalEmployeeMilestone4Router.get('/agent-onboarding/pending', async (req, res, next) => {
   try {
     requireEmployee(req);
+    if (req.auth.role === 'employee') {
+      const access = await getEffectiveEmployeeAccess(req.auth.userId);
+      requireEmployeeModuleAccess(access, 'agents', 'read');
+    }
     await ensureMilestone4Schema();
     const pool = getPool();
     const [rows] = await pool.execute(
@@ -93,6 +103,14 @@ portalEmployeeMilestone4Router.post('/agent-onboarding/:userId/qc', async (req, 
     requireEmployee(req);
     await ensureMilestone4Schema();
     const input = QcDecisionSchema.parse(req.body);
+    if (req.auth.role === 'employee') {
+      const access = await getEffectiveEmployeeAccess(req.auth.userId);
+      requireEmployeeModuleAccess(
+        access,
+        'agents',
+        input.decision === 'approved' ? 'approve' : 'reject',
+      );
+    }
     const pool = getPool();
 
     const [[agent]] = await pool.execute(

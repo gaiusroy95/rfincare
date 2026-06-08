@@ -6,9 +6,10 @@ import { newId } from '../lib/ids.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { authorize } from '../middleware/authorize.js';
 import { ensureStaffMessagingSchema } from '../db/ensureStaffMessagingSchema.js';
-import { sendEmail } from '../lib/email.js';
+import { sendEmail, smtpConfigured } from '../lib/email.js';
 import { writeAuditLog } from '../lib/audit.js';
 import { ensureAgentCodeForUser } from '../lib/agentCode.js';
+import { resolveUploadFilePath } from '../lib/uploadPaths.js';
 
 export const staffCommunicationRouter = Router();
 export const adminHierarchyRouter = Router();
@@ -208,7 +209,33 @@ async function resolvePeerForUser(pool, userId, role, applicationId = null) {
   return null;
 }
 
-function formatMessageRow(row, attachments = []) {
+function getPublicApiBaseUrl() {
+  return (
+    process.env.API_PUBLIC_URL
+    || process.env.APP_PUBLIC_URL
+    || 'http://127.0.0.1:8080'
+  ).replace(/\/$/, '');
+}
+
+function formatAttachmentRow(att) {
+  const documentId = att.document_id || att.documentId || null;
+  const storedUrl = att.file_url || att.fileUrl || '';
+  const fileUrl = documentId
+    ? `/documents/${documentId}/download`
+    : storedUrl.startsWith('/documents/')
+      ? storedUrl
+      : storedUrl;
+  return {
+    id: att.id,
+    documentId,
+    fileName: att.file_name || att.fileName,
+    fileUrl,
+    documentType: att.document_type || att.documentType,
+    mimeType: att.mime_type || att.mimeType,
+  };
+}
+
+function formatMessageRow(row, attachments = [], extra = {}) {
   return {
     id: row.id,
     threadKey: row.thread_key,
@@ -221,8 +248,32 @@ function formatMessageRow(row, attachments = []) {
     emailTo: row.email_to,
     createdAt: row.created_at,
     readAt: row.read_at,
-    attachments,
+    attachments: attachments.map(formatAttachmentRow),
+    ...extra,
   };
+}
+
+async function buildEmailFileAttachments(pool, documentIds = []) {
+  const files = [];
+  for (const docId of documentIds) {
+    const [[doc]] = await pool.execute(
+      `SELECT document_name, file_path, document_url, mime_type
+       FROM customer_documents WHERE id = :id LIMIT 1`,
+      { id: docId },
+    );
+    if (!doc) continue;
+    const resolvedPath = resolveUploadFilePath(doc.file_path, [
+      doc.document_name,
+      doc.document_url,
+    ]);
+    if (!resolvedPath) continue;
+    files.push({
+      filename: doc.document_name || `document-${docId}`,
+      path: resolvedPath,
+      contentType: doc.mime_type || undefined,
+    });
+  }
+  return files;
 }
 
 // ——— Admin hierarchy CRUD ———
@@ -649,7 +700,7 @@ staffCommunicationRouter.post('/messages', async (req, res, next) => {
       if (!canAttach) continue;
 
       const attId = newId();
-      const fileUrl = doc.document_url || `/documents/${doc.id}/download`;
+      const fileUrl = `/documents/${doc.id}/download`;
       await pool.execute(
         `INSERT INTO staff_message_attachments
          (id, message_id, document_id, file_name, file_url, document_type, mime_type)
@@ -674,26 +725,72 @@ staffCommunicationRouter.post('/messages', async (req, res, next) => {
       });
     }
 
+    let emailDelivery = null;
     if (channel === 'email' && communicationEmail) {
-      const appUrl = process.env.APP_PUBLIC_URL || 'http://127.0.0.1:4028';
+      const apiBase = getPublicApiBaseUrl();
+      const portalUrl = (process.env.APP_PUBLIC_URL || apiBase).replace(/\/$/, '');
       const attachLines = attachments.length
-        ? attachments.map((a) => `- ${a.fileName}: ${appUrl}${a.fileUrl}`).join('\n')
+        ? attachments
+            .map((a) => {
+              const link = a.documentId
+                ? `${apiBase}/documents/${a.documentId}/download`
+                : a.fileUrl?.startsWith('http')
+                  ? a.fileUrl
+                  : `${apiBase}${a.fileUrl?.startsWith('/') ? a.fileUrl : `/${a.fileUrl || ''}`}`;
+              return `- ${a.fileName}: ${link}`;
+            })
+            .join('\n')
         : '';
-      await sendEmail({
+      const emailSubject = input.subject || 'Rfincare — message from your assigned contact';
+      const emailText = [
+        input.body,
+        '',
+        attachLines ? 'Attached documents (also included as email attachments when available):\n' + attachLines : '',
+        '',
+        `Open Rfincare: ${portalUrl}`,
+        '',
+        '— Rfincare Staff Communication',
+      ]
+        .filter((line, idx, arr) => !(line === '' && arr[idx + 1] === ''))
+        .join('\n');
+
+      const emailHtml = `
+        <p>${String(input.body).replace(/\n/g, '<br/>')}</p>
+        ${
+          attachLines
+            ? `<p><strong>Documents</strong></p><ul>${attachments
+                .map((a) => {
+                  const link = a.documentId
+                    ? `${apiBase}/documents/${a.documentId}/download`
+                    : `${apiBase}${a.fileUrl || ''}`;
+                  return `<li><a href="${link}">${a.fileName || 'Document'}</a></li>`;
+                })
+                .join('')}</ul>`
+            : ''
+        }
+        <p><a href="${portalUrl}">Open Rfincare</a></p>
+        <p>— Rfincare Staff Communication</p>
+      `;
+
+      const emailAttachments = await buildEmailFileAttachments(pool, documentIds);
+      emailDelivery = await sendEmail({
         to: communicationEmail,
-        subject: input.subject || 'Rfincare — message from your assigned contact',
-        text: [
-          input.body,
-          '',
-          attachLines ? 'Attached documents:\n' + attachLines : '',
-          '',
-          '— Rfincare Staff Communication',
-        ].join('\n'),
+        subject: emailSubject,
+        text: emailText,
+        html: emailHtml,
+        attachments: emailAttachments,
       });
+      emailDelivery = {
+        ...emailDelivery,
+        to: communicationEmail,
+        smtpConfigured: smtpConfigured(),
+      };
     }
 
     const [[row]] = await pool.execute(`SELECT * FROM staff_messages WHERE id = :id`, { id: messageId });
-    res.status(201).json(formatMessageRow(row, attachments));
+    res.status(201).json(
+      formatMessageRow(row, attachments, emailDelivery ? { emailDelivery } : {}),
+    );
   } catch (err) {
     next(err);
   }

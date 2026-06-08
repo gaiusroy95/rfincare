@@ -14,6 +14,11 @@ import { requireSuccessfulCibilForSubmit } from '../lib/cibilService.js';
 import { dispatchFileUpdateNotification } from '../lib/fileNotificationService.js';
 import { buildSimpleTextPdf } from '../lib/simplePdf.js';
 import { finalizeApplicationSubmission } from '../lib/applicationSubmissionService.js';
+import {
+  assertEmployeeAccess,
+  requireEmployeeModuleAccess,
+  getEffectiveEmployeeAccess,
+} from '../lib/employeeAccessControls.js';
 
 export const loanApplicationsRouter = Router();
 
@@ -282,6 +287,7 @@ loanApplicationsRouter.get(
   authenticate,
   async (req, res, next) => {
     try {
+      await assertEmployeeAccess(req, 'applications', 'read');
       const pool = getPool();
       const { where, params } = buildListQuery(req.auth.role, req.auth.userId, {});
       const [rows] = await pool.execute(
@@ -546,6 +552,10 @@ loanApplicationsRouter.get(
         throw e;
       }
 
+      if (req.auth.role === 'employee' && isAssignee) {
+        await assertEmployeeAccess(req, 'applications', 'read');
+      }
+
       res.json(app);
     } catch (err) {
       next(err);
@@ -671,6 +681,23 @@ loanApplicationsRouter.patch(
         const e = new Error('Insufficient permissions');
         e.status = 403;
         throw e;
+      }
+
+      if (req.auth.role === 'employee') {
+        if (existing.assigned_employee_id !== req.auth.userId) {
+          const e = new Error('Insufficient permissions');
+          e.status = 403;
+          throw e;
+        }
+        const access = await getEffectiveEmployeeAccess(req.auth.userId);
+        const statusValue = req.body?.status ?? null;
+        if (statusValue === 'approved') {
+          requireEmployeeModuleAccess(access, 'applications', 'approve');
+        } else if (statusValue === 'rejected') {
+          requireEmployeeModuleAccess(access, 'applications', 'reject');
+        } else {
+          requireEmployeeModuleAccess(access, 'applications', 'write');
+        }
       }
 
       const input = PatchSchema.parse(req.body);

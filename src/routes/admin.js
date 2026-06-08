@@ -12,6 +12,10 @@ import { assignUniqueCustomerCode } from '../lib/customerCode.js';
 import { writeAuditLog } from '../lib/audit.js';
 import { newId } from '../lib/ids.js';
 import { ensureStaffExtrasSchema } from '../db/ensureStaffExtrasSchema.js';
+import {
+  buildEffectiveEmployeeAccess,
+  fetchEmployeeAccessControlsMap,
+} from '../lib/employeeAccessControls.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { authorize } from '../middleware/authorize.js';
 import { approvalMatrixRouter } from './approvalMatrixRules.js';
@@ -115,10 +119,17 @@ function mapAgentProfile(row) {
   };
 }
 
-function mapEmployeeProfile(row) {
+function mapEmployeeProfile(row, accessRows = []) {
   const employeeCode =
     row.employee_code ||
     (row.id ? `EMP-${String(row.id).slice(0, 8).toUpperCase()}` : 'N/A');
+  const accessControls = accessRows.map((r) => ({
+    moduleName: r.moduleName,
+    permissions: r.permissions || [],
+    isActive: r.isActive,
+    expiresAt: r.expiresAt,
+  }));
+  const effective = buildEffectiveEmployeeAccess(accessRows);
   return {
     id: row.id,
     email: row.email,
@@ -131,7 +142,11 @@ function mapEmployeeProfile(row) {
       role: row.role,
       is_active: Boolean(row.is_active),
     },
-    access_controls: [],
+    access_controls: accessControls,
+    granted_modules: effective?.grantedModuleLabels || [],
+    access_configured: accessRows.length > 0,
+    access_active: effective ? effective.isActive : true,
+    access_expires_at: effective?.expiresAt || null,
   };
 }
 
@@ -279,6 +294,7 @@ adminRouter.get(
     try {
       const pool = getPool();
       await ensureOnboardingSchema();
+      await ensureStaffExtrasSchema();
       const [rows] = await pool.execute(
         `SELECT up.*,
                 eo.employee_code,
@@ -286,10 +302,13 @@ adminRouter.get(
                 eo.onboarding_status AS eo_status
          FROM user_profiles up
          LEFT JOIN employee_onboarding eo ON eo.user_id = up.id
-         WHERE up.role = 'employee'
+         WHERE up.role COLLATE utf8mb4_unicode_ci = 'employee'
          ORDER BY up.created_at DESC`,
       );
-      res.json(rows.map(mapEmployeeProfile));
+      const accessByUser = await fetchEmployeeAccessControlsMap(rows.map((r) => r.id));
+      res.json(
+        rows.map((row) => mapEmployeeProfile(row, accessByUser[row.id] || [])),
+      );
     } catch (err) {
       next(err);
     }

@@ -20,6 +20,11 @@ import { writeAuditLog } from '../lib/audit.js';
 import { dispatchFileUpdateNotification } from '../lib/fileNotificationService.js';
 import { createCustomerNotification } from './notifications.js';
 import { ensureAgentCodeForUser } from '../lib/agentCode.js';
+import {
+  assertEmployeeAccess,
+  requireEmployeeModuleAccess,
+  getEffectiveEmployeeAccess,
+} from '../lib/employeeAccessControls.js';
 
 export const documentsRouter = Router();
 
@@ -363,11 +368,22 @@ documentsRouter.get(
           `application_id IN (SELECT id FROM loan_applications WHERE ${agentApplicationScopeSql('loan_applications')})`,
         );
         Object.assign(params, scope);
+      } else if (req.auth.role === 'employee') {
+        await assertEmployeeAccess(req, 'documents', 'read');
+        conditions.push(
+          `application_id IN (SELECT id FROM loan_applications WHERE assigned_employee_id = :employee_id)`,
+        );
+        params.employee_id = req.auth.userId;
+        if (req.query.status === 'pending') {
+          conditions.push(
+            `COALESCE(verification_status, status, 'pending') IN ('pending','uploaded')`,
+          );
+        }
       } else if (isStaff && customerId) {
         conditions.push('customer_id = :customer_id');
         params.customer_id = customerId;
       } else if (isStaff) {
-        /* staff: all documents when no filter */
+        /* admin staff: all documents when no filter */
       } else {
         const ownerId = customerId || req.auth.userId;
         if (ownerId !== req.auth.userId && req.auth.role === 'customer') {
@@ -565,6 +581,18 @@ documentsRouter.patch(
         const e = new Error('Insufficient permissions');
         e.status = 403;
         throw e;
+      }
+
+      if (req.auth.role === 'employee') {
+        const access = await getEffectiveEmployeeAccess(req.auth.userId);
+        const inputPreview = VerifyDocumentSchema.parse(req.body);
+        if (inputPreview.status === 'approved') {
+          requireEmployeeModuleAccess(access, 'documents', 'approve');
+        } else if (inputPreview.status === 'rejected') {
+          requireEmployeeModuleAccess(access, 'documents', 'reject');
+        } else {
+          requireEmployeeModuleAccess(access, 'documents', 'write');
+        }
       }
 
       await ensureDocumentSchema();

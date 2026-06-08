@@ -2,7 +2,10 @@ import bcrypt from 'bcryptjs';
 import { z } from 'zod';
 
 import { getPool } from '../db/pool.js';
-import { ensureOnboardingSchema } from '../db/ensureOnboardingSchema.js';
+import {
+  ensureOnboardingSchema,
+  ensureStaffOnboardingCollation,
+} from '../db/ensureOnboardingSchema.js';
 import { newId } from './ids.js';
 import { sendStaffWelcomeEmail } from './email.js';
 import { reserveUniqueAgentCode } from './agentCode.js';
@@ -52,6 +55,7 @@ function normalizeBody(body = {}) {
 
 export async function createAgentAccount(input, createdByUserId) {
   await ensureOnboardingSchema();
+  await ensureStaffOnboardingCollation();
   await ensureAgentOnboardingQcSchema();
   const data = CreateAgentSchema.parse(normalizeBody(input));
   const pool = getPool();

@@ -23,7 +23,7 @@ export async function fetchAgentDetail(userId) {
             ao.onboarding_status AS ao_status
      FROM user_profiles up
      LEFT JOIN agent_onboarding ao ON ao.user_id = up.id
-     WHERE up.id = :id AND up.role = 'agent' LIMIT 1`,
+     WHERE up.id = :id AND up.role COLLATE utf8mb4_unicode_ci = 'agent' LIMIT 1`,
     { id: userId },
   );
   if (!row) {
@@ -60,7 +60,7 @@ export async function fetchEmployeeDetail(userId) {
             eo.onboarding_status AS eo_status
      FROM user_profiles up
      LEFT JOIN employee_onboarding eo ON eo.user_id = up.id
-     WHERE up.id = :id AND up.role = 'employee' LIMIT 1`,
+     WHERE up.id = :id AND up.role COLLATE utf8mb4_unicode_ci = 'employee' LIMIT 1`,
     { id: userId },
   );
   if (!row) {
@@ -102,7 +102,9 @@ export async function updateAgentDetails(userId, body) {
 
   if (email) {
     const [[dup]] = await pool.execute(
-      `SELECT id FROM auth_users WHERE email = :email AND id != :id LIMIT 1`,
+      `SELECT id FROM auth_users
+       WHERE email COLLATE utf8mb4_unicode_ci = CONVERT(:email USING utf8mb4) COLLATE utf8mb4_unicode_ci
+         AND id != :id LIMIT 1`,
       { email, id: userId },
     );
     if (dup) {
@@ -125,7 +127,7 @@ export async function updateAgentDetails(userId, body) {
          WHEN :account_status IN ('inactive', 'suspended') THEN 0
          ELSE is_active
        END
-     WHERE id = :id AND role = 'agent'`,
+     WHERE id = :id AND role COLLATE utf8mb4_unicode_ci = 'agent'`,
     {
       id: userId,
       full_name: fullName || null,
@@ -179,7 +181,9 @@ export async function updateEmployeeDetails(userId, body) {
 
   if (email) {
     const [[dup]] = await pool.execute(
-      `SELECT id FROM auth_users WHERE email = :email AND id != :id LIMIT 1`,
+      `SELECT id FROM auth_users
+       WHERE email COLLATE utf8mb4_unicode_ci = CONVERT(:email USING utf8mb4) COLLATE utf8mb4_unicode_ci
+         AND id != :id LIMIT 1`,
       { email, id: userId },
     );
     if (dup) {
@@ -202,7 +206,7 @@ export async function updateEmployeeDetails(userId, body) {
          WHEN :account_status IN ('inactive', 'suspended') THEN 0
          ELSE is_active
        END
-     WHERE id = :id AND role = 'employee'`,
+     WHERE id = :id AND role COLLATE utf8mb4_unicode_ci = 'employee'`,
     {
       id: userId,
       full_name: fullName || null,

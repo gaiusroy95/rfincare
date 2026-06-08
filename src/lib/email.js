@@ -7,7 +7,7 @@ export function smtpConfigured() {
   return Boolean(process.env.SMTP_HOST && process.env.SMTP_FROM);
 }
 
-async function sendViaSmtp({ to, subject, text, html }) {
+async function sendViaSmtp({ to, subject, text, html, attachments = [] }) {
   const nodemailer = await import('nodemailer');
   const transporter = nodemailer.createTransport({
     host: process.env.SMTP_HOST,
@@ -25,19 +25,35 @@ async function sendViaSmtp({ to, subject, text, html }) {
     subject,
     text,
     html: html || text,
+    attachments,
   });
 }
 
-export async function sendEmail({ to, subject, text, html }) {
+export async function sendEmail({ to, subject, text, html, attachments }) {
   if (!to) return { sent: false, reason: 'no_recipient' };
 
+  const mailAttachments = Array.isArray(attachments)
+    ? attachments.filter((a) => a?.path || a?.content)
+    : [];
+
   if (smtpConfigured()) {
-    await sendViaSmtp({ to, subject, text, html });
-    return { sent: true, channel: 'smtp' };
+    await sendViaSmtp({ to, subject, text, html, attachments: mailAttachments });
+    return {
+      sent: true,
+      channel: 'smtp',
+      attachmentCount: mailAttachments.length,
+    };
   }
 
   console.log('[email]', { to, subject }, process.env.LOG_OTP === 'true' ? text : '(body hidden)');
-  return { sent: true, channel: 'log' };
+  return {
+    sent: false,
+    channel: 'log',
+    reason: 'smtp_not_configured',
+    warning:
+      'Email was not delivered — configure SMTP_HOST and SMTP_FROM on the server. The message is saved in in-app chat only.',
+    attachmentCount: mailAttachments.length,
+  };
 }
 
 export async function sendStaffWelcomeEmail({ email, fullName, role, password, loginPath }) {

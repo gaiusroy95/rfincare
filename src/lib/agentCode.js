@@ -29,7 +29,9 @@ export async function reserveUniqueAgentCode(connOrPool) {
     const seq = (await nextSequenceNumber(pool)) + attempt;
     const code = formatAgentCode(seq);
     const [[existing]] = await pool.execute(
-      `SELECT id FROM agent_onboarding WHERE agent_code = :code LIMIT 1`,
+      `SELECT id FROM agent_onboarding
+       WHERE agent_code COLLATE utf8mb4_unicode_ci = CONVERT(:code USING utf8mb4) COLLATE utf8mb4_unicode_ci
+       LIMIT 1`,
       { code },
     );
     if (!existing) return code;
@@ -56,7 +58,8 @@ export async function ensureAgentCodeForUser(connOrPool, userId) {
   const code = await reserveUniqueAgentCode(pool);
   await pool.execute(
     `UPDATE agent_onboarding SET agent_code = :code, updated_at = NOW(3)
-     WHERE user_id = :id AND (agent_code IS NULL OR TRIM(agent_code) = '')`,
+     WHERE user_id = :id
+       AND (agent_code IS NULL OR LENGTH(TRIM(agent_code)) = 0)`,
     { code, id: userId },
   );
   return code;
@@ -70,7 +73,7 @@ export async function backfillMissingAgentCodes(connOrPool) {
   const pool = connOrPool?.execute ? connOrPool : getPool();
   const [rows] = await pool.execute(
     `SELECT user_id FROM agent_onboarding
-     WHERE agent_code IS NULL OR TRIM(agent_code) = ''`,
+     WHERE agent_code IS NULL OR LENGTH(TRIM(agent_code)) = 0`,
   );
   for (const row of rows) {
     await ensureAgentCodeForUser(pool, row.user_id);

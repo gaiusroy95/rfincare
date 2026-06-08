@@ -9,6 +9,10 @@ import {
 } from '../lib/agentCustomerProvision.js';
 import { getAgentLearningFeed } from './agentLearning.js';
 import { getEmployeeLearningFeed } from './employeeLearning.js';
+import {
+  employeeHasModulePermission,
+  getEffectiveEmployeeAccess,
+} from '../lib/employeeAccessControls.js';
 import { ensureAgentLearningSchema } from '../db/ensureAgentLearningSchema.js';
 import { ensureAgentProfileSchema } from '../db/ensureAgentProfileSchema.js';
 import { ensureAgentCodeForUser } from '../lib/agentCode.js';
@@ -195,6 +199,20 @@ portalDashboardsRouter.get('/agent/dashboard', authenticate, async (req, res, ne
   }
 });
 
+portalDashboardsRouter.get('/employee/access', authenticate, async (req, res, next) => {
+  try {
+    if (req.auth.role !== 'employee') {
+      const e = new Error('Employee access only');
+      e.status = 403;
+      throw e;
+    }
+    const access = await getEffectiveEmployeeAccess(req.auth.userId);
+    res.json({ access });
+  } catch (err) {
+    next(err);
+  }
+});
+
 portalDashboardsRouter.get('/employee/dashboard', authenticate, async (req, res, next) => {
   try {
     if (!['employee', 'admin', 'super_admin'].includes(req.auth.role)) {
@@ -231,34 +249,48 @@ portalDashboardsRouter.get('/employee/dashboard', authenticate, async (req, res,
     );
 
     const learningResources = await getEmployeeLearningFeed(pool, employeeId);
+    const access = await getEffectiveEmployeeAccess(employeeId);
+
+    const canApplications = employeeHasModulePermission(access, 'applications', 'read');
+    const canDocuments = employeeHasModulePermission(access, 'documents', 'read');
+    const canReports = employeeHasModulePermission(access, 'reports', 'read');
 
     res.json({
+      access,
       stats: {
-        assignedApplications: apps.length,
-        pendingReview: apps.filter((a) => ['submitted', 'pending', 'under_review'].includes(a.status)).length,
-        pendingDocuments: Number(pendingDocs?.c || 0),
-        completedToday: apps.filter((a) => {
-          if (!a.reviewed_at) return false;
-          const d = new Date(a.reviewed_at);
-          const today = new Date();
-          return d.toDateString() === today.toDateString();
-        }).length,
+        assignedApplications: canApplications ? apps.length : 0,
+        pendingReview: canApplications
+          ? apps.filter((a) => ['submitted', 'pending', 'under_review'].includes(a.status)).length
+          : 0,
+        pendingDocuments: canDocuments ? Number(pendingDocs?.c || 0) : 0,
+        completedToday: canApplications
+          ? apps.filter((a) => {
+              if (!a.reviewed_at) return false;
+              const d = new Date(a.reviewed_at);
+              const today = new Date();
+              return d.toDateString() === today.toDateString();
+            }).length
+          : 0,
       },
       learningResources,
-      applications: apps.map((row) => ({
-        ...mapAppToClient(row),
-        id: row.id,
-        customerName: row.customer_full_name,
-        status: row.status,
-        applicationNumber: row.application_number,
-      })),
-      activities: activities.map((a) => ({
-        id: `${a.record_id}-${a.created_at}`,
-        type: String(a.action_type).toLowerCase(),
-        actionType: `${a.action_type} · ${a.table_name}`,
-        timestamp: new Date(a.created_at).toLocaleString(),
-        details: a.record_id,
-      })),
+      applications: canApplications
+        ? apps.map((row) => ({
+            ...mapAppToClient(row),
+            id: row.id,
+            customerName: row.customer_full_name,
+            status: row.status,
+            applicationNumber: row.application_number,
+          }))
+        : [],
+      activities: canReports
+        ? activities.map((a) => ({
+            id: `${a.record_id}-${a.created_at}`,
+            type: String(a.action_type).toLowerCase(),
+            actionType: `${a.action_type} · ${a.table_name}`,
+            timestamp: new Date(a.created_at).toLocaleString(),
+            details: a.record_id,
+          }))
+        : [],
     });
   } catch (err) {
     next(err);
