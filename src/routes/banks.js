@@ -234,6 +234,25 @@ function slimProductForList(product) {
   };
 }
 
+function productDedupeKey(product) {
+  const loanType = resolveProductLoanType(product);
+  const name = String(product.name || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ');
+  return `${name}::${loanType || ''}`;
+}
+
+function dedupeBankProducts(products) {
+  const seen = new Map();
+  for (const product of products || []) {
+    const key = productDedupeKey(product);
+    if (seen.has(key)) continue;
+    seen.set(key, product);
+  }
+  return [...seen.values()];
+}
+
 async function fetchBankList({ includeInactive, includeProducts, categoryQuery }) {
   const pool = getPool();
   const category = categoryQuery
@@ -267,6 +286,11 @@ async function fetchBankList({ includeInactive, includeProducts, categoryQuery }
     if (!category || bankProductMatchesCategory(product, category)) {
       entry.matched.push(slim);
     }
+  }
+
+  for (const entry of productsByBank.values()) {
+    entry.all = dedupeBankProducts(entry.all);
+    entry.matched = dedupeBankProducts(entry.matched);
   }
 
   const result = rows
