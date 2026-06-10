@@ -11,6 +11,10 @@ import {
   ensureLeadDraftSession,
   upsertLeadFromDraft,
 } from '../lib/resumeTokens.js';
+import {
+  findMarketingLeadByContact,
+  upsertMarketingLead,
+} from '../lib/marketingLeads.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { hasPermission } from '../auth/permissions.js';
 
@@ -65,30 +69,21 @@ leadsRouter.post('/', async (req, res, next) => {
   try {
     const body = CreateLeadSchema.parse(req.body);
     const pool = getPool();
-    const id = newId();
     const fullName = body.fullName || body.full_name || '';
     const sessionKey = body.sessionKey || body.session_key || null;
 
-    await pool.execute(
-      `INSERT INTO marketing_leads (
-         id, full_name, email, phone, loan_type, source, status, consent_accepted, session_key
-       ) VALUES (
-         :id, :full_name, :email, :phone, :loan_type, :source, 'new', :consent, :session_key
-       )`,
-      {
-        id,
-        full_name: fullName,
-        email: body.email,
-        phone: body.phone,
-        loan_type: body.loanType || body.loan_type || null,
-        source: body.source || 'eligibility',
-        consent: body.consentAccepted || body.consent_accepted ? 1 : 0,
-        session_key: sessionKey,
-      },
-    );
+    const { row, created } = await upsertMarketingLead(pool, {
+      fullName,
+      email: body.email,
+      phone: body.phone,
+      loanType: body.loanType || body.loan_type || null,
+      source: body.source || 'eligibility',
+      consentAccepted: Boolean(body.consentAccepted || body.consent_accepted),
+      sessionKey,
+      status: 'new',
+    });
 
-    const [[row]] = await pool.execute(`SELECT * FROM marketing_leads WHERE id = :id`, { id });
-    res.status(201).json(formatLead(row));
+    res.status(created ? 201 : 200).json({ ...formatLead(row), created, updated: !created });
   } catch (err) {
     next(err);
   }
@@ -122,6 +117,12 @@ leadsRouter.post('/request-otp', async (req, res, next) => {
     const settings = await getOtpProviderSettings();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
+    let resolvedLeadId = leadId || null;
+    if (!resolvedLeadId) {
+      const existing = await findMarketingLeadByContact(pool, { email, phone });
+      resolvedLeadId = existing?.id || null;
+    }
+
     const { mobileOtp, emailOtp } = await sendDualChannelOtp({
       phone,
       email,
@@ -137,7 +138,7 @@ leadsRouter.post('/request-otp', async (req, res, next) => {
          VALUES (:id, :lead_id, :email, :phone, :hash, 'lead_verify', 'sms', :exp)`,
         {
           id: smsId,
-          lead_id: leadId || null,
+          lead_id: resolvedLeadId,
           email,
           phone,
           hash: hashOtp(mobileOtp),
@@ -154,7 +155,7 @@ leadsRouter.post('/request-otp', async (req, res, next) => {
          VALUES (:id, :lead_id, :email, :phone, :hash, 'lead_verify', 'email', :exp)`,
         {
           id: emailId,
-          lead_id: leadId || null,
+          lead_id: resolvedLeadId,
           email,
           phone,
           hash: hashOtp(emailOtp),
@@ -261,7 +262,14 @@ leadsRouter.post('/verify-otp', async (req, res, next) => {
       await pool.execute(`UPDATE lead_otps SET verified_at = NOW(3) WHERE id = :id`, { id });
     }
 
-    const targetLeadId = body.leadId || smsRow?.lead_id || emailRow?.lead_id;
+    const targetLeadId =
+      body.leadId ||
+      smsRow?.lead_id ||
+      emailRow?.lead_id ||
+      (await findMarketingLeadByContact(pool, {
+        email: body.email,
+        phone: body.phone,
+      }))?.id;
     if (targetLeadId) {
       await pool.execute(
         `UPDATE marketing_leads SET consent_verified_at = NOW(3), status = 'verified' WHERE id = :id`,

@@ -274,13 +274,34 @@ portalDashboardsRouter.get('/employee/dashboard', authenticate, async (req, res,
       },
       learningResources,
       applications: canApplications
-        ? apps.map((row) => ({
-            ...mapAppToClient(row),
-            id: row.id,
-            customerName: row.customer_full_name,
-            status: row.status,
-            applicationNumber: row.application_number,
-          }))
+        ? apps.map((row) => {
+            const data =
+              typeof row.data === 'string'
+                ? (() => {
+                    try {
+                      return JSON.parse(row.data || '{}');
+                    } catch {
+                      return {};
+                    }
+                  })()
+                : row.data || {};
+            return {
+              ...mapAppToClient(row),
+              id: row.id,
+              customerName: row.customer_full_name,
+              customer: row.customer_id
+                ? { id: row.customer_id, fullName: row.customer_full_name }
+                : null,
+              status: row.status,
+              applicationNumber: row.application_number,
+              submittedAt: row.submitted_at,
+              createdAt: row.created_at,
+              loanAmount: data.loan_amount ?? data.requested_loan_amount ?? null,
+              loanTypeLabel: data.loan_type_label || data.loan_type || data.loan_purpose,
+              loanPurpose: data.loan_purpose || data.loan_type_label,
+              data,
+            };
+          })
         : [],
       activities: canReports
         ? activities.map((a) => ({

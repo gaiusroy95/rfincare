@@ -7,7 +7,7 @@ import { z } from 'zod';
 import { getPool } from '../db/pool.js';
 import { getUploadDir } from '../lib/uploadPaths.js';
 import { ensureBankSchema } from '../db/ensureBankSchema.js';
-import { cacheDeletePrefix, cacheGet, cacheSet } from '../lib/simpleCache.js';
+import { cacheDeletePrefix } from '../lib/simpleCache.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { authorize } from '../middleware/authorize.js';
 import { newId } from '../lib/ids.js';
@@ -18,8 +18,8 @@ import {
 import { listRulesForBank } from './approvalMatrixRules.js';
 
 const BANK_LIST_CACHE_PREFIX = 'banks:list:';
-const BANK_LIST_CACHE_TTL_MS = 120_000;
 
+/** Clears any legacy in-memory bank list entries after writes. */
 function invalidateBankListCache() {
   cacheDeletePrefix(BANK_LIST_CACHE_PREFIX);
 }
@@ -189,6 +189,15 @@ function formatBankRow(row) {
   if (!row) return row;
   return {
     ...row,
+    rating: row.rating != null && row.rating !== '' ? Number(row.rating) : null,
+    reviews_count:
+      row.reviews_count != null && row.reviews_count !== ''
+        ? Number(row.reviews_count)
+        : 0,
+    display_priority:
+      row.display_priority != null && row.display_priority !== ''
+        ? Number(row.display_priority)
+        : 0,
     certifications: parseCertifications(row.certifications),
   };
 }
@@ -226,10 +235,6 @@ function slimProductForList(product) {
 }
 
 async function fetchBankList({ includeInactive, includeProducts, categoryQuery }) {
-  const cacheKey = `${BANK_LIST_CACHE_PREFIX}${includeInactive}:${includeProducts}:${categoryQuery || 'all'}`;
-  const cached = cacheGet(cacheKey);
-  if (cached) return cached;
-
   const pool = getPool();
   const category = categoryQuery
     ? await resolveProductCategoryQuery(pool, categoryQuery)
@@ -242,9 +247,7 @@ async function fetchBankList({ includeInactive, includeProducts, categoryQuery }
   );
 
   if (!includeProducts) {
-    const result = rows.map(formatBankRow);
-    cacheSet(cacheKey, result, BANK_LIST_CACHE_TTL_MS);
-    return result;
+    return rows.map(formatBankRow);
   }
 
   const [products] = await pool.execute(
@@ -283,7 +286,6 @@ async function fetchBankList({ includeInactive, includeProducts, categoryQuery }
     })
     .filter(Boolean);
 
-  cacheSet(cacheKey, result, BANK_LIST_CACHE_TTL_MS);
   return result;
 }
 
@@ -295,11 +297,8 @@ banksRouter.get('/', async (req, res, next) => {
 
     const result = await fetchBankList({ includeInactive, includeProducts, categoryQuery });
 
-    if (includeInactive) {
-      res.set('Cache-Control', 'private, no-cache, no-store, must-revalidate');
-    } else {
-      res.set('Cache-Control', 'public, max-age=60, stale-while-revalidate=120');
-    }
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.set('Pragma', 'no-cache');
     res.json(result);
   } catch (err) {
     next(err);

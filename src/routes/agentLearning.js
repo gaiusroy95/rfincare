@@ -10,6 +10,11 @@ import { authenticate } from '../middleware/authenticate.js';
 import { authorize } from '../middleware/authorize.js';
 import { ensureAgentLearningSchema } from '../db/ensureAgentLearningSchema.js';
 import { fetchAgentCommissionCirculars } from '../lib/agentCommission.js';
+import {
+  buildConfigCircularId,
+  resolveLearningDiskPath,
+  resolveLearningOpenTarget,
+} from '../lib/learningFileDelivery.js';
 
 export const adminAgentLearningRouter = Router();
 export const portalAgentLearningRouter = Router();
@@ -51,6 +56,14 @@ const learningUpload = multer({
 
 function formatContentRow(row, progress = null) {
   const progressPercent = progress?.progress_percent ?? 0;
+  const { openUrl } = resolveLearningOpenTarget({
+    id: row.id,
+    contentType: row.content_type,
+    videoUrl: row.video_url,
+    fileUrl: row.file_url,
+    filePath: row.file_path,
+    fileName: row.file_name,
+  });
   return {
     id: row.id,
     contentType: row.content_type,
@@ -69,7 +82,7 @@ function formatContentRow(row, progress = null) {
     progress: progressPercent,
     completedAt: progress?.completed_at || null,
     createdAt: row.created_at,
-    openUrl: row.video_url || row.file_url,
+    openUrl,
   };
 }
 
@@ -96,22 +109,33 @@ async function fetchLearningForAgent(pool, agentUserId) {
 async function fetchLegacyCirculars(pool) {
   try {
     const rows = await fetchAgentCommissionCirculars(pool);
-    return rows.map((r) => ({
-      id: `circular-${r.id}`,
-      contentType: 'circular',
-      type: 'document',
-      title: r.title,
-      description: r.description,
-      duration: 'PDF',
-      fileName: r.file_name,
-      fileUrl: r.file_url,
-      videoUrl: null,
-      isNew: false,
-      progress: 0,
-      createdAt: r.created_at,
-      openUrl: r.file_url,
-      legacy: true,
-    }));
+    return rows.map((r) => {
+      const circularId = String(r.id).replace(/^circular-/, '');
+      const { openUrl } = resolveLearningOpenTarget({
+        id: circularId,
+        contentType: 'circular',
+        fileUrl: r.file_url,
+        filePath: r.file_path,
+        fileName: r.file_name,
+        legacy: true,
+      });
+      return {
+        id: `circular-${r.id}`,
+        contentType: 'circular',
+        type: 'document',
+        title: r.title,
+        description: r.description,
+        duration: 'PDF',
+        fileName: r.file_name,
+        fileUrl: r.file_url,
+        videoUrl: null,
+        isNew: false,
+        progress: 0,
+        createdAt: r.created_at,
+        openUrl,
+        legacy: true,
+      };
+    });
   } catch {
     return [];
   }
@@ -284,13 +308,104 @@ adminAgentLearningRouter.delete(
 
 portalAgentLearningRouter.use(authenticate);
 
+async function lookupCommissionCircular(pool, rawId) {
+  const id = String(rawId || '').replace(/^circular-/, '');
+  if (!id) return null;
+
+  if (id.startsWith('cfg-')) {
+    const [configRows] = await pool.execute(
+      `SELECT circular_title, circular_file_url
+       FROM agent_commission_config
+       WHERE circular_file_url IS NOT NULL AND TRIM(circular_file_url) != ''`,
+    );
+    for (const cfg of configRows || []) {
+      if (buildConfigCircularId(cfg.circular_file_url) !== id) continue;
+      return {
+        title: cfg.circular_title || 'Commission circular',
+        file_name: cfg.circular_title || 'circular.pdf',
+        file_path: cfg.circular_file_url,
+        file_url: cfg.circular_file_url,
+        mime_type: 'application/pdf',
+      };
+    }
+    return null;
+  }
+
+  const [[row]] = await pool.execute(
+    `SELECT title, file_name, file_path, file_url
+     FROM agent_commission_circulars
+     WHERE id = :id AND is_active = 1
+     LIMIT 1`,
+    { id },
+  );
+  if (!row) return null;
+  return {
+    title: row.title,
+    file_name: row.file_name,
+    file_path: row.file_path,
+    file_url: row.file_url,
+    mime_type: 'application/pdf',
+  };
+}
+
+function sendLearningFile(res, record, next) {
+  const diskPath = resolveLearningDiskPath({
+    filePath: record.file_path,
+    fileUrl: record.file_url,
+    fileName: record.file_name,
+  });
+  if (!diskPath) {
+    const err = new Error('Learning file not found on server');
+    err.status = 404;
+    return next(err);
+  }
+  res.setHeader('Content-Type', record.mime_type || 'application/pdf');
+  res.setHeader('Content-Disposition', `inline; filename="${record.file_name || 'document.pdf'}"`);
+  return res.sendFile(diskPath);
+}
+
+function assertAgentPortalAccess(req) {
+  if (req.auth.role !== 'agent' && !['admin', 'super_admin'].includes(req.auth.role)) {
+    const e = new Error('Agent access only');
+    e.status = 403;
+    throw e;
+  }
+}
+
+portalAgentLearningRouter.get('/circulars/:id/file', async (req, res, next) => {
+  try {
+    assertAgentPortalAccess(req);
+    const pool = getPool();
+    const record = await lookupCommissionCircular(pool, req.params.id);
+    if (!record) return res.status(404).json({ error: 'Circular not found' });
+    return sendLearningFile(res, record, next);
+  } catch (err) {
+    next(err);
+  }
+});
+
+portalAgentLearningRouter.get('/content/:id/file', async (req, res, next) => {
+  try {
+    assertAgentPortalAccess(req);
+    await ensureAgentLearningSchema();
+    const pool = getPool();
+    const [[row]] = await pool.execute(
+      `SELECT id, title, file_name, file_path, file_url, mime_type, content_type
+       FROM agent_learning_content
+       WHERE id = :id AND is_active = 1 AND audience IN ('agent', 'all')
+       LIMIT 1`,
+      { id: req.params.id },
+    );
+    if (!row) return res.status(404).json({ error: 'Content not found' });
+    return sendLearningFile(res, row, next);
+  } catch (err) {
+    next(err);
+  }
+});
+
 portalAgentLearningRouter.get('/', async (req, res, next) => {
   try {
-    if (req.auth.role !== 'agent' && !['admin', 'super_admin'].includes(req.auth.role)) {
-      const e = new Error('Agent access only');
-      e.status = 403;
-      throw e;
-    }
+    assertAgentPortalAccess(req);
     const pool = getPool();
     const items = await fetchLearningForAgent(pool, req.auth.userId);
     const legacy = await fetchLegacyCirculars(pool);

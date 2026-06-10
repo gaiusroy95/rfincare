@@ -38,13 +38,18 @@ export function resolveUploadFilePath(storedPath, extraNames = []) {
     candidates.push(storedPath, resolve(storedPath));
     const trimmed = String(storedPath).trim();
     if (trimmed.startsWith('/uploads/')) {
-      candidates.push(join(uploadDir, basename(trimmed)));
+      const relative = trimmed.replace(/^\/uploads\//i, '').replace(/\\/g, '/');
+      candidates.push(join(uploadDir, relative), join(uploadDir, basename(trimmed)));
     }
   }
   for (const name of names) {
     candidates.push(
       join(uploadDir, name),
+      join(uploadDir, 'commission-circulars', name),
+      join(uploadDir, 'agent-learning', name),
+      join(uploadDir, 'staff-learning', name),
       join(backendRoot, 'uploads', name),
+      join(backendRoot, 'uploads', 'commission-circulars', name),
       join(process.cwd(), 'uploads', name),
       join(process.cwd(), 'backend', 'uploads', name),
     );

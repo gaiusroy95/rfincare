@@ -9,6 +9,10 @@ import { newId } from '../lib/ids.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { authorize } from '../middleware/authorize.js';
 import { ensureAgentLearningSchema } from '../db/ensureAgentLearningSchema.js';
+import {
+  resolveLearningDiskPath,
+  resolveLearningOpenTarget,
+} from '../lib/learningFileDelivery.js';
 
 export const adminEmployeeLearningRouter = Router();
 export const portalEmployeeLearningRouter = Router();
@@ -52,6 +56,15 @@ function formatEmployeeContentRow(row, progress = null, completionCount = 0) {
   const progressPercent = progress?.progress_percent ?? 0;
   const category =
     row.category_label || CATEGORY_BY_TYPE[row.content_type] || 'Document Verification';
+  const { openUrl } = resolveLearningOpenTarget({
+    id: row.id,
+    contentType: row.content_type,
+    videoUrl: row.video_url,
+    fileUrl: row.file_url,
+    filePath: row.file_path,
+    fileName: row.file_name,
+    portal: 'employee',
+  });
   return {
     id: row.id,
     contentType: row.content_type,
@@ -73,7 +86,7 @@ function formatEmployeeContentRow(row, progress = null, completionCount = 0) {
     completions: String(completionCount || 0),
     completedAt: progress?.completed_at || null,
     createdAt: row.created_at,
-    openUrl: row.video_url || row.file_url,
+    openUrl,
     audience: row.audience,
   };
 }
@@ -279,6 +292,45 @@ adminEmployeeLearningRouter.delete(
 // ——— Employee portal ———
 
 portalEmployeeLearningRouter.use(authenticate);
+
+function sendEmployeeLearningFile(res, record, next) {
+  const diskPath = resolveLearningDiskPath({
+    filePath: record.file_path,
+    fileUrl: record.file_url,
+    fileName: record.file_name,
+  });
+  if (!diskPath) {
+    const err = new Error('Learning file not found on server');
+    err.status = 404;
+    return next(err);
+  }
+  res.setHeader('Content-Type', record.mime_type || 'application/pdf');
+  res.setHeader('Content-Disposition', `inline; filename="${record.file_name || 'document.pdf'}"`);
+  return res.sendFile(diskPath);
+}
+
+portalEmployeeLearningRouter.get('/content/:id/file', async (req, res, next) => {
+  try {
+    if (req.auth.role !== 'employee' && !['admin', 'super_admin'].includes(req.auth.role)) {
+      const e = new Error('Employee access only');
+      e.status = 403;
+      throw e;
+    }
+    await ensureAgentLearningSchema();
+    const pool = getPool();
+    const [[row]] = await pool.execute(
+      `SELECT id, title, file_name, file_path, file_url, mime_type
+       FROM agent_learning_content
+       WHERE id = :id AND is_active = 1 AND audience IN ('employee', 'all')
+       LIMIT 1`,
+      { id: req.params.id },
+    );
+    if (!row) return res.status(404).json({ error: 'Content not found' });
+    return sendEmployeeLearningFile(res, row, next);
+  } catch (err) {
+    next(err);
+  }
+});
 
 portalEmployeeLearningRouter.get('/', async (req, res, next) => {
   try {

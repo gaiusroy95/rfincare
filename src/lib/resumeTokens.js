@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 
 import { getPool } from '../db/pool.js';
 import { newId } from './ids.js';
+import { findMarketingLeadByContact, normalizeLeadPhone } from './marketingLeads.js';
 import { getOAuthFrontendCallbackUrls } from './publicUrl.js';
 
 export function hashResumeToken(token) {
@@ -153,18 +154,18 @@ export async function ensureLeadDraftSession(pool, lead) {
 
 export async function upsertLeadFromDraft({ sessionKey, formData, loanType, currentStep, applicationId }) {
   const email = formData?.email?.trim();
-  const phone = (formData?.phone || '').replace(/\D/g, '').slice(-10);
+  const phone = normalizeLeadPhone(formData?.phone);
   if (!email || phone.length !== 10) return null;
 
   const pool = getPool();
   const fullName = [formData.firstName, formData.middleName, formData.lastName].filter(Boolean).join(' ');
-
-  const [[existing]] = await pool.execute(
-    `SELECT id FROM marketing_leads WHERE session_key = :sk OR (email = :email AND phone = :phone) LIMIT 1`,
-    { sk: sessionKey, email, phone },
-  );
-
   const status = currentStep >= 5 ? 'application_in_progress' : 'draft_started';
+
+  const existing = await findMarketingLeadByContact(pool, {
+    email,
+    phone,
+    sessionKey,
+  });
 
   if (existing?.id) {
     await pool.execute(
@@ -173,7 +174,8 @@ export async function upsertLeadFromDraft({ sessionKey, formData, loanType, curr
          loan_type = COALESCE(:loan_type, loan_type),
          status = :status,
          session_key = :sk,
-         application_id = COALESCE(:app_id, application_id)
+         application_id = COALESCE(:app_id, application_id),
+         updated_at = NOW(3)
        WHERE id = :id`,
       {
         id: existing.id,
@@ -197,7 +199,7 @@ export async function upsertLeadFromDraft({ sessionKey, formData, loanType, curr
     {
       id,
       name: fullName || null,
-      email,
+      email: email.trim().toLowerCase(),
       phone,
       loan_type: loanType || null,
       status,

@@ -1,5 +1,10 @@
 import { newId } from './ids.js';
 import { escapeCsvCell } from './parseCsv.js';
+import {
+  buildConfigCircularId,
+  normalizeLearningPublicUrl,
+  resolveLearningDiskPath,
+} from './learningFileDelivery.js';
 
 const LOAN_TYPE_ALIASES = {
   personal: 'personal_loan',
@@ -263,6 +268,8 @@ async function resolveCircularFileUrl(pool, row, circularFilesByName) {
     if (/^https?:\/\//i.test(uploadVal) || uploadVal.startsWith('/uploads/')) {
       return uploadVal;
     }
+    const diskPath = resolveLearningDiskPath({ fileUrl: uploadVal, fileName: uploadVal.split(/[/\\]/).pop() });
+    if (diskPath) return normalizeLearningPublicUrl(uploadVal);
   }
 
   if (row.circularTitle) {
@@ -272,10 +279,12 @@ async function resolveCircularFileUrl(pool, row, circularFilesByName) {
        ORDER BY created_at DESC LIMIT 1`,
       { title: row.circularTitle },
     );
-    if (existing?.file_url) return existing.file_url;
+    if (existing?.file_url) {
+      return normalizeLearningPublicUrl(existing.file_url) || existing.file_url;
+    }
   }
 
-  return uploadVal || null;
+  return null;
 }
 
 function resolveCircularUploadMeta(row, circularFilesByName) {
@@ -366,15 +375,16 @@ export async function fetchAgentCommissionCirculars(pool) {
   );
 
   for (const cfg of configRows || []) {
-    const fileUrl = cfg.circular_file_url;
+    const fileUrl = normalizeLearningPublicUrl(cfg.circular_file_url) || cfg.circular_file_url;
     if (!fileUrl || seenUrls.has(fileUrl)) continue;
     seenUrls.add(fileUrl);
     circulars.push({
-      id: `cfg-${Buffer.from(fileUrl).toString('base64url').slice(0, 12)}`,
+      id: buildConfigCircularId(cfg.circular_file_url),
       title: cfg.circular_title || 'Commission circular',
       description: null,
       file_name: cfg.circular_title || 'circular.pdf',
       file_url: fileUrl,
+      file_path: fileUrl,
       created_at: cfg.updated_at,
     });
   }
@@ -382,7 +392,11 @@ export async function fetchAgentCommissionCirculars(pool) {
   circulars.sort(
     (a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime(),
   );
-  return circulars;
+
+  return circulars.map((row) => ({
+    ...row,
+    file_url: normalizeLearningPublicUrl(row.file_url) || row.file_url,
+  }));
 }
 
 export async function upsertAgentCommissionConfig(pool, agentUserId, row, { updatedBy, circularFilesByName = {} }) {
