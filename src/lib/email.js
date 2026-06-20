@@ -7,16 +7,24 @@ export function smtpConfigured() {
   return Boolean(process.env.SMTP_HOST && process.env.SMTP_FROM);
 }
 
+function smtpPassword() {
+  return process.env.SMTP_PASS || process.env.SMTP_PASSWORD || '';
+}
+
 async function sendViaSmtp({ to, subject, text, html, attachments = [] }) {
   const nodemailer = await import('nodemailer');
+  const pass = smtpPassword();
   const transporter = nodemailer.createTransport({
     host: process.env.SMTP_HOST,
     port: Number(process.env.SMTP_PORT || 587),
     secure: process.env.SMTP_SECURE === 'true',
     auth:
-      process.env.SMTP_USER && process.env.SMTP_PASS
-        ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+      process.env.SMTP_USER && pass
+        ? { user: process.env.SMTP_USER, pass }
         : undefined,
+    connectionTimeout: Number(process.env.SMTP_CONNECTION_TIMEOUT_MS || 10000),
+    greetingTimeout: Number(process.env.SMTP_GREETING_TIMEOUT_MS || 10000),
+    socketTimeout: Number(process.env.SMTP_SOCKET_TIMEOUT_MS || 15000),
   });
 
   await transporter.sendMail({

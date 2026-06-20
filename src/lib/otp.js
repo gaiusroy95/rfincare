@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 
+import { withPromiseTimeout } from './fetchWithTimeout.js';
 import { sendEmail, smtpConfigured } from './email.js';
 import {
   getMsg91Config,
@@ -182,15 +183,20 @@ async function sendEmailOtp({ email, otp, settings }) {
   }
 
   if (provider === 'smtp') {
-    const result = await sendEmail({ to: email, subject, text, html });
     if (!smtpConfigured()) {
-      console.log(
-        '[otp:email]',
-        { email, provider: 'console-fallback' },
-        process.env.LOG_OTP === 'true' ? otp : '(hidden)',
+      const err = new Error(
+        'Email operator is SMTP but SMTP_HOST/SMTP_FROM are not set on the server. Configure SMTP or set email operator to Console in Admin → OTP settings.',
       );
+      err.status = 503;
+      throw err;
     }
-    return { ...result, provider: result.channel === 'smtp' ? 'smtp' : 'console' };
+    const result = await sendEmail({ to: email, subject, text, html });
+    if (!result.sent) {
+      const err = new Error(result.warning || 'Email OTP could not be delivered.');
+      err.status = 502;
+      throw err;
+    }
+    return { ...result, provider: 'smtp' };
   }
 
   throw new Error(`Unknown email provider: ${provider}`);
@@ -222,6 +228,16 @@ async function sendWhatsappOtp({ phone, otp, settings }) {
     return sendMsg91Whatsapp({ phone, otp, config: settings?.providerConfig });
   }
   throw new Error(`Unknown WhatsApp provider: ${provider}`);
+}
+
+const CHANNEL_TIMEOUT_MS = Number(process.env.OTP_CHANNEL_TIMEOUT_MS || 20000);
+
+function channelTimeout(promise, label) {
+  return withPromiseTimeout(
+    promise,
+    CHANNEL_TIMEOUT_MS,
+    `${label} timed out after ${Math.round(CHANNEL_TIMEOUT_MS / 1000)}s. Check server OTP/SMTP/MSG91 configuration.`,
+  );
 }
 
 function aggregateChannelErrors(results) {
@@ -260,15 +276,15 @@ export async function sendOtpNotification({
     (!channel && settings.requireWhatsappOtp);
 
   if (wantSms && phone) {
-    tasks.push(sendSmsOtp({ phone, otp, settings }));
+    tasks.push(channelTimeout(sendSmsOtp({ phone, otp, settings }), 'SMS OTP'));
     labels.push('sms');
   }
   if (wantEmail && email) {
-    tasks.push(sendEmailOtp({ email, otp, settings }));
+    tasks.push(channelTimeout(sendEmailOtp({ email, otp, settings }), 'Email OTP'));
     labels.push('email');
   }
   if (wantWhatsapp && phone) {
-    tasks.push(sendWhatsappOtp({ phone, otp, settings }));
+    tasks.push(channelTimeout(sendWhatsappOtp({ phone, otp, settings }), 'WhatsApp OTP'));
     labels.push('whatsapp');
   }
 
@@ -303,29 +319,87 @@ export async function sendDualChannelOtp({ email, phone, settings: settingsOverr
   const settings = settingsOverride || (await getOtpProviderSettings());
   const mobileOtp = generateOtp();
   const emailOtp = generateOtp();
+  const warnings = [];
+  const outcomes = {};
 
-  const tasks = [];
-  const keys = [];
+  async function runSmsChannel() {
+    try {
+      return await channelTimeout(
+        sendSmsOtp({ phone, otp: mobileOtp, settings }),
+        'SMS OTP',
+      );
+    } catch (err) {
+      const errMsg = err?.message || 'SMS send failed';
+      const hint =
+        settings.smsProvider === 'msg91'
+          ? `${errMsg} Confirm MSG91_AUTH_KEY and MSG91_OTP_TEMPLATE_ID on the server, and that the template is DLT-approved.`
+          : errMsg;
+      const e = new Error(hint);
+      e.status = err?.status || 502;
+      throw e;
+    }
+  }
+
+  async function runEmailChannel() {
+    try {
+      return await channelTimeout(
+        sendEmailOtp({ email, otp: emailOtp, settings }),
+        'Email OTP',
+      );
+    } catch (err) {
+      if (settings.emailProvider === 'smtp' && !smtpConfigured()) {
+        warnings.push(
+          'SMTP is not configured on the server; email OTP was logged server-side only. Set SMTP_* env vars or use Admin → OTP settings → Email operator: Console for testing.',
+        );
+        return sendEmailOtp({
+          email,
+          otp: emailOtp,
+          settings: { ...settings, emailProvider: 'console' },
+        });
+      }
+      const e = new Error(
+        `${err?.message || 'Email OTP failed'}. Configure SMTP on the server or set email operator to Console in Admin → OTP settings.`,
+      );
+      e.status = err?.status || 502;
+      throw e;
+    }
+  }
+
+  const parallel = [];
 
   if (settings.requireMobileOtp !== false && phone) {
-    tasks.push(sendSmsOtp({ phone, otp: mobileOtp, settings }));
-    keys.push('sms');
-  }
-  if (settings.requireWhatsappOtp && phone) {
-    tasks.push(sendWhatsappOtp({ phone, otp: mobileOtp, settings }));
-    keys.push('whatsapp');
-  }
-  if (settings.requireEmailOtp !== false && email) {
-    tasks.push(sendEmailOtp({ email, otp: emailOtp, settings }));
-    keys.push('email');
+    parallel.push(
+      runSmsChannel().then((r) => {
+        outcomes.sms = r;
+      }),
+    );
   }
 
-  const results = await Promise.allSettled(tasks);
-  const errMsg = aggregateChannelErrors(results);
-  if (errMsg) {
-    const err = new Error(errMsg);
-    err.status = results.find((r) => r.reason?.status)?.reason?.status || 502;
-    throw err;
+  if (settings.requireEmailOtp !== false && email) {
+    parallel.push(
+      runEmailChannel().then((r) => {
+        outcomes.email = r;
+        if (r?.sent === false && settings.emailProvider === 'smtp') {
+          warnings.push(
+            r.warning ||
+              'Email was not delivered — configure SMTP_HOST and SMTP_FROM on the server.',
+          );
+        }
+      }),
+    );
+  }
+
+  await Promise.all(parallel);
+
+  if (settings.requireWhatsappOtp && phone) {
+    try {
+      outcomes.whatsapp = await channelTimeout(
+        sendWhatsappOtp({ phone, otp: mobileOtp, settings }),
+        'WhatsApp OTP',
+      );
+    } catch (err) {
+      warnings.push(err?.message || 'WhatsApp OTP failed');
+    }
   }
 
   return {
@@ -335,6 +409,8 @@ export async function sendDualChannelOtp({ email, phone, settings: settingsOverr
     emailProvider: settings.emailProvider,
     whatsappProvider: settings.whatsappProvider,
     msg91Configured: isMsg91Configured(),
+    warnings,
+    delivery: outcomes,
   };
 }
 

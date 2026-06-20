@@ -1,6 +1,6 @@
 /**
  * MSG91 SMS / OTP / WhatsApp integration.
- * @see https://docs.msg91.com/
+ * @see https://docs.msg91.com/otp
  *
  * Server env:
  *   MSG91_AUTH_KEY (required)
@@ -11,11 +11,15 @@
  *   MSG91_ROUTE (default 4 = transactional India)
  */
 
+import { fetchWithTimeout } from './fetchWithTimeout.js';
+
 const MSG91_OTP_URL = 'https://control.msg91.com/api/v5/otp';
 const MSG91_FLOW_URL = 'https://control.msg91.com/api/v5/flow/';
 const MSG91_SMS_HTTP_URL = 'https://control.msg91.com/api/sendhttp.php';
 const MSG91_WHATSAPP_URL =
   'https://api.msg91.com/api/v5/whatsapp/whatsapp-outbound-message/bulk/';
+
+const MSG91_FETCH_TIMEOUT_MS = Number(process.env.MSG91_FETCH_TIMEOUT_MS || 15000);
 
 export function normalizeIndianMobile(phone) {
   const digits = String(phone || '').replace(/\D/g, '');
@@ -94,7 +98,7 @@ async function parseMsg91Response(res) {
 }
 
 /**
- * Send OTP via MSG91 v5 OTP API (recommended — use DLT-approved OTP template).
+ * Send OTP via MSG91 v5 OTP API (DLT-approved OTP template).
  */
 export async function sendMsg91Otp({ phone, otp, config: overrides = {} }) {
   const config = getMsg91Config(overrides);
@@ -114,20 +118,31 @@ export async function sendMsg91Otp({ phone, otp, config: overrides = {} }) {
     });
   }
 
-  const url = new URL(MSG91_OTP_URL);
-  url.searchParams.set('otp_expiry', '10');
-  url.searchParams.set('template_id', config.otpTemplateId);
-  url.searchParams.set('mobile', `${config.countryCode}${mobile}`);
-  url.searchParams.set('authkey', config.authKey);
+  const mobileE164 = `${config.countryCode}${mobile}`;
+  const url = `${MSG91_OTP_URL}?otp_expiry=10&otp_length=6`;
 
-  const res = await fetch(url.toString(), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', authkey: config.authKey },
-    body: JSON.stringify({ OTP: String(otp) }),
-  });
+  const res = await fetchWithTimeout(
+    url,
+    {
+      method: 'POST',
+      headers: {
+        authkey: config.authKey,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({
+        template_id: config.otpTemplateId,
+        mobile: mobileE164,
+        otp: String(otp),
+      }),
+      timeoutMessage:
+        'MSG91 OTP request timed out. Verify MSG91_AUTH_KEY, MSG91_OTP_TEMPLATE_ID, and server outbound network access.',
+    },
+    MSG91_FETCH_TIMEOUT_MS,
+  );
 
   await parseMsg91Response(res);
-  return { sent: true, provider: 'msg91', mode: 'otp_api', mobile: `91${mobile}` };
+  return { sent: true, provider: 'msg91', mode: 'otp_api', mobile: mobileE164 };
 }
 
 /**
@@ -143,18 +158,23 @@ export async function sendMsg91Flow({ phone, variables = {}, config: overrides =
   }
 
   const mobile = normalizeIndianMobile(phone);
-  const res = await fetch(MSG91_FLOW_URL, {
-    method: 'POST',
-    headers: {
-      authkey: config.authKey,
-      'Content-Type': 'application/json',
+  const res = await fetchWithTimeout(
+    MSG91_FLOW_URL,
+    {
+      method: 'POST',
+      headers: {
+        authkey: config.authKey,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        template_id: templateId,
+        short_url: '0',
+        recipients: [{ mobiles: `${config.countryCode}${mobile}`, ...variables }],
+      }),
+      timeoutMessage: 'MSG91 Flow request timed out.',
     },
-    body: JSON.stringify({
-      template_id: templateId,
-      short_url: '0',
-      recipients: [{ mobiles: `${config.countryCode}${mobile}`, ...variables }],
-    }),
-  });
+    MSG91_FETCH_TIMEOUT_MS,
+  );
 
   await parseMsg91Response(res);
   return { sent: true, provider: 'msg91', mode: 'flow' };
@@ -187,7 +207,13 @@ export async function sendMsg91TransactionalSms({
   url.searchParams.set('route', config.route);
   url.searchParams.set('country', config.countryCode);
 
-  const res = await fetch(url.toString());
+  const res = await fetchWithTimeout(
+    url.toString(),
+    {
+      timeoutMessage: 'MSG91 SMS request timed out.',
+    },
+    MSG91_FETCH_TIMEOUT_MS,
+  );
   const text = await res.text();
   if (!res.ok || /invalid|error|authentication|denied/i.test(text)) {
     throw new Error(`MSG91 SMS failed: ${text.slice(0, 300)}`);
@@ -208,24 +234,29 @@ export async function sendMsg91Whatsapp({ phone, otp, config: overrides = {} }) 
   }
 
   const mobile = normalizeIndianMobile(phone);
-  const res = await fetch(MSG91_WHATSAPP_URL, {
-    method: 'POST',
-    headers: {
-      authkey: config.authKey,
-      'Content-Type': 'application/json',
+  const res = await fetchWithTimeout(
+    MSG91_WHATSAPP_URL,
+    {
+      method: 'POST',
+      headers: {
+        authkey: config.authKey,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        integrated_number: process.env.MSG91_WHATSAPP_INTEGRATED_NUMBER || '',
+        template_name: config.whatsappTemplateId,
+        language: process.env.MSG91_WHATSAPP_LANGUAGE || 'en',
+        recipients: [
+          {
+            mobiles: [`${config.countryCode}${mobile}`],
+            variables: { otp: String(otp), OTP: String(otp) },
+          },
+        ],
+      }),
+      timeoutMessage: 'MSG91 WhatsApp request timed out.',
     },
-    body: JSON.stringify({
-      integrated_number: process.env.MSG91_WHATSAPP_INTEGRATED_NUMBER || '',
-      template_name: config.whatsappTemplateId,
-      language: process.env.MSG91_WHATSAPP_LANGUAGE || 'en',
-      recipients: [
-        {
-          mobiles: [`${config.countryCode}${mobile}`],
-          variables: { otp: String(otp), OTP: String(otp) },
-        },
-      ],
-    }),
-  });
+    MSG91_FETCH_TIMEOUT_MS,
+  );
 
   await parseMsg91Response(res);
   return { sent: true, provider: 'msg91', mode: 'whatsapp' };

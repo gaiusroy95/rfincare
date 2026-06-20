@@ -63,14 +63,22 @@ export async function ensureOtpProviderSchema() {
   }
 
   // Backward-compatible column upgrades for older databases.
-  await pool.execute(
-    `ALTER TABLE otp_provider_settings
-     ADD COLUMN IF NOT EXISTS whatsapp_provider VARCHAR(32) NOT NULL DEFAULT 'console' AFTER sms_provider`,
-  );
-  await pool.execute(
-    `ALTER TABLE otp_provider_settings
-     ADD COLUMN IF NOT EXISTS require_whatsapp_otp TINYINT(1) NOT NULL DEFAULT 0 AFTER require_email_otp`,
-  );
+  try {
+    await pool.execute(
+      `ALTER TABLE otp_provider_settings
+       ADD COLUMN whatsapp_provider VARCHAR(32) NOT NULL DEFAULT 'console' AFTER sms_provider`,
+    );
+  } catch (err) {
+    if (err.code !== 'ER_DUP_FIELDNAME') throw err;
+  }
+  try {
+    await pool.execute(
+      `ALTER TABLE otp_provider_settings
+       ADD COLUMN require_whatsapp_otp TINYINT(1) NOT NULL DEFAULT 0 AFTER require_email_otp`,
+    );
+  } catch (err) {
+    if (err.code !== 'ER_DUP_FIELDNAME') throw err;
+  }
 
   ensured = true;
 }

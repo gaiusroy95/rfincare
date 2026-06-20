@@ -103,6 +103,110 @@ leadsRouter.get('/otp-settings', async (_req, res, next) => {
   }
 });
 
+async function persistLeadOtps(pool, { leadId, email, phone, settings, mobileOtp, emailOtp }) {
+  const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+  const otpIds = {};
+
+  if (settings.requireMobileOtp !== false && mobileOtp) {
+    const smsId = newId();
+    await pool.execute(
+      `INSERT INTO lead_otps (id, lead_id, email, phone, otp_hash, purpose, channel, expires_at)
+       VALUES (:id, :lead_id, :email, :phone, :hash, 'lead_verify', 'sms', :exp)`,
+      {
+        id: smsId,
+        lead_id: leadId,
+        email,
+        phone,
+        hash: hashOtp(mobileOtp),
+        exp: expiresAt,
+      },
+    );
+    otpIds.sms = smsId;
+  }
+
+  if (settings.requireEmailOtp !== false && emailOtp) {
+    const emailId = newId();
+    await pool.execute(
+      `INSERT INTO lead_otps (id, lead_id, email, phone, otp_hash, purpose, channel, expires_at)
+       VALUES (:id, :lead_id, :email, :phone, :hash, 'lead_verify', 'email', :exp)`,
+      {
+        id: emailId,
+        lead_id: leadId,
+        email,
+        phone,
+        hash: hashOtp(emailOtp),
+        exp: expiresAt,
+      },
+    );
+    otpIds.email = emailId;
+  }
+
+  return otpIds;
+}
+
+function formatOtpSendResponse({ settings, mobileOtp, emailOtp, otpIds, warnings = [] }) {
+  return {
+    success: true,
+    otpIds,
+    expiresInSeconds: 600,
+    requireMobileOtp: settings.requireMobileOtp,
+    requireEmailOtp: settings.requireEmailOtp,
+    smsProvider: settings.smsProvider,
+    emailProvider: settings.emailProvider,
+    warnings: warnings.length ? warnings : undefined,
+    ...(process.env.LOG_OTP === 'true'
+      ? { devMobileOtp: mobileOtp, devEmailOtp: emailOtp }
+      : {}),
+  };
+}
+
+/** Create/update lead and send OTP in one request (eligibility gate). */
+leadsRouter.post('/start-verification', async (req, res, next) => {
+  try {
+    const body = CreateLeadSchema.parse(req.body);
+    const pool = getPool();
+    const fullName = body.fullName || body.full_name || '';
+    const sessionKey = body.sessionKey || body.session_key || null;
+    const phone = String(body.phone).replace(/\D/g, '').slice(-10);
+    const email = body.email.trim().toLowerCase();
+
+    const { row } = await upsertMarketingLead(pool, {
+      fullName,
+      email,
+      phone,
+      loanType: body.loanType || body.loan_type || null,
+      source: body.source || 'eligibility',
+      consentAccepted: Boolean(body.consentAccepted || body.consent_accepted),
+      sessionKey,
+      status: 'new',
+    });
+
+    const settings = await getOtpProviderSettings();
+    const otpResult = await sendDualChannelOtp({ phone, email, settings });
+    const otpIds = await persistLeadOtps(pool, {
+      leadId: row.id,
+      email,
+      phone,
+      settings,
+      mobileOtp: otpResult.mobileOtp,
+      emailOtp: otpResult.emailOtp,
+    });
+
+    res.status(200).json({
+      ...formatOtpSendResponse({
+        settings,
+        mobileOtp: otpResult.mobileOtp,
+        emailOtp: otpResult.emailOtp,
+        otpIds,
+        warnings: otpResult.warnings,
+      }),
+      lead: formatLead(row),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 leadsRouter.post('/request-otp', async (req, res, next) => {
   try {
     const { phone, email, leadId } = z
@@ -115,7 +219,6 @@ leadsRouter.post('/request-otp', async (req, res, next) => {
 
     const pool = getPool();
     const settings = await getOtpProviderSettings();
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
     let resolvedLeadId = leadId || null;
     if (!resolvedLeadId) {
@@ -123,60 +226,30 @@ leadsRouter.post('/request-otp', async (req, res, next) => {
       resolvedLeadId = existing?.id || null;
     }
 
-    const { mobileOtp, emailOtp } = await sendDualChannelOtp({
+    const otpResult = await sendDualChannelOtp({
       phone,
       email,
       settings,
     });
 
-    const otpIds = {};
-
-    if (settings.requireMobileOtp !== false && mobileOtp) {
-      const smsId = newId();
-      await pool.execute(
-        `INSERT INTO lead_otps (id, lead_id, email, phone, otp_hash, purpose, channel, expires_at)
-         VALUES (:id, :lead_id, :email, :phone, :hash, 'lead_verify', 'sms', :exp)`,
-        {
-          id: smsId,
-          lead_id: resolvedLeadId,
-          email,
-          phone,
-          hash: hashOtp(mobileOtp),
-          exp: expiresAt,
-        },
-      );
-      otpIds.sms = smsId;
-    }
-
-    if (settings.requireEmailOtp !== false && emailOtp) {
-      const emailId = newId();
-      await pool.execute(
-        `INSERT INTO lead_otps (id, lead_id, email, phone, otp_hash, purpose, channel, expires_at)
-         VALUES (:id, :lead_id, :email, :phone, :hash, 'lead_verify', 'email', :exp)`,
-        {
-          id: emailId,
-          lead_id: resolvedLeadId,
-          email,
-          phone,
-          hash: hashOtp(emailOtp),
-          exp: expiresAt,
-        },
-      );
-      otpIds.email = emailId;
-    }
-
-    res.json({
-      success: true,
-      otpIds,
-      expiresInSeconds: 600,
-      requireMobileOtp: settings.requireMobileOtp,
-      requireEmailOtp: settings.requireEmailOtp,
-      smsProvider: settings.smsProvider,
-      emailProvider: settings.emailProvider,
-      ...(process.env.LOG_OTP === 'true'
-        ? { devMobileOtp: mobileOtp, devEmailOtp: emailOtp }
-        : {}),
+    const otpIds = await persistLeadOtps(pool, {
+      leadId: resolvedLeadId,
+      email,
+      phone,
+      settings,
+      mobileOtp: otpResult.mobileOtp,
+      emailOtp: otpResult.emailOtp,
     });
+
+    res.json(
+      formatOtpSendResponse({
+        settings,
+        mobileOtp: otpResult.mobileOtp,
+        emailOtp: otpResult.emailOtp,
+        otpIds,
+        warnings: otpResult.warnings,
+      }),
+    );
   } catch (err) {
     next(err);
   }
