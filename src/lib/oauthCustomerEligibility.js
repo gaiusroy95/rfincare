@@ -1,5 +1,6 @@
 import { getPool } from '../db/pool.js';
 import { getOAuthGlobalSettings } from './oauthProviderSettings.js';
+import { sqlParamEqualsLower } from './sqlCollation.js';
 
 /**
  * Customer OAuth is allowed when the email is tied to an existing customer account
@@ -35,7 +36,7 @@ export async function checkCustomerEmailForOAuth(email) {
   }
 
   const [[lead]] = await pool.execute(
-    `SELECT id FROM marketing_leads WHERE LOWER(email) = :email LIMIT 1`,
+    `SELECT id FROM marketing_leads WHERE ${sqlParamEqualsLower('email', 'email')} LIMIT 1`,
     { email: normalized },
   );
   if (lead) {

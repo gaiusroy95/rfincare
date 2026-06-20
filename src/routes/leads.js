@@ -13,8 +13,11 @@ import {
 } from '../lib/resumeTokens.js';
 import {
   findMarketingLeadByContact,
+  normalizeLeadPhone,
   upsertMarketingLead,
 } from '../lib/marketingLeads.js';
+import { ensureLeadCollation } from '../db/ensureLeadCollation.js';
+import { sqlLiteralEquals, sqlParamEquals } from '../lib/sqlCollation.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { hasPermission } from '../auth/permissions.js';
 
@@ -104,6 +107,7 @@ leadsRouter.get('/otp-settings', async (_req, res, next) => {
 });
 
 async function persistLeadOtps(pool, { leadId, email, phone, settings, mobileOtp, emailOtp }) {
+  await ensureLeadCollation();
   const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
   const otpIds = {};
 
@@ -280,8 +284,12 @@ leadsRouter.post('/verify-otp', async (req, res, next) => {
     }
 
     const pool = getPool();
+    await ensureLeadCollation();
     let smsRow = null;
     let emailRow = null;
+
+    const phone = normalizeLeadPhone(body.phone);
+    const email = body.email.trim().toLowerCase();
 
     const devTestOtp =
       process.env.LOG_OTP === 'true' &&
@@ -292,16 +300,21 @@ leadsRouter.post('/verify-otp', async (req, res, next) => {
       const [[row]] = await pool.execute(
         devTestOtp
           ? `SELECT id, lead_id FROM lead_otps
-             WHERE phone = :phone AND purpose = 'lead_verify' AND channel = 'sms'
+             WHERE ${sqlParamEquals('phone', 'phone')}
+               AND ${sqlLiteralEquals('purpose', 'lead_verify')}
+               AND ${sqlLiteralEquals('channel', 'sms')}
                AND verified_at IS NULL AND expires_at > NOW(3)
              ORDER BY created_at DESC LIMIT 1`
           : `SELECT id, lead_id FROM lead_otps
-             WHERE phone = :phone AND otp_hash = :hash AND purpose = 'lead_verify' AND channel = 'sms'
+             WHERE ${sqlParamEquals('phone', 'phone')}
+               AND ${sqlParamEquals('otp_hash', 'hash')}
+               AND ${sqlLiteralEquals('purpose', 'lead_verify')}
+               AND ${sqlLiteralEquals('channel', 'sms')}
                AND verified_at IS NULL AND expires_at > NOW(3)
              ORDER BY created_at DESC LIMIT 1`,
         devTestOtp
-          ? { phone: body.phone }
-          : { phone: body.phone, hash: hashOtp(mobileCode) },
+          ? { phone }
+          : { phone, hash: hashOtp(mobileCode) },
       );
       smsRow = row;
       if (!smsRow) {
@@ -313,16 +326,21 @@ leadsRouter.post('/verify-otp', async (req, res, next) => {
       const [[row]] = await pool.execute(
         devTestOtp
           ? `SELECT id, lead_id FROM lead_otps
-             WHERE email = :email AND purpose = 'lead_verify' AND channel = 'email'
+             WHERE ${sqlParamEquals('email', 'email')}
+               AND ${sqlLiteralEquals('purpose', 'lead_verify')}
+               AND ${sqlLiteralEquals('channel', 'email')}
                AND verified_at IS NULL AND expires_at > NOW(3)
              ORDER BY created_at DESC LIMIT 1`
           : `SELECT id, lead_id FROM lead_otps
-             WHERE email = :email AND otp_hash = :hash AND purpose = 'lead_verify' AND channel = 'email'
+             WHERE ${sqlParamEquals('email', 'email')}
+               AND ${sqlParamEquals('otp_hash', 'hash')}
+               AND ${sqlLiteralEquals('purpose', 'lead_verify')}
+               AND ${sqlLiteralEquals('channel', 'email')}
                AND verified_at IS NULL AND expires_at > NOW(3)
              ORDER BY created_at DESC LIMIT 1`,
         devTestOtp
-          ? { email: body.email }
-          : { email: body.email, hash: hashOtp(emailCode) },
+          ? { email }
+          : { email, hash: hashOtp(emailCode) },
       );
       emailRow = row;
       if (!emailRow) {
@@ -340,8 +358,8 @@ leadsRouter.post('/verify-otp', async (req, res, next) => {
       smsRow?.lead_id ||
       emailRow?.lead_id ||
       (await findMarketingLeadByContact(pool, {
-        email: body.email,
-        phone: body.phone,
+        email,
+        phone,
       }))?.id;
     if (targetLeadId) {
       await pool.execute(

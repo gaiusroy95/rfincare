@@ -1,4 +1,6 @@
 import { newId } from './ids.js';
+import { ensureLeadCollation } from '../db/ensureLeadCollation.js';
+import { sqlParamEquals, sqlParamEqualsLower } from './sqlCollation.js';
 
 export function normalizeLeadEmail(email) {
   return String(email || '').trim().toLowerCase();
@@ -14,9 +16,11 @@ export function normalizeLeadPhone(phone) {
  * Find the most recently updated lead for the same contact (email + phone) or session.
  */
 export async function findMarketingLeadByContact(pool, { email, phone, sessionKey }) {
+  await ensureLeadCollation();
+
   if (sessionKey) {
     const [[row]] = await pool.execute(
-      `SELECT * FROM marketing_leads WHERE session_key = :sk LIMIT 1`,
+      `SELECT * FROM marketing_leads WHERE ${sqlParamEquals('session_key', 'sk')} LIMIT 1`,
       { sk: sessionKey },
     );
     if (row) return row;
@@ -28,7 +32,7 @@ export async function findMarketingLeadByContact(pool, { email, phone, sessionKe
 
   const [rows] = await pool.execute(
     `SELECT * FROM marketing_leads
-     WHERE LOWER(TRIM(email)) = :email
+     WHERE ${sqlParamEqualsLower('email', 'email')}
      ORDER BY updated_at DESC
      LIMIT 20`,
     { email: normalizedEmail },
@@ -57,6 +61,8 @@ export async function upsertMarketingLead(
     applicationId = null,
   },
 ) {
+  await ensureLeadCollation();
+
   const normalizedEmail = normalizeLeadEmail(email);
   const normalizedPhone = normalizeLeadPhone(phone);
   const existing = await findMarketingLeadByContact(pool, {
