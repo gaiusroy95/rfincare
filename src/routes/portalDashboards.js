@@ -236,10 +236,7 @@ portalDashboardsRouter.get('/employee/dashboard', authenticate, async (req, res,
 
     const [[pendingDocs]] = await pool.execute(
       `SELECT COUNT(*) AS c FROM customer_documents cd
-       INNER JOIN loan_applications la ON la.id = cd.application_id
-       WHERE la.assigned_employee_id = :id
-         AND COALESCE(cd.verification_status, cd.status, 'pending') IN ('pending','uploaded')`,
-      { id: employeeId },
+       WHERE COALESCE(cd.verification_status, cd.status, 'pending') IN ('pending','uploaded')`,
     );
 
     const [activities] = await pool.execute(

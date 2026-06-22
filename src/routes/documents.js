@@ -346,12 +346,13 @@ documentsRouter.get(
 
       let conditions = [];
       const params = {};
+      const col = (name) => `cd.${name}`;
 
       if (applicationId) {
-        conditions.push('application_id = :application_id');
+        conditions.push(`${col('application_id')} = :application_id`);
         params.application_id = applicationId;
         if (!isStaff && req.auth.role === 'customer') {
-          conditions.push('customer_id = :customer_id');
+          conditions.push(`${col('customer_id')} = :customer_id`);
           params.customer_id = req.auth.userId;
         }
         if (req.auth.role === 'agent') {
@@ -365,22 +366,18 @@ documentsRouter.get(
       } else if (req.auth.role === 'agent') {
         const scope = await resolveAgentScopeParams(pool, req.auth.userId);
         conditions.push(
-          `application_id IN (SELECT id FROM loan_applications WHERE ${agentApplicationScopeSql('loan_applications')})`,
+          `${col('application_id')} IN (SELECT id FROM loan_applications WHERE ${agentApplicationScopeSql('loan_applications')})`,
         );
         Object.assign(params, scope);
       } else if (req.auth.role === 'employee') {
         await assertEmployeeAccess(req, 'documents', 'read');
-        conditions.push(
-          `application_id IN (SELECT id FROM loan_applications WHERE assigned_employee_id = :employee_id)`,
-        );
-        params.employee_id = req.auth.userId;
         if (req.query.status === 'pending') {
           conditions.push(
-            `COALESCE(verification_status, status, 'pending') IN ('pending','uploaded')`,
+            `COALESCE(${col('verification_status')}, ${col('status')}, 'pending') IN ('pending','uploaded')`,
           );
         }
       } else if (isStaff && customerId) {
-        conditions.push('customer_id = :customer_id');
+        conditions.push(`${col('customer_id')} = :customer_id`);
         params.customer_id = customerId;
       } else if (isStaff) {
         /* admin staff: all documents when no filter */
@@ -391,13 +388,17 @@ documentsRouter.get(
           e.status = 403;
           throw e;
         }
-        conditions.push('customer_id = :customer_id');
+        conditions.push(`${col('customer_id')} = :customer_id`);
         params.customer_id = ownerId;
       }
 
       const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
       const [rows] = await pool.execute(
-        `SELECT * FROM customer_documents ${where} ORDER BY uploaded_at DESC`,
+        `SELECT cd.*, la.application_number
+         FROM customer_documents cd
+         LEFT JOIN loan_applications la ON la.id = cd.application_id
+         ${where}
+         ORDER BY cd.uploaded_at DESC`,
         params,
       );
       res.json(rows.map(formatDocumentRow));
