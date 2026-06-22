@@ -17,7 +17,7 @@ import {
   upsertMarketingLead,
 } from '../lib/marketingLeads.js';
 import { ensureLeadCollation } from '../db/ensureLeadCollation.js';
-import { sqlLiteralEquals, sqlParamEquals } from '../lib/sqlCollation.js';
+import { sqlCastParam, sqlLiteralEquals, sqlParamEquals } from '../lib/sqlCollation.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { hasPermission } from '../auth/permissions.js';
 
@@ -115,13 +115,18 @@ async function persistLeadOtps(pool, { leadId, email, phone, settings, mobileOtp
     const smsId = newId();
     await pool.execute(
       `INSERT INTO lead_otps (id, lead_id, email, phone, otp_hash, purpose, channel, expires_at)
-       VALUES (:id, :lead_id, :email, :phone, :hash, 'lead_verify', 'sms', :exp)`,
+       VALUES (
+         :id, :lead_id, ${sqlCastParam('email')}, ${sqlCastParam('phone')}, ${sqlCastParam('hash')},
+         ${sqlCastParam('purpose')}, ${sqlCastParam('channel')}, :exp
+       )`,
       {
         id: smsId,
         lead_id: leadId,
         email,
         phone,
         hash: hashOtp(mobileOtp),
+        purpose: 'lead_verify',
+        channel: 'sms',
         exp: expiresAt,
       },
     );
@@ -132,13 +137,18 @@ async function persistLeadOtps(pool, { leadId, email, phone, settings, mobileOtp
     const emailId = newId();
     await pool.execute(
       `INSERT INTO lead_otps (id, lead_id, email, phone, otp_hash, purpose, channel, expires_at)
-       VALUES (:id, :lead_id, :email, :phone, :hash, 'lead_verify', 'email', :exp)`,
+       VALUES (
+         :id, :lead_id, ${sqlCastParam('email')}, ${sqlCastParam('phone')}, ${sqlCastParam('hash')},
+         ${sqlCastParam('purpose')}, ${sqlCastParam('channel')}, :exp
+       )`,
       {
         id: emailId,
         lead_id: leadId,
         email,
         phone,
         hash: hashOtp(emailOtp),
+        purpose: 'lead_verify',
+        channel: 'email',
         exp: expiresAt,
       },
     );

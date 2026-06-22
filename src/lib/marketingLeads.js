@@ -1,6 +1,6 @@
 import { newId } from './ids.js';
 import { ensureLeadCollation } from '../db/ensureLeadCollation.js';
-import { sqlParamEquals, sqlParamEqualsLower } from './sqlCollation.js';
+import { sqlCastParam, sqlParamEquals, sqlParamEqualsLower } from './sqlCollation.js';
 
 export function normalizeLeadEmail(email) {
   return String(email || '').trim().toLowerCase();
@@ -65,6 +65,7 @@ export async function upsertMarketingLead(
 
   const normalizedEmail = normalizeLeadEmail(email);
   const normalizedPhone = normalizeLeadPhone(phone);
+  const trimmedName = String(fullName || '').trim();
   const existing = await findMarketingLeadByContact(pool, {
     email: normalizedEmail,
     phone: normalizedPhone,
@@ -76,19 +77,20 @@ export async function upsertMarketingLead(
   if (existing) {
     await pool.execute(
       `UPDATE marketing_leads SET
-         full_name = CASE WHEN :full_name != '' THEN :full_name ELSE full_name END,
-         email = :email,
-         phone = :phone,
-         loan_type = COALESCE(:loan_type, loan_type),
-         source = COALESCE(:source, source),
+         full_name = IF(:use_name = 1, ${sqlCastParam('full_name')}, full_name),
+         email = ${sqlCastParam('email')},
+         phone = ${sqlCastParam('phone')},
+         loan_type = IF(:loan_type IS NULL, loan_type, ${sqlCastParam('loan_type')}),
+         source = IF(:source IS NULL, source, ${sqlCastParam('source')}),
          consent_accepted = GREATEST(consent_accepted, :consent),
-         session_key = COALESCE(:session_key, session_key),
-         application_id = COALESCE(:application_id, application_id),
+         session_key = IF(:session_key IS NULL, session_key, ${sqlCastParam('session_key')}),
+         application_id = IF(:application_id IS NULL, application_id, :application_id),
          updated_at = NOW(3)
        WHERE id = :id`,
       {
         id: existing.id,
-        full_name: fullName || '',
+        use_name: trimmedName ? 1 : 0,
+        full_name: trimmedName,
         email: normalizedEmail,
         phone: normalizedPhone,
         loan_type: loanType || null,
@@ -110,11 +112,21 @@ export async function upsertMarketingLead(
     `INSERT INTO marketing_leads (
        id, full_name, email, phone, loan_type, source, status, consent_accepted, session_key, application_id
      ) VALUES (
-       :id, :full_name, :email, :phone, :loan_type, :source, :status, :consent, :session_key, :application_id
+       :id,
+       IF(:use_name = 1, ${sqlCastParam('full_name')}, NULL),
+       ${sqlCastParam('email')},
+       ${sqlCastParam('phone')},
+       ${sqlCastParam('loan_type')},
+       ${sqlCastParam('source')},
+       ${sqlCastParam('status')},
+       :consent,
+       ${sqlCastParam('session_key')},
+       :application_id
      )`,
     {
       id,
-      full_name: fullName || null,
+      use_name: trimmedName ? 1 : 0,
+      full_name: trimmedName,
       email: normalizedEmail,
       phone: normalizedPhone,
       loan_type: loanType || null,

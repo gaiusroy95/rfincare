@@ -6,6 +6,7 @@ import dotenv from 'dotenv';
 
 import { createApp } from './app.js';
 import { ensureCibilCoreTables } from './db/ensureMilestone4Schema.js';
+import { ensureLeadCollation } from './db/ensureLeadCollation.js';
 import { ensureStaffOnboardingCollation } from './db/ensureOnboardingSchema.js';
 import { getPool } from './db/pool.js';
 import { getUploadDir } from './lib/uploadPaths.js';
@@ -23,6 +24,7 @@ async function bootstrap() {
   try {
     await ensureCibilCoreTables(getPool());
     await ensureStaffOnboardingCollation();
+    await ensureLeadCollation();
   } catch (err) {
     // eslint-disable-next-line no-console
     console.warn('[api] milestone4 schema bootstrap:', err.message);
