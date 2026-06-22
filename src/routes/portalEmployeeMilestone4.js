@@ -5,8 +5,11 @@ import bcrypt from 'bcryptjs';
 import { authenticate } from '../middleware/authenticate.js';
 import { getPool } from '../db/pool.js';
 import { ensureMilestone4Schema } from '../db/ensureMilestone4Schema.js';
+import { ensureStaffOnboardingCollation } from '../db/ensureOnboardingSchema.js';
 import { dispatchFileUpdateNotification } from '../lib/fileNotificationService.js';
 import { ensureAgentCodeForUser } from '../lib/agentCode.js';
+import { sendStaffWelcomeEmail } from '../lib/email.js';
+import { sqlCastParam } from '../lib/sqlCollation.js';
 import {
   assertEmployeeAccess,
   getEffectiveEmployeeAccess,
@@ -67,12 +70,14 @@ portalEmployeeMilestone4Router.get('/agent-onboarding/pending', async (req, res,
       requireEmployeeModuleAccess(access, 'agents', 'read');
     }
     await ensureMilestone4Schema();
+    await ensureStaffOnboardingCollation();
     const pool = getPool();
     const [rows] = await pool.execute(
       `SELECT ao.*, up.full_name, up.email, up.phone
        FROM agent_onboarding ao
        JOIN user_profiles up ON up.id = ao.user_id
-       WHERE ao.qc_status IN ('pending_qc', 'qc_review')
+       WHERE CONVERT(ao.qc_status USING utf8mb4) COLLATE utf8mb4_general_ci
+         IN ('pending_qc', 'qc_review')
        ORDER BY ao.created_at ASC`,
     );
     res.json(
@@ -81,8 +86,12 @@ portalEmployeeMilestone4Router.get('/agent-onboarding/pending', async (req, res,
         userId: r.user_id,
         agentName: r.agent_name,
         agentCode: r.agent_code,
+        username: r.username,
         email: r.email,
         mobileNumber: r.mobile_number,
+        bankName: r.bank_name,
+        accountNumber: r.account_number,
+        ifscCode: r.ifsc_code,
         qcStatus: r.qc_status,
         onboardingStatus: r.onboarding_status,
         createdAt: r.created_at,
@@ -96,13 +105,17 @@ portalEmployeeMilestone4Router.get('/agent-onboarding/pending', async (req, res,
 const QcDecisionSchema = z.object({
   decision: z.enum(['approved', 'rejected']),
   notes: z.string().optional(),
+  temporaryPassword: z.string().min(8).optional(),
+  password: z.string().min(8).optional(),
 });
 
 portalEmployeeMilestone4Router.post('/agent-onboarding/:userId/qc', async (req, res, next) => {
   try {
     requireEmployee(req);
     await ensureMilestone4Schema();
+    await ensureStaffOnboardingCollation();
     const input = QcDecisionSchema.parse(req.body);
+    const tempPassword = input.temporaryPassword || input.password || null;
     if (req.auth.role === 'employee') {
       const access = await getEffectiveEmployeeAccess(req.auth.userId);
       requireEmployeeModuleAccess(
@@ -120,29 +133,86 @@ portalEmployeeMilestone4Router.post('/agent-onboarding/:userId/qc', async (req, 
     if (!agent) return res.status(404).json({ error: 'Agent onboarding not found' });
 
     if (input.decision === 'approved') {
+      if (tempPassword) {
+        const passwordHash = await bcrypt.hash(tempPassword, 12);
+        await pool.execute(`UPDATE auth_users SET password_hash = :ph WHERE id = :id`, {
+          ph: passwordHash,
+          id: req.params.userId,
+        });
+        await pool.execute(
+          `UPDATE user_profiles SET password_change_required = 0 WHERE id = :id`,
+          { id: req.params.userId },
+        );
+      }
+
       await ensureAgentCodeForUser(pool, req.params.userId);
       await pool.execute(
         `UPDATE agent_onboarding
-         SET qc_status = 'qc_approved', qc_employee_id = :emp, qc_notes = :notes, qc_at = NOW(3),
-             qc_approved_by = :emp, onboarding_status = 'active'
+         SET qc_status = ${sqlCastParam('qc_status')},
+             qc_employee_id = :emp,
+             qc_notes = IF(:notes IS NULL, qc_notes, ${sqlCastParam('notes')}),
+             qc_at = NOW(3),
+             qc_approved_by = :emp,
+             onboarding_status = ${sqlCastParam('onboarding_status')}
          WHERE user_id = :id`,
-        { id: req.params.userId, emp: req.auth.userId, notes: input.notes || null },
+        {
+          id: req.params.userId,
+          emp: req.auth.userId,
+          notes: input.notes || null,
+          qc_status: 'qc_approved',
+          onboarding_status: 'active',
+        },
       );
       await pool.execute(
-        `UPDATE user_profiles SET is_active = 1, account_status = 'active' WHERE id = :id`,
-        { id: req.params.userId },
+        `UPDATE user_profiles SET
+           is_active = 1,
+           account_status = ${sqlCastParam('account_status')},
+           onboarding_status = ${sqlCastParam('profile_onboarding_status')}
+         WHERE id = :id`,
+        {
+          id: req.params.userId,
+          account_status: 'active',
+          profile_onboarding_status: 'active',
+        },
       );
+
+      if (tempPassword) {
+        await sendStaffWelcomeEmail({
+          email: agent.email,
+          fullName: agent.agent_name,
+          role: 'agent',
+          password: tempPassword,
+          loginPath: '/agent-login',
+        }).catch((err) => console.warn('[agent-qc-email]', err.message));
+      }
     } else {
       await pool.execute(
         `UPDATE agent_onboarding
-         SET qc_status = 'qc_rejected', qc_employee_id = :emp, qc_notes = :notes, qc_at = NOW(3),
-             onboarding_status = 'rejected'
+         SET qc_status = ${sqlCastParam('qc_status')},
+             qc_employee_id = :emp,
+             qc_notes = ${sqlCastParam('notes')},
+             qc_at = NOW(3),
+             onboarding_status = ${sqlCastParam('onboarding_status')}
          WHERE user_id = :id`,
-        { id: req.params.userId, emp: req.auth.userId, notes: input.notes || 'QC rejected' },
+        {
+          id: req.params.userId,
+          emp: req.auth.userId,
+          notes: input.notes || 'QC rejected',
+          qc_status: 'qc_rejected',
+          onboarding_status: 'rejected',
+        },
       );
       await pool.execute(
-        `UPDATE user_profiles SET is_active = 0, account_status = 'suspended' WHERE id = :id`,
-        { id: req.params.userId },
+        `UPDATE user_profiles SET
+           is_active = 0,
+           account_status = ${sqlCastParam('account_status')},
+           onboarding_status = ${sqlCastParam('profile_onboarding_status')}
+         WHERE id = :id`,
+        {
+          id: req.params.userId,
+          account_status: 'suspended',
+          profile_onboarding_status: 'rejected',
+        },
       );
     }
 
