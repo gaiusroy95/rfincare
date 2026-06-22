@@ -4,31 +4,43 @@
  */
 
 export function smtpConfigured() {
-  return Boolean(process.env.SMTP_HOST && process.env.SMTP_FROM);
+  return Boolean(
+    process.env.SMTP_HOST &&
+      (process.env.SMTP_FROM || process.env.SMTP_FROM_EMAIL || process.env.SMTP_USER),
+  );
 }
 
 function smtpPassword() {
-  return process.env.SMTP_PASS || process.env.SMTP_PASSWORD || '';
+  const raw = process.env.SMTP_PASS || process.env.SMTP_PASSWORD || '';
+  return String(raw).replace(/^["']|["']$/g, '').trim();
+}
+
+function smtpFromAddress() {
+  return String(
+    process.env.SMTP_FROM || process.env.SMTP_FROM_EMAIL || process.env.SMTP_USER || '',
+  ).trim();
 }
 
 async function sendViaSmtp({ to, subject, text, html, attachments = [] }) {
   const nodemailer = await import('nodemailer');
   const pass = smtpPassword();
+  const user = String(process.env.SMTP_USER || '').trim();
+  const port = Number(process.env.SMTP_PORT || 587);
+  const secure = process.env.SMTP_SECURE === 'true' || port === 465;
+
   const transporter = nodemailer.createTransport({
     host: process.env.SMTP_HOST,
-    port: Number(process.env.SMTP_PORT || 587),
-    secure: process.env.SMTP_SECURE === 'true',
-    auth:
-      process.env.SMTP_USER && pass
-        ? { user: process.env.SMTP_USER, pass }
-        : undefined,
+    port,
+    secure,
+    requireTLS: !secure && port === 587,
+    auth: user && pass ? { user, pass } : undefined,
     connectionTimeout: Number(process.env.SMTP_CONNECTION_TIMEOUT_MS || 10000),
     greetingTimeout: Number(process.env.SMTP_GREETING_TIMEOUT_MS || 10000),
     socketTimeout: Number(process.env.SMTP_SOCKET_TIMEOUT_MS || 15000),
   });
 
   await transporter.sendMail({
-    from: process.env.SMTP_FROM,
+    from: smtpFromAddress(),
     to,
     subject,
     text,
@@ -45,12 +57,25 @@ export async function sendEmail({ to, subject, text, html, attachments }) {
     : [];
 
   if (smtpConfigured()) {
-    await sendViaSmtp({ to, subject, text, html, attachments: mailAttachments });
-    return {
-      sent: true,
-      channel: 'smtp',
-      attachmentCount: mailAttachments.length,
-    };
+    try {
+      await sendViaSmtp({ to, subject, text, html, attachments: mailAttachments });
+      return {
+        sent: true,
+        channel: 'smtp',
+        attachmentCount: mailAttachments.length,
+      };
+    } catch (err) {
+      console.error('[email:smtp]', err?.message || err);
+      return {
+        sent: false,
+        channel: 'smtp',
+        reason: err?.code || 'smtp_error',
+        warning:
+          err?.message ||
+          'Email could not be delivered via SMTP. Check SMTP_* env vars or hosting outbound port access.',
+        attachmentCount: mailAttachments.length,
+      };
+    }
   }
 
   console.log('[email]', { to, subject }, process.env.LOG_OTP === 'true' ? text : '(body hidden)');

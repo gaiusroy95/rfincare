@@ -1,4 +1,5 @@
 import { getPool } from '../db/pool.js';
+import { sqlCastParam, sqlParamEquals } from './sqlCollation.js';
 
 export const AGENT_CODE_PREFIX = 'RFA';
 const CODE_PATTERN = /^RFA-\d{6}$/;
@@ -30,7 +31,7 @@ export async function reserveUniqueAgentCode(connOrPool) {
     const code = formatAgentCode(seq);
     const [[existing]] = await pool.execute(
       `SELECT id FROM agent_onboarding
-       WHERE agent_code COLLATE utf8mb4_unicode_ci = CONVERT(:code USING utf8mb4) COLLATE utf8mb4_unicode_ci
+       WHERE ${sqlParamEquals('agent_code', 'code')}
        LIMIT 1`,
       { code },
     );
@@ -57,7 +58,7 @@ export async function ensureAgentCodeForUser(connOrPool, userId) {
 
   const code = await reserveUniqueAgentCode(pool);
   await pool.execute(
-    `UPDATE agent_onboarding SET agent_code = :code, updated_at = NOW(3)
+    `UPDATE agent_onboarding SET agent_code = ${sqlCastParam('code')}, updated_at = NOW(3)
      WHERE user_id = :id
        AND (agent_code IS NULL OR LENGTH(TRIM(agent_code)) = 0)`,
     { code, id: userId },

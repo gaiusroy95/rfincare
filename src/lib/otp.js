@@ -192,11 +192,9 @@ async function sendEmailOtp({ email, otp, settings }) {
     }
     const result = await sendEmail({ to: email, subject, text, html });
     if (!result.sent) {
-      const err = new Error(result.warning || 'Email OTP could not be delivered.');
-      err.status = 502;
-      throw err;
+      return { ...result, provider: 'smtp', delivered: false };
     }
-    return { ...result, provider: 'smtp' };
+    return { ...result, provider: 'smtp', delivered: true };
   }
 
   throw new Error(`Unknown email provider: ${provider}`);
@@ -342,26 +340,24 @@ export async function sendDualChannelOtp({ email, phone, settings: settingsOverr
 
   async function runEmailChannel() {
     try {
-      return await channelTimeout(
+      const result = await channelTimeout(
         sendEmailOtp({ email, otp: emailOtp, settings }),
         'Email OTP',
       );
-    } catch (err) {
-      if (settings.emailProvider === 'smtp' && !smtpConfigured()) {
-        warnings.push(
-          'SMTP is not configured on the server; email OTP was logged server-side only. Set SMTP_* env vars or use Admin → OTP settings → Email operator: Console for testing.',
-        );
-        return sendEmailOtp({
-          email,
-          otp: emailOtp,
-          settings: { ...settings, emailProvider: 'console' },
-        });
+      if (result?.delivered === false || result?.sent === false) {
+        throw new Error(result.warning || 'Email OTP could not be delivered.');
       }
-      const e = new Error(
-        `${err?.message || 'Email OTP failed'}. Configure SMTP on the server or set email operator to Console in Admin → OTP settings.`,
+      return result;
+    } catch (err) {
+      await sendEmailOtp({
+        email,
+        otp: emailOtp,
+        settings: { ...settings, emailProvider: 'console' },
+      });
+      warnings.push(
+        `Email OTP could not be sent (${err?.message || 'delivery failed'}). You can continue with mobile OTP only.`,
       );
-      e.status = err?.status || 502;
-      throw e;
+      return { sent: false, provider: settings.emailProvider, delivered: false, degraded: true };
     }
   }
 
@@ -379,17 +375,14 @@ export async function sendDualChannelOtp({ email, phone, settings: settingsOverr
     parallel.push(
       runEmailChannel().then((r) => {
         outcomes.email = r;
-        if (r?.sent === false && settings.emailProvider === 'smtp') {
-          warnings.push(
-            r.warning ||
-              'Email was not delivered — configure SMTP_HOST and SMTP_FROM on the server.',
-          );
-        }
       }),
     );
   }
 
   await Promise.all(parallel);
+
+  const emailDelivered = outcomes.email?.delivered !== false && outcomes.email?.sent !== false;
+  const smsDelivered = outcomes.sms?.sent !== false;
 
   if (settings.requireWhatsappOtp && phone) {
     try {
@@ -404,11 +397,15 @@ export async function sendDualChannelOtp({ email, phone, settings: settingsOverr
 
   return {
     mobileOtp: settings.requireMobileOtp !== false ? mobileOtp : null,
-    emailOtp: settings.requireEmailOtp !== false ? emailOtp : null,
+    emailOtp: settings.requireEmailOtp !== false && emailDelivered ? emailOtp : null,
     smsProvider: settings.smsProvider,
     emailProvider: settings.emailProvider,
     whatsappProvider: settings.whatsappProvider,
     msg91Configured: isMsg91Configured(),
+    emailDelivered,
+    smsDelivered,
+    requireMobileOtp: settings.requireMobileOtp !== false,
+    requireEmailOtp: settings.requireEmailOtp !== false && emailDelivered,
     warnings,
     delivery: outcomes,
   };

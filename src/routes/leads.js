@@ -158,19 +158,32 @@ async function persistLeadOtps(pool, { leadId, email, phone, settings, mobileOtp
   return otpIds;
 }
 
-function formatOtpSendResponse({ settings, mobileOtp, emailOtp, otpIds, warnings = [] }) {
+function formatOtpSendResponse({ settings, mobileOtp, emailOtp, otpIds, warnings = [], otpResult }) {
+  const requireMobileOtp = otpResult?.requireMobileOtp ?? settings.requireMobileOtp;
+  const requireEmailOtp = otpResult?.requireEmailOtp ?? settings.requireEmailOtp;
+
   return {
     success: true,
     otpIds,
     expiresInSeconds: 600,
-    requireMobileOtp: settings.requireMobileOtp,
-    requireEmailOtp: settings.requireEmailOtp,
+    requireMobileOtp,
+    requireEmailOtp,
+    emailDelivered: otpResult?.emailDelivered,
+    smsDelivered: otpResult?.smsDelivered,
     smsProvider: settings.smsProvider,
     emailProvider: settings.emailProvider,
     warnings: warnings.length ? warnings : undefined,
     ...(process.env.LOG_OTP === 'true'
       ? { devMobileOtp: mobileOtp, devEmailOtp: emailOtp }
       : {}),
+  };
+}
+
+function effectiveOtpSettings(settings, otpResult) {
+  return {
+    ...settings,
+    requireMobileOtp: otpResult.requireMobileOtp !== false,
+    requireEmailOtp: otpResult.requireEmailOtp !== false,
   };
 }
 
@@ -197,11 +210,12 @@ leadsRouter.post('/start-verification', async (req, res, next) => {
 
     const settings = await getOtpProviderSettings();
     const otpResult = await sendDualChannelOtp({ phone, email, settings });
+    const deliverySettings = effectiveOtpSettings(settings, otpResult);
     const otpIds = await persistLeadOtps(pool, {
       leadId: row.id,
       email,
       phone,
-      settings,
+      settings: deliverySettings,
       mobileOtp: otpResult.mobileOtp,
       emailOtp: otpResult.emailOtp,
     });
@@ -213,6 +227,7 @@ leadsRouter.post('/start-verification', async (req, res, next) => {
         emailOtp: otpResult.emailOtp,
         otpIds,
         warnings: otpResult.warnings,
+        otpResult,
       }),
       lead: formatLead(row),
     });
@@ -246,11 +261,12 @@ leadsRouter.post('/request-otp', async (req, res, next) => {
       settings,
     });
 
+    const deliverySettings = effectiveOtpSettings(settings, otpResult);
     const otpIds = await persistLeadOtps(pool, {
       leadId: resolvedLeadId,
       email,
       phone,
-      settings,
+      settings: deliverySettings,
       mobileOtp: otpResult.mobileOtp,
       emailOtp: otpResult.emailOtp,
     });
@@ -262,6 +278,7 @@ leadsRouter.post('/request-otp', async (req, res, next) => {
         emailOtp: otpResult.emailOtp,
         otpIds,
         warnings: otpResult.warnings,
+        otpResult,
       }),
     );
   } catch (err) {

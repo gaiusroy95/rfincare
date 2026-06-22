@@ -4,6 +4,7 @@ import { getPool } from '../db/pool.js';
 import { ensureOnboardingSchema } from '../db/ensureOnboardingSchema.js';
 import { sendStaffWelcomeEmail } from './email.js';
 import { ensureAgentCodeForUser } from './agentCode.js';
+import { sqlCastParam, sqlLiteralEquals, sqlParamEqualsLower } from './sqlCollation.js';
 
 function pick(body, ...keys) {
   for (const key of keys) {
@@ -12,6 +13,16 @@ function pick(body, ...keys) {
     }
   }
   return undefined;
+}
+
+function resolveActiveFlag(accountStatus) {
+  if (accountStatus === 'active') return 1;
+  if (accountStatus === 'inactive' || accountStatus === 'suspended') return 0;
+  return null;
+}
+
+function sqlSetFromParam(column, param) {
+  return `${column} = IF(:${param} IS NULL, ${column}, ${sqlCastParam(param)})`;
 }
 
 export async function fetchAgentDetail(userId) {
@@ -23,7 +34,7 @@ export async function fetchAgentDetail(userId) {
             ao.onboarding_status AS ao_status
      FROM user_profiles up
      LEFT JOIN agent_onboarding ao ON ao.user_id = up.id
-     WHERE up.id = :id AND up.role COLLATE utf8mb4_unicode_ci = 'agent' LIMIT 1`,
+     WHERE up.id = :id AND ${sqlLiteralEquals('up.role', 'agent')} LIMIT 1`,
     { id: userId },
   );
   if (!row) {
@@ -60,7 +71,7 @@ export async function fetchEmployeeDetail(userId) {
             eo.onboarding_status AS eo_status
      FROM user_profiles up
      LEFT JOIN employee_onboarding eo ON eo.user_id = up.id
-     WHERE up.id = :id AND up.role COLLATE utf8mb4_unicode_ci = 'employee' LIMIT 1`,
+     WHERE up.id = :id AND ${sqlLiteralEquals('up.role', 'employee')} LIMIT 1`,
     { id: userId },
   );
   if (!row) {
@@ -99,60 +110,61 @@ export async function updateAgentDetails(userId, body) {
   const ifscCode = pick(body, 'ifscCode', 'ifsc_code');
   const accountStatus = pick(body, 'accountStatus', 'account_status');
   const onboardingStatus = pick(body, 'onboardingStatus', 'onboarding_status');
+  const isActive = resolveActiveFlag(accountStatus);
 
   if (email) {
+    const normalizedEmail = String(email).trim().toLowerCase();
     const [[dup]] = await pool.execute(
       `SELECT id FROM auth_users
-       WHERE email COLLATE utf8mb4_unicode_ci = CONVERT(:email USING utf8mb4) COLLATE utf8mb4_unicode_ci
-         AND id != :id LIMIT 1`,
-      { email, id: userId },
+       WHERE ${sqlParamEqualsLower('email', 'email')} AND id != :id LIMIT 1`,
+      { email: normalizedEmail, id: userId },
     );
     if (dup) {
       const e = new Error('Email already in use');
       e.status = 409;
       throw e;
     }
-    await pool.execute(`UPDATE auth_users SET email = :email WHERE id = :id`, { email, id: userId });
+    await pool.execute(`UPDATE auth_users SET email = ${sqlCastParam('email')} WHERE id = :id`, {
+      email: normalizedEmail,
+      id: userId,
+    });
   }
 
   await pool.execute(
     `UPDATE user_profiles SET
-       full_name = COALESCE(:full_name, full_name),
-       email = COALESCE(:email, email),
-       phone = COALESCE(:phone, phone),
-       account_status = COALESCE(:account_status, account_status),
-       onboarding_status = COALESCE(:onboarding_status, onboarding_status),
-       is_active = CASE
-         WHEN :account_status = 'active' THEN 1
-         WHEN :account_status IN ('inactive', 'suspended') THEN 0
-         ELSE is_active
-       END
-     WHERE id = :id AND role COLLATE utf8mb4_unicode_ci = 'agent'`,
+       ${sqlSetFromParam('full_name', 'full_name')},
+       ${email ? `${sqlSetFromParam('email', 'email')},` : ''}
+       ${sqlSetFromParam('phone', 'phone')},
+       ${sqlSetFromParam('account_status', 'account_status')},
+       ${sqlSetFromParam('onboarding_status', 'onboarding_status')},
+       is_active = IF(:is_active IS NULL, is_active, :is_active)
+     WHERE id = :id AND ${sqlLiteralEquals('role', 'agent')}`,
     {
       id: userId,
       full_name: fullName || null,
-      email: email || null,
+      email: email ? String(email).trim().toLowerCase() : null,
       phone: phone || null,
       account_status: accountStatus || null,
       onboarding_status: onboardingStatus || null,
+      is_active: isActive,
     },
   );
 
   await pool.execute(
     `UPDATE agent_onboarding SET
-       agent_name = COALESCE(:agent_name, agent_name),
-       email = COALESCE(:email, email),
-       mobile_number = COALESCE(:mobile_number, mobile_number),
-       username = COALESCE(:username, username),
-       account_number = COALESCE(:account_number, account_number),
-       bank_name = COALESCE(:bank_name, bank_name),
-       ifsc_code = COALESCE(:ifsc_code, ifsc_code),
-       onboarding_status = COALESCE(:onboarding_status, onboarding_status)
+       ${sqlSetFromParam('agent_name', 'agent_name')},
+       ${email ? `${sqlSetFromParam('email', 'email')},` : ''}
+       ${sqlSetFromParam('mobile_number', 'mobile_number')},
+       ${sqlSetFromParam('username', 'username')},
+       ${sqlSetFromParam('account_number', 'account_number')},
+       ${sqlSetFromParam('bank_name', 'bank_name')},
+       ${sqlSetFromParam('ifsc_code', 'ifsc_code')},
+       ${sqlSetFromParam('onboarding_status', 'onboarding_status')}
      WHERE user_id = :id`,
     {
       id: userId,
       agent_name: fullName || null,
-      email: email || null,
+      email: email ? String(email).trim().toLowerCase() : null,
       mobile_number: phone || null,
       username: username || null,
       account_number: accountNumber || null,
@@ -178,61 +190,62 @@ export async function updateEmployeeDetails(userId, body) {
   const ifscCode = pick(body, 'ifscCode', 'ifsc_code');
   const accountStatus = pick(body, 'accountStatus', 'account_status');
   const onboardingStatus = pick(body, 'onboardingStatus', 'onboarding_status');
+  const isActive = resolveActiveFlag(accountStatus);
 
   if (email) {
+    const normalizedEmail = String(email).trim().toLowerCase();
     const [[dup]] = await pool.execute(
       `SELECT id FROM auth_users
-       WHERE email COLLATE utf8mb4_unicode_ci = CONVERT(:email USING utf8mb4) COLLATE utf8mb4_unicode_ci
-         AND id != :id LIMIT 1`,
-      { email, id: userId },
+       WHERE ${sqlParamEqualsLower('email', 'email')} AND id != :id LIMIT 1`,
+      { email: normalizedEmail, id: userId },
     );
     if (dup) {
       const e = new Error('Email already in use');
       e.status = 409;
       throw e;
     }
-    await pool.execute(`UPDATE auth_users SET email = :email WHERE id = :id`, { email, id: userId });
+    await pool.execute(`UPDATE auth_users SET email = ${sqlCastParam('email')} WHERE id = :id`, {
+      email: normalizedEmail,
+      id: userId,
+    });
   }
 
   await pool.execute(
     `UPDATE user_profiles SET
-       full_name = COALESCE(:full_name, full_name),
-       email = COALESCE(:email, email),
-       phone = COALESCE(:phone, phone),
-       account_status = COALESCE(:account_status, account_status),
-       onboarding_status = COALESCE(:onboarding_status, onboarding_status),
-       is_active = CASE
-         WHEN :account_status = 'active' THEN 1
-         WHEN :account_status IN ('inactive', 'suspended') THEN 0
-         ELSE is_active
-       END
-     WHERE id = :id AND role COLLATE utf8mb4_unicode_ci = 'employee'`,
+       ${sqlSetFromParam('full_name', 'full_name')},
+       ${email ? `${sqlSetFromParam('email', 'email')},` : ''}
+       ${sqlSetFromParam('phone', 'phone')},
+       ${sqlSetFromParam('account_status', 'account_status')},
+       ${sqlSetFromParam('onboarding_status', 'onboarding_status')},
+       is_active = IF(:is_active IS NULL, is_active, :is_active)
+     WHERE id = :id AND ${sqlLiteralEquals('role', 'employee')}`,
     {
       id: userId,
       full_name: fullName || null,
-      email: email || null,
+      email: email ? String(email).trim().toLowerCase() : null,
       phone: phone || null,
       account_status: accountStatus || null,
       onboarding_status: onboardingStatus || null,
+      is_active: isActive,
     },
   );
 
   await pool.execute(
     `UPDATE employee_onboarding SET
-       employee_name = COALESCE(:employee_name, employee_name),
-       email = COALESCE(:email, email),
-       mobile_number = COALESCE(:mobile_number, mobile_number),
-       username = COALESCE(:username, username),
-       employee_code = COALESCE(:employee_code, employee_code),
-       account_number = COALESCE(:account_number, account_number),
-       bank_name = COALESCE(:bank_name, bank_name),
-       ifsc_code = COALESCE(:ifsc_code, ifsc_code),
-       onboarding_status = COALESCE(:onboarding_status, onboarding_status)
+       ${sqlSetFromParam('employee_name', 'employee_name')},
+       ${email ? `${sqlSetFromParam('email', 'email')},` : ''}
+       ${sqlSetFromParam('mobile_number', 'mobile_number')},
+       ${sqlSetFromParam('username', 'username')},
+       ${sqlSetFromParam('employee_code', 'employee_code')},
+       ${sqlSetFromParam('account_number', 'account_number')},
+       ${sqlSetFromParam('bank_name', 'bank_name')},
+       ${sqlSetFromParam('ifsc_code', 'ifsc_code')},
+       ${sqlSetFromParam('onboarding_status', 'onboarding_status')}
      WHERE user_id = :id`,
     {
       id: userId,
       employee_name: fullName || null,
-      email: email || null,
+      email: email ? String(email).trim().toLowerCase() : null,
       mobile_number: phone || null,
       username: username || null,
       employee_code: employeeCode || null,
