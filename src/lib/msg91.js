@@ -7,7 +7,9 @@
  *   MSG91_SENDER_ID (6-char DLT sender)
  *   MSG91_OTP_TEMPLATE_ID or MSG91_TEMPLATE_ID (OTP template in MSG91 panel)
  *   MSG91_FLOW_TEMPLATE_ID (optional Flow API template)
- *   MSG91_WHATSAPP_TEMPLATE_ID (optional)
+ *   MSG91_WHATSAPP_TEMPLATE_ID (optional — template name in MSG91 panel)
+ *   MSG91_WHATSAPP_NAMESPACE (required for WhatsApp template API)
+ *   MSG91_WHATSAPP_INTEGRATED_NUMBER (onboarded WhatsApp number with country code)
  *   MSG91_ROUTE (default 4 = transactional India)
  *   MSG91_EMAIL_DOMAIN (e.g. mail.rfincare.com)
  *   MSG91_EMAIL_FROM_EMAIL (e.g. no-reply@mail.rfincare.com)
@@ -23,7 +25,7 @@ const MSG91_EMAIL_URL = 'https://control.msg91.com/api/v5/email/send';
 const MSG91_FLOW_URL = 'https://control.msg91.com/api/v5/flow/';
 const MSG91_SMS_HTTP_URL = 'https://control.msg91.com/api/sendhttp.php';
 const MSG91_WHATSAPP_URL =
-  'https://api.msg91.com/api/v5/whatsapp/whatsapp-outbound-message/bulk/';
+  'https://control.msg91.com/api/v5/whatsapp/whatsapp-outbound-message/bulk/';
 
 const MSG91_FETCH_TIMEOUT_MS = Number(process.env.MSG91_FETCH_TIMEOUT_MS || 15000);
 
@@ -55,6 +57,14 @@ export function getMsg91Config(overrides = {}) {
       overrides.msg91WhatsappTemplateId ||
       process.env.MSG91_WHATSAPP_TEMPLATE_ID ||
       '',
+    whatsappNamespace:
+      overrides.msg91WhatsappNamespace ||
+      process.env.MSG91_WHATSAPP_NAMESPACE ||
+      '',
+    whatsappLanguage:
+      overrides.msg91WhatsappLanguage ||
+      process.env.MSG91_WHATSAPP_LANGUAGE ||
+      'en',
     route: process.env.MSG91_ROUTE || '4',
     countryCode: '91',
   };
@@ -271,8 +281,24 @@ export async function sendMsg91TransactionalSms({
   return { sent: true, provider: 'msg91', mode: 'transactional_sms', requestId: text.trim() };
 }
 
+function buildMsg91WhatsappOtpComponents(otp) {
+  const otpValue = String(otp);
+  const bodyKey = process.env.MSG91_WHATSAPP_OTP_BODY_KEY || 'body_1';
+  const components = {
+    [bodyKey]: { type: 'text', value: otpValue },
+  };
+
+  if (process.env.MSG91_WHATSAPP_INCLUDE_BUTTON === 'true') {
+    const buttonKey = process.env.MSG91_WHATSAPP_OTP_BUTTON_KEY || 'button_1';
+    components[buttonKey] = { subtype: 'url', type: 'text', value: otpValue };
+  }
+
+  return components;
+}
+
 /**
- * WhatsApp outbound (requires MSG91 WhatsApp template + namespace in panel).
+ * WhatsApp outbound (MSG91 v5 bulk template API).
+ * @see https://msg91.com/help/whatsapp/whatsapp-otp
  */
 export async function sendMsg91Whatsapp({ phone, otp, config: overrides = {} }) {
   const config = getMsg91Config(overrides);
@@ -293,7 +319,16 @@ export async function sendMsg91Whatsapp({ phone, otp, config: overrides = {} }) 
     throw err;
   }
 
+  if (!config.whatsappNamespace) {
+    const err = new Error(
+      'MSG91 WhatsApp template namespace is missing. Set MSG91_WHATSAPP_NAMESPACE in server env (MSG91 → WhatsApp → Templates → your template details), or disable WhatsApp OTP in Admin → OTP settings.',
+    );
+    err.status = 503;
+    throw err;
+  }
+
   const mobile = normalizeIndianMobile(phone);
+  const recipient = `${config.countryCode}${mobile}`;
   const res = await fetchWithTimeout(
     MSG91_WHATSAPP_URL,
     {
@@ -301,17 +336,29 @@ export async function sendMsg91Whatsapp({ phone, otp, config: overrides = {} }) 
       headers: {
         authkey: config.authKey,
         'Content-Type': 'application/json',
+        Accept: 'application/json',
       },
       body: JSON.stringify({
         integrated_number: integratedNumber,
-        template_name: config.whatsappTemplateId,
-        language: process.env.MSG91_WHATSAPP_LANGUAGE || 'en',
-        recipients: [
-          {
-            mobiles: [`${config.countryCode}${mobile}`],
-            variables: { otp: String(otp), OTP: String(otp) },
+        content_type: 'template',
+        payload: {
+          messaging_product: 'whatsapp',
+          type: 'template',
+          template: {
+            name: config.whatsappTemplateId,
+            language: {
+              code: config.whatsappLanguage,
+              policy: 'deterministic',
+            },
+            namespace: config.whatsappNamespace,
+            to_and_components: [
+              {
+                to: [recipient],
+                components: buildMsg91WhatsappOtpComponents(otp),
+              },
+            ],
           },
-        ],
+        },
       }),
       timeoutMessage: 'MSG91 WhatsApp request timed out.',
     },
@@ -420,6 +467,9 @@ export async function testMsg91Connection(overrides = {}) {
     otpTemplateId: config.otpTemplateId || '(using plain SMS — set MSG91_OTP_TEMPLATE_ID)',
     flowTemplateId: config.flowTemplateId || null,
     whatsappTemplateId: config.whatsappTemplateId || null,
+    whatsappNamespace: config.whatsappNamespace || null,
+    whatsappIntegratedNumber:
+      (process.env.MSG91_WHATSAPP_INTEGRATED_NUMBER || '').trim() || null,
     email: {
       configured: isMsg91EmailConfigured(overrides),
       domain: emailConfig.domain || null,
