@@ -9,7 +9,7 @@ const SETTINGS_ID = 'default';
 let ensured = false;
 
 export const SMS_PROVIDERS = ['console', 'twilio', 'msg91'];
-export const EMAIL_PROVIDERS = ['console', 'smtp'];
+export const EMAIL_PROVIDERS = ['console', 'smtp', 'msg91'];
 export const WHATSAPP_PROVIDERS = ['console', 'twilio', 'msg91'];
 
 const DEFAULTS = {
@@ -25,6 +25,11 @@ const DEFAULTS = {
     msg91OtpTemplateId: '',
     msg91FlowTemplateId: '',
     msg91WhatsappTemplateId: '',
+    msg91EmailDomain: '',
+    msg91EmailFromEmail: '',
+    msg91EmailFromName: '',
+    msg91EmailOtpTemplateId: '',
+    msg91EmailOtpVariable: 'OTP_CODE',
     otpMessageTemplate: 'Your Rfincare verification code is {{otp}}. Valid for 10 minutes.',
   },
 };

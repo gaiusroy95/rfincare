@@ -143,6 +143,11 @@ const OtpProviderSettingsSchema = z.object({
       msg91OtpTemplateId: z.string().optional(),
       msg91FlowTemplateId: z.string().optional(),
       msg91WhatsappTemplateId: z.string().optional(),
+      msg91EmailDomain: z.string().optional(),
+      msg91EmailFromEmail: z.string().optional(),
+      msg91EmailFromName: z.string().optional(),
+      msg91EmailOtpTemplateId: z.string().optional(),
+      msg91EmailOtpVariable: z.string().optional(),
       otpMessageTemplate: z.string().optional(),
     })
     .optional(),
@@ -253,14 +258,38 @@ cmsRouter.post('/otp-settings/test', async (req, res, next) => {
   try {
     const body = z
       .object({
-        phone: z.string().min(10),
-        channel: z.enum(['sms', 'whatsapp']).optional(),
+        phone: z.string().min(10).optional(),
+        email: z.string().email().optional(),
+        channel: z.enum(['sms', 'whatsapp', 'email']).optional(),
       })
       .parse(req.body);
 
     const settings = await getOtpProviderSettings();
     const otp = generateOtp();
-    const channel = body.channel || 'sms';
+    const channel = body.channel || (body.email ? 'email' : 'sms');
+
+    if (channel === 'email') {
+      if (!body.email) {
+        return res.status(400).json({ error: 'email is required for email test' });
+      }
+      const result = await sendOtpNotification({
+        email: body.email,
+        otp,
+        channel: 'email',
+        settings: { ...settings, emailProvider: 'msg91' },
+      });
+      return res.json({
+        success: true,
+        channel,
+        ...(process.env.LOG_OTP === 'true' ? { devOtp: otp } : {}),
+        result,
+      });
+    }
+
+    if (!body.phone) {
+      return res.status(400).json({ error: 'phone is required for SMS/WhatsApp test' });
+    }
+
     const result = await sendOtpNotification({
       phone: body.phone,
       otp,

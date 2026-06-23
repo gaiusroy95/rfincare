@@ -5,6 +5,8 @@ import { sendEmail, smtpConfigured } from './email.js';
 import {
   getMsg91Config,
   isMsg91Configured,
+  isMsg91EmailConfigured,
+  sendMsg91EmailOtp,
   sendMsg91Otp,
   sendMsg91Whatsapp,
 } from './msg91.js';
@@ -35,10 +37,14 @@ export function getOtpInfrastructureStatus() {
   return {
     msg91: {
       configured: isMsg91Configured(),
+      emailConfigured: isMsg91EmailConfigured(),
       senderId: process.env.MSG91_SENDER_ID || null,
       otpTemplateId:
         process.env.MSG91_OTP_TEMPLATE_ID || process.env.MSG91_TEMPLATE_ID || null,
       whatsappTemplateId: process.env.MSG91_WHATSAPP_TEMPLATE_ID || null,
+      emailDomain: process.env.MSG91_EMAIL_DOMAIN || null,
+      emailFrom: process.env.MSG91_EMAIL_FROM_EMAIL || process.env.MSG91_EMAIL_FROM || null,
+      emailOtpTemplateId: process.env.MSG91_EMAIL_OTP_TEMPLATE_ID || null,
     },
     twilio: {
       configured: Boolean(
@@ -136,6 +142,22 @@ async function sendViaMsg91({ phone, otp, config }) {
   });
 }
 
+async function sendViaMsg91Email({ email, otp, recipientName, config }) {
+  const providerConfig = config || {};
+  return sendMsg91EmailOtp({
+    email,
+    otp,
+    recipientName,
+    config: {
+      msg91EmailDomain: providerConfig.msg91EmailDomain,
+      msg91EmailFromEmail: providerConfig.msg91EmailFromEmail,
+      msg91EmailFromName: providerConfig.msg91EmailFromName,
+      msg91EmailOtpTemplateId: providerConfig.msg91EmailOtpTemplateId,
+      msg91EmailOtpVariable: providerConfig.msg91EmailOtpVariable,
+    },
+  });
+}
+
 async function sendSmsOtp({ phone, otp, settings }) {
   const provider = settings?.smsProvider || 'console';
   const message = formatOtpMessage(settings?.providerConfig?.otpMessageTemplate, otp);
@@ -185,7 +207,7 @@ async function sendEmailOtp({ email, otp, settings }) {
   if (provider === 'smtp') {
     if (!smtpConfigured()) {
       const err = new Error(
-        'Email operator is SMTP but SMTP_HOST/SMTP_FROM are not set on the server. Configure SMTP or set email operator to Console in Admin → OTP settings.',
+        'Email operator is SMTP but SMTP_HOST/SMTP_FROM are not set on the server. Configure SMTP or set email operator to MSG91 in Admin → OTP settings.',
       );
       err.status = 503;
       throw err;
@@ -195,6 +217,22 @@ async function sendEmailOtp({ email, otp, settings }) {
       return { ...result, provider: 'smtp', delivered: false };
     }
     return { ...result, provider: 'smtp', delivered: true };
+  }
+
+  if (provider === 'msg91') {
+    if (!isMsg91EmailConfigured(settings?.providerConfig)) {
+      const err = new Error(
+        'Email operator is MSG91 but MSG91 email is not configured. Set MSG91_AUTH_KEY, MSG91_EMAIL_DOMAIN, MSG91_EMAIL_FROM_EMAIL, and MSG91_EMAIL_OTP_TEMPLATE_ID on the server.',
+      );
+      err.status = 503;
+      throw err;
+    }
+    const result = await sendViaMsg91Email({
+      email,
+      otp,
+      config: settings?.providerConfig,
+    });
+    return { ...result, delivered: true };
   }
 
   throw new Error(`Unknown email provider: ${provider}`);
