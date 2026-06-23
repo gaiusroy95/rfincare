@@ -121,13 +121,21 @@ async function parseMsg91Response(res) {
   const failed =
     !res.ok ||
     data?.type === 'error' ||
+    data?.status === 'fail' ||
+    data?.hasError === true ||
     (typeof data?.message === 'string' && /error|fail/i.test(data.message));
 
   if (failed) {
+    const errorsField = data?.errors;
+    const errorsText = Array.isArray(errorsField)
+      ? errorsField.join('; ')
+      : typeof errorsField === 'string'
+        ? errorsField
+        : null;
     const detail =
+      errorsText ||
       data?.message ||
       data?.msg ||
-      (Array.isArray(data?.errors) ? data.errors.join('; ') : null) ||
       text ||
       `HTTP ${res.status}`;
     const err = new Error(`MSG91: ${String(detail).slice(0, 400)}`);
@@ -274,6 +282,17 @@ export async function sendMsg91Whatsapp({ phone, otp, config: overrides = {} }) 
     return sendMsg91Otp({ phone, otp, config: overrides });
   }
 
+  const integratedNumber = (
+    process.env.MSG91_WHATSAPP_INTEGRATED_NUMBER || ''
+  ).trim();
+  if (!integratedNumber) {
+    const err = new Error(
+      'MSG91 WhatsApp OTP is enabled but MSG91_WHATSAPP_INTEGRATED_NUMBER is not set. Add your onboarded WhatsApp number from the MSG91 dashboard to server env, or disable WhatsApp OTP in Admin → OTP settings.',
+    );
+    err.status = 503;
+    throw err;
+  }
+
   const mobile = normalizeIndianMobile(phone);
   const res = await fetchWithTimeout(
     MSG91_WHATSAPP_URL,
@@ -284,7 +303,7 @@ export async function sendMsg91Whatsapp({ phone, otp, config: overrides = {} }) 
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        integrated_number: process.env.MSG91_WHATSAPP_INTEGRATED_NUMBER || '',
+        integrated_number: integratedNumber,
         template_name: config.whatsappTemplateId,
         language: process.env.MSG91_WHATSAPP_LANGUAGE || 'en',
         recipients: [
