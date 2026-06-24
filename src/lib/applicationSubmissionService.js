@@ -8,6 +8,7 @@ import { sendEmail } from './email.js';
 import { sendMsg91TransactionalSms } from './msg91.js';
 import { writeAuditLog } from './audit.js';
 import { createCustomerNotification } from '../routes/notifications.js';
+import { getUserNotificationPreferences } from './expoPushService.js';
 
 function parseJson(value) {
   if (!value) return {};
@@ -237,7 +238,8 @@ export async function finalizeApplicationSubmission({
 
   const smsMessage = `Rfincare: Your application ${appNumber} has been submitted successfully. Track status in your dashboard.`;
   try {
-    if (phone && process.env.MSG91_AUTH_KEY) {
+    const prefs = await getUserNotificationPreferences(row.customer_id);
+    if (phone && prefs.sms !== false && process.env.MSG91_AUTH_KEY) {
       await sendMsg91TransactionalSms({ phone, message: smsMessage });
       notificationResults.sms = true;
     } else if (phone) {

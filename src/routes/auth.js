@@ -14,6 +14,7 @@ import { generateOtp, hashOtp, sendOtpNotification } from '../lib/otp.js';
 import { assignUniqueCustomerCode } from '../lib/customerCode.js';
 import { ensureMilestone3Schema } from '../db/ensureMilestone3Schema.js';
 import { writeAuditLog } from '../lib/audit.js';
+import { buildMobileAuthJson } from '../lib/mobileClient.js';
 
 export const authRouter = Router();
 
@@ -111,10 +112,13 @@ authRouter.post('/signup', async (req, res, next) => {
     const { accessJwt, refreshJwt } = await issueTokens({ userId, email: input.email, role, req });
     setRefreshCookie(res, refreshJwt);
 
-    res.status(201).json({
-      accessToken: accessJwt,
-      user: { id: userId, email: input.email, role },
-    });
+    res.status(201).json(
+      buildMobileAuthJson(req, {
+        accessJwt,
+        refreshJwt,
+        user: { id: userId, email: input.email, role },
+      }),
+    );
   } catch (err) {
     if (err?.code === 'ER_DUP_ENTRY') {
       err.status = 409;
@@ -225,10 +229,13 @@ authRouter.post('/login', async (req, res, next) => {
     });
     setRefreshCookie(res, refreshJwt);
 
-    res.json({
-      accessToken: accessJwt,
-      user: { id: profile.id, email: userRow.email, role: profile.role },
-    });
+    res.json(
+      buildMobileAuthJson(req, {
+        accessJwt,
+        refreshJwt,
+        user: { id: profile.id, email: userRow.email, role: profile.role },
+      }),
+    );
   } catch (err) {
     next(err);
   }
@@ -308,7 +315,7 @@ authRouter.post('/refresh', async (req, res, next) => {
     const accessJwt = signAccessToken({ userId, email: profile.email, role: profile.role });
     setRefreshCookie(res, newRefreshJwt);
 
-    res.json({ accessToken: accessJwt });
+    res.json(buildMobileAuthJson(req, { accessJwt, refreshJwt: newRefreshJwt }));
   } catch (err) {
     next(err);
   }
@@ -696,11 +703,14 @@ authRouter.post('/application/verify-otp', async (req, res, next) => {
     const { accessJwt, refreshJwt } = await issueTokens({ userId, email, role, req });
     setRefreshCookie(res, refreshJwt);
 
-    res.json({
-      verified: true,
-      accessToken: accessJwt,
-      user: { id: userId, email, role },
-    });
+    res.json(
+      buildMobileAuthJson(req, {
+        verified: true,
+        accessJwt,
+        refreshJwt,
+        user: { id: userId, email, role },
+      }),
+    );
   } catch (err) {
     next(err);
   }

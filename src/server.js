@@ -6,6 +6,7 @@ import dotenv from 'dotenv';
 
 import { createApp } from './app.js';
 import { ensureCibilCoreTables } from './db/ensureMilestone4Schema.js';
+import { ensurePushNotificationSchema } from './db/ensurePushNotificationSchema.js';
 import { ensureLeadCollation } from './db/ensureLeadCollation.js';
 import { ensureStaffOnboardingCollation } from './db/ensureOnboardingSchema.js';
 import { getPool } from './db/pool.js';
@@ -23,6 +24,7 @@ const app = createApp();
 async function bootstrap() {
   try {
     await ensureCibilCoreTables(getPool());
+    await ensurePushNotificationSchema();
     await ensureStaffOnboardingCollation();
     await ensureLeadCollation();
   } catch (err) {

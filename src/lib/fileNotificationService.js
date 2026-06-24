@@ -2,11 +2,12 @@ import { getPool } from '../db/pool.js';
 import { newId } from './ids.js';
 import { sendEmail } from './email.js';
 import { getOtpProviderSettings } from './otpProviderSettings.js';
-import { createCustomerNotification } from '../routes/notifications.js';
+import { createCustomerNotification, createStaffNotification } from '../routes/notifications.js';
+import { getUserNotificationPreferences } from './expoPushService.js';
 import { ensureMilestone4Schema } from '../db/ensureMilestone4Schema.js';
 
 const DEFAULT_SETTINGS = {
-  channels: { sms: true, email: true, whatsapp: true },
+  channels: { sms: true, email: true, whatsapp: true, push: true },
   agentNotificationsEnabled: true,
   events: {
     customer_document_upload: { customer: false, employee: true, agent: 'optional' },
@@ -47,37 +48,35 @@ export async function saveFileNotificationSettings(settings, updatedBy) {
   return getFileNotificationSettings();
 }
 
-async function createStaffNotification(pool, { userId, role, applicationId, eventType, title, message }) {
-  await pool.execute(
-    `INSERT INTO staff_notifications (id, user_id, role, application_id, event_type, title, message)
-     VALUES (:id, :uid, :role, :app, :event, :title, :msg)`,
-    {
-      id: newId(),
-      uid: userId,
-      role,
-      app: applicationId || null,
-      event: eventType,
-      title,
-      msg: message,
-    },
-  );
+async function createStaffNotificationLocal(pool, payload) {
+  return createStaffNotification(pool, payload);
 }
 
-async function deliverChannels({ phone, email, title, message, settings }) {
+async function deliverChannels({ phone, email, title, message, settings, userId }) {
   const channels = [];
   const body = `${title}\n\n${message}`;
   const otpSettings = await getOtpProviderSettings();
+
+  let allowSms = !!settings.channels?.sms;
+  let allowWhatsapp = !!settings.channels?.whatsapp;
+  if (userId) {
+    const prefs = await getUserNotificationPreferences(userId);
+    if (prefs.sms === false) {
+      allowSms = false;
+      allowWhatsapp = false;
+    }
+  }
 
   if (settings.channels?.email && email) {
     await sendEmail({ to: email, subject: title, text: body });
     channels.push('email');
   }
-  if (settings.channels?.sms && phone) {
+  if (allowSms && phone) {
     const { sendOtpNotification } = await import('./otp.js');
     await sendOtpNotification({ phone, otp: message.slice(0, 160), channel: 'sms', settings: otpSettings });
     channels.push('sms');
   }
-  if (settings.channels?.whatsapp && phone) {
+  if (allowWhatsapp && phone) {
     const { sendOtpNotification } = await import('./otp.js');
     await sendOtpNotification({
       phone,
@@ -144,6 +143,7 @@ export async function dispatchFileUpdateNotification(eventKey, { applicationId, 
         title,
         message,
         settings,
+        userId: app.customer_id,
       });
       results.channels.push(...ch);
     } catch {
@@ -152,7 +152,7 @@ export async function dispatchFileUpdateNotification(eventKey, { applicationId, 
   }
 
   if (shouldNotify(rule, 'employee') && app.assigned_employee_id) {
-    await createStaffNotification(pool, {
+    await createStaffNotificationLocal(pool, {
       userId: app.assigned_employee_id,
       role: 'employee',
       applicationId,
@@ -171,6 +171,7 @@ export async function dispatchFileUpdateNotification(eventKey, { applicationId, 
       title,
       message,
       settings,
+      userId: app.assigned_employee_id,
     });
     results.channels.push(...ch);
   } else if (shouldNotify(rule, 'employee')) {
@@ -178,7 +179,7 @@ export async function dispatchFileUpdateNotification(eventKey, { applicationId, 
       `SELECT id, email, phone FROM user_profiles WHERE role = 'employee' AND is_active = 1 LIMIT 20`,
     );
     for (const emp of employees) {
-      await createStaffNotification(pool, {
+      await createStaffNotificationLocal(pool, {
         userId: emp.id,
         role: 'employee',
         applicationId,
@@ -192,6 +193,7 @@ export async function dispatchFileUpdateNotification(eventKey, { applicationId, 
         title,
         message,
         settings,
+        userId: emp.id,
       });
     }
     results.inApp.push('employees_broadcast');
@@ -203,7 +205,7 @@ export async function dispatchFileUpdateNotification(eventKey, { applicationId, 
     && (shouldNotify(rule, 'agent') || rule.agent === 'if_sourced');
 
   if (notifyAgent) {
-    await createStaffNotification(pool, {
+    await createStaffNotificationLocal(pool, {
       userId: app.agent_id,
       role: 'agent',
       applicationId,
@@ -218,6 +220,7 @@ export async function dispatchFileUpdateNotification(eventKey, { applicationId, 
       title,
       message,
       settings,
+      userId: app.agent_id,
     });
     results.channels.push(...ch);
   }

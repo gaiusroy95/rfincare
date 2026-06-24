@@ -6,6 +6,7 @@ import { newId } from '../lib/ids.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { calculateEligibility } from '../lib/eligibilityEngine.js';
 import { verifyAccessToken } from '../lib/jwt.js';
+import { createCustomerNotification } from './notifications.js';
 
 function getOptionalCustomerId(req) {
   const auth = req.headers.authorization || '';
@@ -99,6 +100,17 @@ eligibilityAssessmentsRouter.post('/', async (req, res, next) => {
         bank_results: JSON.stringify(bankResults || []),
       },
     );
+
+    if (customerId) {
+      const scoreLabel = score != null ? `${Math.round(score)}%` : 'ready';
+      await createCustomerNotification(pool, {
+        customerId,
+        title: 'Eligibility check complete',
+        message: `Your loan eligibility result is ${scoreLabel}. Open the app to compare bank offers.`,
+        type: 'eligibility',
+        data: { assessmentId: id },
+      }).catch(() => {});
+    }
 
     res.status(201).json({
       id,

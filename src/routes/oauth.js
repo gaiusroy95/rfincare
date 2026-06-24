@@ -16,6 +16,7 @@ import {
   getOAuthRedirectUri,
   getPublicOAuthConfig,
 } from '../lib/oauthProviderSettings.js';
+import { isMobileClient } from '../lib/mobileClient.js';
 import {
   isAllowedOAuthFrontendCallbackAsync,
   resolveOAuthFrontendCallbackAsync,
@@ -98,7 +99,7 @@ async function issueTokensForUser({ userId, email, role, req, res }) {
 
   const accessJwt = signAccessToken({ userId, email, role });
   setRefreshCookie(res, refreshJwt);
-  return accessJwt;
+  return { accessJwt, refreshJwt };
 }
 
 async function findOrCreateOAuthUser({ provider, providerUserId, email, fullName }) {
@@ -330,7 +331,7 @@ async function handleOAuthCallback(req, res, provider) {
     return res.redirect(`${callbackUrl}?error=staff_account`);
   }
 
-  const accessJwt = await issueTokensForUser({
+  const { accessJwt, refreshJwt } = await issueTokensForUser({
     userId: profile.id,
     email: profile.email,
     role: profile.role,
@@ -344,6 +345,9 @@ async function handleOAuthCallback(req, res, provider) {
   const front = new URL(callbackUrl);
   front.searchParams.set('accessToken', accessJwt);
   front.searchParams.set('provider', provider);
+  if (callbackUrl.startsWith('rfincare://')) {
+    front.searchParams.set('refreshToken', refreshJwt);
+  }
   res.redirect(front.toString());
 }
 

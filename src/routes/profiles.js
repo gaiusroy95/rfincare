@@ -4,6 +4,8 @@ import { z } from 'zod';
 import { authenticate } from '../middleware/authenticate.js';
 import { authorize } from '../middleware/authorize.js';
 import { getPool } from '../db/pool.js';
+import { ensurePushNotificationSchema } from '../db/ensurePushNotificationSchema.js';
+import { saveUserNotificationPreferences } from '../lib/expoPushService.js';
 
 export const profilesRouter = Router();
 
@@ -11,6 +13,22 @@ const UpdateMeSchema = z.object({
   full_name: z.string().min(1).optional(),
   phone: z.string().min(6).optional(),
   avatar_url: z.string().url().optional(),
+  notification_preferences: z
+    .object({
+      push: z.boolean().optional(),
+      email: z.boolean().optional(),
+      sms: z.boolean().optional(),
+      marketing: z.boolean().optional(),
+    })
+    .optional(),
+  notificationPreferences: z
+    .object({
+      push: z.boolean().optional(),
+      email: z.boolean().optional(),
+      sms: z.boolean().optional(),
+      marketing: z.boolean().optional(),
+    })
+    .optional(),
 }).passthrough();
 
 profilesRouter.patch(
@@ -21,6 +39,14 @@ profilesRouter.patch(
     try {
       const input = UpdateMeSchema.parse(req.body);
       const pool = getPool();
+
+      if (input.notification_preferences || input.notificationPreferences) {
+        await ensurePushNotificationSchema();
+        await saveUserNotificationPreferences(
+          req.auth.userId,
+          input.notification_preferences || input.notificationPreferences,
+        );
+      }
 
       await pool.execute(
         `UPDATE user_profiles

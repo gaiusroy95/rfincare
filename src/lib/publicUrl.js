@@ -34,6 +34,8 @@ export function getPublicSiteOrigin() {
   return `http://127.0.0.1:${process.env.API_PORT || 8080}`;
 }
 
+const MOBILE_OAUTH_CALLBACK = 'rfincare://oauth/callback';
+
 function parseCallbackListFromEnv() {
   const raw = process.env.OAUTH_FRONTEND_CALLBACK || '';
   const urls = raw
@@ -41,13 +43,18 @@ function parseCallbackListFromEnv() {
     .map((s) => s.trim())
     .filter(Boolean);
 
-  if (urls.length) return urls;
-
-  if (process.env.VERCEL_URL) {
-    return [`${getPublicSiteOrigin()}/oauth/callback`];
+  const withMobile = [...urls];
+  if (!withMobile.includes(MOBILE_OAUTH_CALLBACK)) {
+    withMobile.push(MOBILE_OAUTH_CALLBACK);
   }
 
-  return ['http://127.0.0.1:4028/oauth/callback'];
+  if (withMobile.length > 1 || urls.length) return withMobile;
+
+  if (process.env.VERCEL_URL) {
+    return [`${getPublicSiteOrigin()}/oauth/callback`, MOBILE_OAUTH_CALLBACK];
+  }
+
+  return ['http://127.0.0.1:4028/oauth/callback', MOBILE_OAUTH_CALLBACK];
 }
 
 /** All allowed SPA OAuth callback URLs (sync — env only). */
@@ -83,6 +90,12 @@ export function resolveOAuthFrontendCallback(returnOrigin, urls = getOAuthFronte
   if (!returnOrigin) return urls[0];
 
   const normalized = returnOrigin.replace(/\/$/, '');
+  const exact = urls.find((url) => url.replace(/\/$/, '') === normalized);
+  if (exact) return exact;
+
+  const mobileMatch = urls.find((url) => url.startsWith('rfincare://') && normalized.startsWith('rfincare://'));
+  if (mobileMatch) return mobileMatch;
+
   const match = urls.find((url) => originOfCallbackUrl(url) === normalized);
   return match || urls[0];
 }
