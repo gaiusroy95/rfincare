@@ -861,14 +861,28 @@ loanApplicationsRouter.get('/:id/summary-pdf', authenticate, async (req, res, ne
     const data = parseJson(row.data);
     if (data.application_package_pdf) {
       const { resolveUploadFilePath } = await import('../lib/uploadPaths.js');
-      const { createReadStream } = await import('node:fs');
+      const { createReadStream, existsSync } = await import('node:fs');
       const filePath = resolveUploadFilePath(data.application_package_pdf.replace(/^\/uploads\//, ''));
-      res.setHeader('Content-Type', 'application/pdf');
-      res.setHeader(
-        'Content-Disposition',
-        `inline; filename="application-${row.application_number || row.id}.pdf"`,
+      if (existsSync(filePath)) {
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader(
+          'Content-Disposition',
+          `inline; filename="application-${row.application_number || row.id}.pdf"`,
+        );
+        const stream = createReadStream(filePath);
+        stream.on('error', (streamErr) => {
+          console.warn('[summary-pdf] stored package read failed, will not retry:', streamErr.message);
+          if (!res.headersSent) {
+            next(streamErr);
+          } else {
+            res.destroy(streamErr);
+          }
+        });
+        return stream.pipe(res);
+      }
+      console.warn(
+        `[summary-pdf] stored package missing for application ${row.id}; falling back to generated summary`,
       );
-      return createReadStream(filePath).pipe(res);
     }
 
     const lines = [
