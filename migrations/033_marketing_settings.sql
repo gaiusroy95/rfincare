@@ -18,9 +18,9 @@ CREATE TABLE IF NOT EXISTS marketing_settings (
   seo_canonical_url VARCHAR(512) NULL,
   seo_robots VARCHAR(128) NULL DEFAULT 'index,follow',
   google_site_verification VARCHAR(128) NULL,
-  page_seo_json JSON NULL,
-  ad_campaigns_json JSON NULL,
-  custom_tags_json JSON NULL,
+  page_seo_json LONGTEXT NULL,
+  ad_campaigns_json LONGTEXT NULL,
+  custom_tags_json LONGTEXT NULL,
   updated_by CHAR(36) NULL,
   updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   PRIMARY KEY (id)
@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS marketing_settings (
 CREATE TABLE IF NOT EXISTS marketing_events (
   id CHAR(36) NOT NULL PRIMARY KEY,
   event_name VARCHAR(128) NOT NULL,
-  platform ENUM('web', 'mobile', 'ios', 'android') NOT NULL DEFAULT 'web',
+  platform VARCHAR(16) NOT NULL DEFAULT 'web',
   page_path VARCHAR(512) NULL,
   utm_source VARCHAR(128) NULL,
   utm_medium VARCHAR(128) NULL,

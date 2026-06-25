@@ -1,11 +1,6 @@
-import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-
 import { getPool } from '../db/pool.js';
 import { newId } from './ids.js';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
 const SETTINGS_ID = 'default';
 let ensured = false;
 
@@ -99,15 +94,56 @@ export function formatPublicMarketingSettings(settings) {
 
 export async function ensureMarketingSchema() {
   if (ensured) return;
-  const sql = readFileSync(
-    join(__dirname, '../../migrations/033_marketing_settings.sql'),
-    'utf8',
-  );
   const pool = getPool();
-  const statements = sql
-    .split(';')
-    .map((s) => s.trim())
-    .filter((s) => s && !s.startsWith('--'));
+
+  // Inlined (no readFileSync) so this works in serverless bundles (e.g. Vercel)
+  // where the migrations/ folder may not be included. JSON payloads are stored
+  // as LONGTEXT and parsed in JS for broad MySQL/MariaDB compatibility.
+  const statements = [
+    `CREATE TABLE IF NOT EXISTS marketing_settings (
+      id VARCHAR(32) NOT NULL DEFAULT 'default',
+      ga_measurement_id VARCHAR(32) NULL,
+      gtm_container_id VARCHAR(32) NULL,
+      ga_enabled TINYINT(1) NOT NULL DEFAULT 0,
+      meta_pixel_id VARCHAR(64) NULL,
+      meta_pixel_enabled TINYINT(1) NOT NULL DEFAULT 0,
+      meta_conversions_api_token VARCHAR(512) NULL,
+      custom_head_html MEDIUMTEXT NULL,
+      custom_body_html MEDIUMTEXT NULL,
+      seo_site_name VARCHAR(255) NULL,
+      seo_default_title VARCHAR(255) NULL,
+      seo_default_description TEXT NULL,
+      seo_keywords TEXT NULL,
+      seo_og_image VARCHAR(512) NULL,
+      seo_twitter_card VARCHAR(32) NULL DEFAULT 'summary_large_image',
+      seo_canonical_url VARCHAR(512) NULL,
+      seo_robots VARCHAR(128) NULL DEFAULT 'index,follow',
+      google_site_verification VARCHAR(128) NULL,
+      page_seo_json LONGTEXT NULL,
+      ad_campaigns_json LONGTEXT NULL,
+      custom_tags_json LONGTEXT NULL,
+      updated_by CHAR(36) NULL,
+      updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+      PRIMARY KEY (id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS marketing_events (
+      id CHAR(36) NOT NULL PRIMARY KEY,
+      event_name VARCHAR(128) NOT NULL,
+      platform VARCHAR(16) NOT NULL DEFAULT 'web',
+      page_path VARCHAR(512) NULL,
+      utm_source VARCHAR(128) NULL,
+      utm_medium VARCHAR(128) NULL,
+      utm_campaign VARCHAR(128) NULL,
+      utm_content VARCHAR(128) NULL,
+      utm_term VARCHAR(128) NULL,
+      campaign_id VARCHAR(64) NULL,
+      payload_json LONGTEXT NULL,
+      created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+      INDEX idx_marketing_events_created (created_at),
+      INDEX idx_marketing_events_campaign (utm_campaign),
+      INDEX idx_marketing_events_name (event_name)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+  ];
 
   for (const statement of statements) {
     try {
