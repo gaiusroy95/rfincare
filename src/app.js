@@ -45,6 +45,7 @@ import { portalAdminProfileRouter } from './routes/portalAdminProfile.js';
 import { milestone4AdminRouter } from './routes/milestone4Admin.js';
 import { portalEmployeeMilestone4Router } from './routes/portalEmployeeMilestone4.js';
 import { portalAgentMilestone4Router } from './routes/portalAgentMilestone4.js';
+import { partnersRouter } from './routes/partners.js';
 import { getCorsOptions } from './lib/corsOptions.js';
 import { getUploadDir } from './lib/uploadPaths.js';
 
@@ -102,6 +103,8 @@ export function createApp({ serveStatic = true } = {}) {
   app.use('/portal/agent/reports', portalAgentMilestone4Router);
   app.use('/document-requirements', documentRequirementsRouter);
   app.use('/admin/document-requirements', documentRequirementsRouter);
+  app.use('/partners', partnersRouter);
+  app.use('/api/partners', partnersRouter);
 
   app.use('/uploads', express.static(getUploadDir()));
   app.use('/uploads', (_req, res) => {

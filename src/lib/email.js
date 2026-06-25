@@ -122,3 +122,113 @@ export async function sendStaffWelcomeEmail({ email, fullName, role, password, l
 
   return sendEmail({ to: email, subject, text, html });
 }
+
+export async function sendPartnerApplicationAdminEmail({ recipients, applicant }) {
+  const appUrl = process.env.APP_PUBLIC_URL || process.env.API_PUBLIC_URL || 'http://127.0.0.1:4028';
+  const adminUrl = `${appUrl.replace(/\/$/, '')}/admin-dashboard?tab=registrations&partner=pending`;
+  const toList = Array.isArray(recipients) ? recipients.filter(Boolean) : [];
+  if (!toList.length) return { sent: false, reason: 'no_recipient' };
+
+  const subject = `New partner application — ${applicant.fullName}`;
+  const text = [
+    'A new Rfincare partner (agent) application was submitted.',
+    '',
+    `Name: ${applicant.fullName}`,
+    `Email: ${applicant.email}`,
+    `Phone: ${applicant.phone}`,
+    `PAN: ${applicant.panNumber || '—'}`,
+    `Bank: ${applicant.bankName || '—'} / ${applicant.ifscCode || '—'}`,
+    '',
+    `Review in admin portal: ${adminUrl}`,
+    '',
+    '— Rfincare',
+  ].join('\n');
+
+  const html = `
+    <p>A new <strong>partner application</strong> was submitted.</p>
+    <ul>
+      <li><strong>Name:</strong> ${applicant.fullName}</li>
+      <li><strong>Email:</strong> ${applicant.email}</li>
+      <li><strong>Phone:</strong> ${applicant.phone}</li>
+      <li><strong>PAN:</strong> ${applicant.panNumber || '—'}</li>
+      <li><strong>Bank:</strong> ${applicant.bankName || '—'} (${applicant.ifscCode || '—'})</li>
+    </ul>
+    <p><a href="${adminUrl}">Open admin portal to review documents</a></p>
+  `;
+
+  const results = [];
+  for (const to of toList) {
+    results.push(await sendEmail({ to, subject, text, html }));
+  }
+  return { sent: results.some((r) => r.sent), results };
+}
+
+export async function sendPartnerWelcomeEmail({
+  email,
+  fullName,
+  username,
+  password,
+  agentCode,
+  financialYear,
+}) {
+  const appUrl = process.env.APP_PUBLIC_URL || process.env.API_PUBLIC_URL || 'http://127.0.0.1:4028';
+  const loginUrl = `${appUrl.replace(/\/$/, '')}/agent-login`;
+  const resetUrl = `${appUrl.replace(/\/$/, '')}/agent-login?reset=1`;
+
+  const subject = `Welcome to Rfincare — Partner account approved (${agentCode})`;
+  const text = [
+    `Hello ${fullName || email},`,
+    '',
+    'Your partner application has been approved. Welcome to the Rfincare agent network.',
+    '',
+    `Agent code (FY ${financialYear || 'current'}): ${agentCode}`,
+    `Login URL: ${loginUrl}`,
+    `Username: ${username}`,
+    `Email: ${email}`,
+    `Temporary password: ${password}`,
+    '',
+    'Sign in with the credentials above, then reset your password:',
+    resetUrl,
+    '',
+    '— Rfincare Team',
+  ].join('\n');
+
+  const html = `
+    <p>Hello ${fullName || email},</p>
+    <p>Your <strong>partner application</strong> has been approved. Welcome to Rfincare.</p>
+    <ul>
+      <li><strong>Agent code (FY ${financialYear || 'current'}):</strong> ${agentCode}</li>
+      <li><strong>Login:</strong> <a href="${loginUrl}">${loginUrl}</a></li>
+      <li><strong>Username:</strong> ${username}</li>
+      <li><strong>Email:</strong> ${email}</li>
+      <li><strong>Temporary password:</strong> ${password}</li>
+    </ul>
+    <p><a href="${resetUrl}">Reset your password after first sign-in</a></p>
+  `;
+
+  return sendEmail({ to: email, subject, text, html });
+}
+
+export async function sendPartnerRejectionEmail({ email, fullName, reason }) {
+  const subject = 'Rfincare partner application update';
+  const text = [
+    `Hello ${fullName || email},`,
+    '',
+    'Thank you for applying to become an Rfincare partner.',
+    'After reviewing your application, we are unable to approve it at this time.',
+    reason ? `\nReason: ${reason}` : '',
+    '',
+    'You may contact support if you have questions.',
+    '',
+    '— Rfincare Team',
+  ].join('\n');
+
+  const html = `
+    <p>Hello ${fullName || email},</p>
+    <p>Thank you for your partner application. We are unable to approve it at this time.</p>
+    ${reason ? `<p><strong>Reason:</strong> ${reason}</p>` : ''}
+    <p>Contact support if you have questions.</p>
+  `;
+
+  return sendEmail({ to: email, subject, text, html });
+}

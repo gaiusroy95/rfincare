@@ -53,7 +53,7 @@ function normalizeBody(body = {}) {
   };
 }
 
-export async function createAgentAccount(input, createdByUserId) {
+export async function createAgentAccount(input, createdByUserId, options = {}) {
   await ensureOnboardingSchema();
   await ensureStaffOnboardingCollation();
   await ensureAgentOnboardingQcSchema();
@@ -121,13 +121,15 @@ export async function createAgentAccount(input, createdByUserId) {
       { id: userId },
     );
 
-    await sendStaffWelcomeEmail({
-      email: data.email,
-      fullName: data.agentName,
-      role: 'agent',
-      password: data.password,
-      loginPath: '/agent-login',
-    }).catch((err) => console.warn('[staff-email]', err.message));
+    if (!options.skipWelcomeEmail) {
+      await sendStaffWelcomeEmail({
+        email: data.email,
+        fullName: data.agentName,
+        role: 'agent',
+        password: data.password,
+        loginPath: '/agent-login',
+      }).catch((err) => console.warn('[staff-email]', err.message));
+    }
 
     return row;
   } catch (err) {
