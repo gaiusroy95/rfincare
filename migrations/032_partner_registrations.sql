@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS partner_registrations (
   branch_address VARCHAR(512) NULL,
   ifsc_code VARCHAR(32) NULL,
   photo_path VARCHAR(512) NULL,
+  pan_card_path VARCHAR(512) NULL,
   cancelled_cheque_path VARCHAR(512) NULL,
   address_proof_path VARCHAR(512) NULL,
   registration_status ENUM('pending', 'approved', 'rejected') NOT NULL DEFAULT 'pending',

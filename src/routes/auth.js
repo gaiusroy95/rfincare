@@ -560,6 +560,119 @@ authRouter.post('/change-password', authenticate, async (req, res, next) => {
   }
 });
 
+const ForgotPasswordRequestSchema = z.object({
+  email: z.string().email(),
+  channel: z.enum(['email', 'sms', 'whatsapp']).default('email'),
+});
+
+const ForgotPasswordConfirmSchema = z.object({
+  email: z.string().email(),
+  otp: z.string().length(6),
+  newPassword: z.string().min(8),
+});
+
+/**
+ * PUBLIC FORGOT PASSWORD (unauthenticated)
+ */
+authRouter.post('/forgot-password/request-otp', async (req, res, next) => {
+  try {
+    const input = ForgotPasswordRequestSchema.parse(req.body);
+    const pool = getPool();
+
+    const [[user]] = await pool.execute(
+      `SELECT au.id, up.phone
+       FROM auth_users au
+       LEFT JOIN user_profiles up ON up.id = au.id
+       WHERE au.email = :email LIMIT 1`,
+      { email: input.email.toLowerCase() },
+    );
+
+    // Always return success to avoid email enumeration.
+    if (!user) {
+      return res.json({ success: true, message: 'If an account exists, an OTP has been sent.', expiresInSeconds: 600 });
+    }
+
+    const otp = generateOtp();
+    const id = newId();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+    const phone = user.phone ? String(user.phone).replace(/\D/g, '').slice(-10) : null;
+
+    await pool.execute(
+      `INSERT INTO lead_otps (id, lead_id, email, phone, otp_hash, purpose, channel, expires_at)
+       VALUES (:id, NULL, :email, :phone, :hash, 'password_reset', :channel, :exp)`,
+      {
+        id,
+        email: input.email.toLowerCase(),
+        phone,
+        hash: hashOtp(otp),
+        channel: input.channel,
+        exp: expiresAt,
+      },
+    );
+
+    await sendOtpNotification({
+      email: input.email.toLowerCase(),
+      phone,
+      otp,
+      channel: input.channel,
+    });
+
+    res.json({ success: true, message: 'OTP sent', expiresInSeconds: 600 });
+  } catch (err) {
+    if (err?.name === 'ZodError') {
+      err.status = 400;
+      err.message = err.issues?.[0]?.message || 'Invalid request';
+    }
+    next(err);
+  }
+});
+
+authRouter.post('/forgot-password/confirm', async (req, res, next) => {
+  try {
+    const input = ForgotPasswordConfirmSchema.parse(req.body);
+    const pool = getPool();
+
+    const [[otpRow]] = await pool.execute(
+      `SELECT id FROM lead_otps
+       WHERE email = :email AND otp_hash = :hash
+         AND purpose = 'password_reset' AND verified_at IS NULL AND expires_at > NOW(3)
+       ORDER BY created_at DESC LIMIT 1`,
+      { email: input.email.toLowerCase(), hash: hashOtp(input.otp) },
+    );
+
+    if (!otpRow) {
+      return res.status(401).json({ error: 'Invalid or expired OTP' });
+    }
+
+    const [[user]] = await pool.execute(
+      `SELECT id FROM auth_users WHERE email = :email LIMIT 1`,
+      { email: input.email.toLowerCase() },
+    );
+    if (!user) {
+      return res.status(404).json({ error: 'Account not found' });
+    }
+
+    const hashed = await bcrypt.hash(input.newPassword, 12);
+    await pool.execute(`UPDATE auth_users SET password_hash = :ph WHERE id = :id`, {
+      ph: hashed,
+      id: user.id,
+    });
+    await pool.execute(`UPDATE lead_otps SET verified_at = NOW(3) WHERE id = :id`, { id: otpRow.id });
+    await pool.execute(
+      `UPDATE refresh_tokens SET revoked_at = NOW(3) WHERE user_id = :id AND revoked_at IS NULL`,
+      { id: user.id },
+    );
+
+    res.json({ success: true, message: 'Password reset successfully. Please sign in with your new password.' });
+  } catch (err) {
+    if (err?.name === 'ZodError') {
+      err.status = 400;
+      err.message = err.issues?.[0]?.message || 'Invalid request';
+    }
+    next(err);
+  }
+});
+
 /**
  * SESSION MANAGEMENT
  */

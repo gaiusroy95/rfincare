@@ -68,6 +68,7 @@ partnersRouter.post(
   '/register',
   upload.fields([
     { name: 'photo', maxCount: 1 },
+    { name: 'panCard', maxCount: 1 },
     { name: 'cancelledCheque', maxCount: 1 },
     { name: 'addressProof', maxCount: 1 },
   ]),
@@ -94,11 +95,17 @@ partnersRouter.post(
 
       const files = req.files || {};
       const photo = files.photo?.[0];
+      const panCard = files.panCard?.[0];
       const cancelledCheque = files.cancelledCheque?.[0];
       const addressProof = files.addressProof?.[0];
 
       if (!photo) {
         const e = new Error('Profile photo is required');
+        e.status = 400;
+        throw e;
+      }
+      if (!panCard) {
+        const e = new Error('PAN card upload is required');
         e.status = 400;
         throw e;
       }
@@ -114,10 +121,15 @@ partnersRouter.post(
       }
 
       const [[existingAccount]] = await pool.execute(
-        `SELECT id FROM auth_users WHERE email = :email LIMIT 1`,
+        `SELECT au.id, up.role
+         FROM auth_users au
+         LEFT JOIN user_profiles up ON up.id = au.id
+         WHERE au.email = :email LIMIT 1`,
         { email: parsed.email },
       );
-      if (existingAccount) {
+      // A customer can apply to become a partner (their account is upgraded on
+      // approval). Only block staff/agent accounts already in the system.
+      if (existingAccount && existingAccount.role && existingAccount.role !== 'customer') {
         const e = new Error('An account with this email already exists. Please sign in.');
         e.status = 409;
         throw e;
@@ -139,11 +151,11 @@ partnersRouter.post(
         `INSERT INTO partner_registrations (
           id, full_name, email, phone, address_line1, address_line2, city, state, pin_code,
           pan_number, bank_name, account_number, branch_address, ifsc_code,
-          photo_path, cancelled_cheque_path, address_proof_path, registration_status
+          photo_path, pan_card_path, cancelled_cheque_path, address_proof_path, registration_status
         ) VALUES (
           :id, :full_name, :email, :phone, :address_line1, :address_line2, :city, :state, :pin_code,
           :pan_number, :bank_name, :account_number, :branch_address, :ifsc_code,
-          :photo_path, :cancelled_cheque_path, :address_proof_path, 'pending'
+          :photo_path, :pan_card_path, :cancelled_cheque_path, :address_proof_path, 'pending'
         )`,
         {
           id,
@@ -161,6 +173,7 @@ partnersRouter.post(
           branch_address: parsed.branchAddress,
           ifsc_code: parsed.ifscCode,
           photo_path: storedPath(photo),
+          pan_card_path: storedPath(panCard),
           cancelled_cheque_path: storedPath(cancelledCheque),
           address_proof_path: storedPath(addressProof),
         },

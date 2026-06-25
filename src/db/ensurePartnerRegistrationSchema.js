@@ -23,6 +23,7 @@ export async function ensurePartnerRegistrationSchema(connOrPool) {
       branch_address VARCHAR(512) NULL,
       ifsc_code VARCHAR(32) NULL,
       photo_path VARCHAR(512) NULL,
+      pan_card_path VARCHAR(512) NULL,
       cancelled_cheque_path VARCHAR(512) NULL,
       address_proof_path VARCHAR(512) NULL,
       registration_status ENUM('pending', 'approved', 'rejected') NOT NULL DEFAULT 'pending',
@@ -40,6 +41,15 @@ export async function ensurePartnerRegistrationSchema(connOrPool) {
       INDEX idx_partner_registrations_created (created_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
+
+  // Add pan_card_path for tables created before this column existed.
+  try {
+    await pool.execute(
+      `ALTER TABLE partner_registrations ADD COLUMN pan_card_path VARCHAR(512) NULL AFTER photo_path`,
+    );
+  } catch (err) {
+    if (err.code !== 'ER_DUP_FIELDNAME') throw err;
+  }
 
   ensured = true;
 }

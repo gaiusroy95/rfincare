@@ -1,7 +1,10 @@
 import crypto from 'node:crypto';
+import bcrypt from 'bcryptjs';
 
 import { getPool } from '../db/pool.js';
 import { ensurePartnerRegistrationSchema } from '../db/ensurePartnerRegistrationSchema.js';
+import { ensureOnboardingSchema } from '../db/ensureOnboardingSchema.js';
+import { newId } from './ids.js';
 import { createAgentAccount } from './staffOnboarding.js';
 import {
   getIndianFinancialYearLabel,
@@ -69,6 +72,7 @@ export function mapPartnerRegistrationRow(row) {
     branchAddress: row.branch_address,
     ifscCode: row.ifsc_code,
     photoUrl: docUrl(row.photo_path),
+    panCardUrl: docUrl(row.pan_card_path),
     cancelledChequeUrl: docUrl(row.cancelled_cheque_path),
     addressProofUrl: docUrl(row.address_proof_path),
     registrationStatus: row.registration_status,
@@ -100,6 +104,92 @@ export async function notifyAdminsOfPartnerApplication(registration) {
   });
 }
 
+/**
+ * Convert an existing customer account into an active agent account. Used when
+ * a customer applies to become a partner with the same email they signed up with.
+ * Returns the (existing) user id.
+ */
+async function upgradeCustomerToAgentAccount(pool, { userId, reg, username, password, agentCode, reviewerUserId }) {
+  await ensureOnboardingSchema();
+  const passwordHash = await bcrypt.hash(password, 12);
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    await conn.execute(`UPDATE auth_users SET password_hash = :ph WHERE id = :id`, {
+      ph: passwordHash,
+      id: userId,
+    });
+
+    await conn.execute(
+      `UPDATE user_profiles
+       SET role = 'agent',
+           full_name = COALESCE(NULLIF(:fullName, ''), full_name),
+           phone = COALESCE(NULLIF(:phone, ''), phone),
+           account_status = 'active',
+           is_active = 1,
+           onboarding_status = 'active'
+       WHERE id = :id`,
+      { id: userId, fullName: reg.full_name || '', phone: reg.phone || '' },
+    );
+
+    const [[existingOnb]] = await conn.execute(
+      `SELECT id FROM agent_onboarding WHERE user_id = :id LIMIT 1`,
+      { id: userId },
+    );
+
+    const onbParams = {
+      user_id: userId,
+      username,
+      agent_name: reg.full_name,
+      agent_code: agentCode,
+      email: reg.email,
+      mobile: reg.phone,
+      acc: reg.account_number,
+      bank: reg.bank_name,
+      ifsc: String(reg.ifsc_code || '').toUpperCase(),
+      by: reviewerUserId,
+    };
+
+    if (existingOnb) {
+      await conn.execute(
+        `UPDATE agent_onboarding
+         SET username = :username, agent_name = :agent_name, agent_code = :agent_code,
+             email = :email, mobile_number = :mobile, account_number = :acc,
+             bank_name = :bank, ifsc_code = :ifsc, onboarding_status = 'active',
+             qc_status = 'qc_approved', qc_at = NOW(3), qc_approved_by = :by
+         WHERE user_id = :user_id`,
+        onbParams,
+      );
+    } else {
+      await conn.execute(
+        `INSERT INTO agent_onboarding (
+           id, user_id, username, agent_name, agent_code, email, mobile_number,
+           account_number, bank_name, ifsc_code, onboarding_status, qc_status,
+           qc_at, qc_approved_by, created_by
+         ) VALUES (
+           :id, :user_id, :username, :agent_name, :agent_code, :email, :mobile,
+           :acc, :bank, :ifsc, 'active', 'qc_approved', NOW(3), :by, :by
+         )`,
+        { ...onbParams, id: newId() },
+      );
+    }
+
+    await conn.commit();
+    return userId;
+  } catch (err) {
+    await conn.rollback();
+    if (err?.code === 'ER_DUP_ENTRY') {
+      const e = new Error('Could not convert account: username or agent code already exists');
+      e.status = 409;
+      throw e;
+    }
+    throw err;
+  } finally {
+    conn.release();
+  }
+}
+
 export async function approvePartnerRegistration(registrationId, reviewerUserId) {
   await ensurePartnerRegistrationSchema();
   const pool = getPool();
@@ -120,10 +210,15 @@ export async function approvePartnerRegistration(registrationId, reviewerUserId)
   }
 
   const [[existingUser]] = await pool.execute(
-    `SELECT id FROM auth_users WHERE email = :email LIMIT 1`,
+    `SELECT au.id, up.role
+     FROM auth_users au
+     LEFT JOIN user_profiles up ON up.id = au.id
+     WHERE au.email = :email LIMIT 1`,
     { email: reg.email },
   );
-  if (existingUser) {
+  // Staff/agent accounts cannot be re-provisioned. A plain customer account is
+  // upgraded in place to an agent so the partner can keep using the same email.
+  if (existingUser && existingUser.role && existingUser.role !== 'customer') {
     const e = new Error('An account with this email already exists');
     e.status = 409;
     throw e;
@@ -134,33 +229,46 @@ export async function approvePartnerRegistration(registrationId, reviewerUserId)
   const username = sanitizeUsername(reg.email.split('@')[0]);
   const password = generateTempPassword();
 
-  const agentRow = await createAgentAccount(
-    {
+  let agentUserId;
+  if (existingUser) {
+    agentUserId = await upgradeCustomerToAgentAccount(pool, {
+      userId: existingUser.id,
+      reg,
       username,
       password,
-      email: reg.email,
-      mobileNumber: reg.phone,
-      agentName: reg.full_name,
       agentCode,
-      accountNumber: reg.account_number,
-      bankName: reg.bank_name,
-      ifscCode: reg.ifsc_code,
-    },
-    reviewerUserId,
-    { skipWelcomeEmail: true },
-  );
+      reviewerUserId,
+    });
+  } else {
+    const agentRow = await createAgentAccount(
+      {
+        username,
+        password,
+        email: reg.email,
+        mobileNumber: reg.phone,
+        agentName: reg.full_name,
+        agentCode,
+        accountNumber: reg.account_number,
+        bankName: reg.bank_name,
+        ifscCode: reg.ifsc_code,
+      },
+      reviewerUserId,
+      { skipWelcomeEmail: true },
+    );
+    agentUserId = agentRow.id;
+  }
 
   await pool.execute(
     `UPDATE user_profiles
      SET account_status = 'active', is_active = 1, onboarding_status = 'active'
      WHERE id = :id`,
-    { id: agentRow.id },
+    { id: agentUserId },
   );
   await pool.execute(
     `UPDATE agent_onboarding
      SET onboarding_status = 'active', qc_status = 'qc_approved', qc_at = NOW(3), qc_approved_by = :by
      WHERE user_id = :id`,
-    { id: agentRow.id, by: reviewerUserId },
+    { id: agentUserId, by: reviewerUserId },
   );
 
   await pool.execute(
@@ -176,7 +284,7 @@ export async function approvePartnerRegistration(registrationId, reviewerUserId)
     {
       id: registrationId,
       by: reviewerUserId,
-      userId: agentRow.id,
+      userId: agentUserId,
       code: agentCode,
       fy: financialYear,
     },
@@ -196,12 +304,12 @@ export async function approvePartnerRegistration(registrationId, reviewerUserId)
     actionType: 'APPROVE',
     tableName: 'partner_registrations',
     recordId: registrationId,
-    newValues: { agentCode, userId: agentRow.id, email: reg.email },
+    newValues: { agentCode, userId: agentUserId, email: reg.email },
   });
 
   return {
     registrationId,
-    userId: agentRow.id,
+    userId: agentUserId,
     agentCode,
     financialYear,
     username,
