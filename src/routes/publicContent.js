@@ -11,6 +11,10 @@ import { getSiteContactSettings } from '../lib/siteContactSettings.js';
 import { getHomepageTrustContent } from '../lib/homepageTrustContent.js';
 import { getAboutPageContent } from '../lib/aboutPageContent.js';
 import { getPublicOAuthConfig } from '../lib/oauthProviderSettings.js';
+import {
+  getPublicMarketingSettings,
+  logMarketingEvent,
+} from '../lib/marketingSettings.js';
 import { createResumeToken, resolveResumeToken } from '../lib/resumeTokens.js';
 import { resolveFrontendEnvPath } from '../lib/envPaths.js';
 import { entriesToObject, readEnvFile } from '../lib/envFile.js';
@@ -410,6 +414,48 @@ publicContentRouter.get('/resume-application/:token', async (req, res, next) => 
     if (err?.code === 'ER_NO_SUCH_TABLE') {
       return res.status(503).json({ error: 'Resume links not enabled on server yet' });
     }
+    next(err);
+  }
+});
+
+publicContentRouter.get('/marketing-settings', async (_req, res, next) => {
+  try {
+    res.json(await getPublicMarketingSettings());
+  } catch (err) {
+    next(err);
+  }
+});
+
+publicContentRouter.post('/marketing/track', async (req, res, next) => {
+  try {
+    const body = z
+      .object({
+        eventName: z.string().min(1).max(128),
+        platform: z.enum(['web', 'mobile', 'ios', 'android']).optional(),
+        pagePath: z.string().max(512).optional(),
+        utmSource: z.string().max(128).optional(),
+        utmMedium: z.string().max(128).optional(),
+        utmCampaign: z.string().max(128).optional(),
+        utmContent: z.string().max(128).optional(),
+        utmTerm: z.string().max(128).optional(),
+        campaignId: z.string().max(64).optional(),
+        payload: z.record(z.unknown()).optional(),
+      })
+      .parse(req.body);
+    await logMarketingEvent({
+      eventName: body.eventName,
+      platform: body.platform || 'web',
+      pagePath: body.pagePath,
+      utmSource: body.utmSource,
+      utmMedium: body.utmMedium,
+      utmCampaign: body.utmCampaign,
+      utmContent: body.utmContent,
+      utmTerm: body.utmTerm,
+      campaignId: body.campaignId,
+      payload: body.payload,
+    });
+    res.status(201).json({ ok: true });
+  } catch (err) {
     next(err);
   }
 });

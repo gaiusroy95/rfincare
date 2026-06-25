@@ -9,6 +9,7 @@ import { ensureCibilCoreTables } from './db/ensureMilestone4Schema.js';
 import { ensurePushNotificationSchema } from './db/ensurePushNotificationSchema.js';
 import { ensurePartnerRegistrationSchema } from './db/ensurePartnerRegistrationSchema.js';
 import { ensureTranslationCacheSchema } from './db/ensureTranslationCacheSchema.js';
+import { ensureMarketingSchema } from './lib/marketingSettings.js';
 import { ensureLeadCollation } from './db/ensureLeadCollation.js';
 import { ensureStaffOnboardingCollation } from './db/ensureOnboardingSchema.js';
 import { getPool } from './db/pool.js';
@@ -33,6 +34,7 @@ async function bootstrap() {
     await ensurePushNotificationSchema();
     await ensurePartnerRegistrationSchema();
     await ensureTranslationCacheSchema();
+    await ensureMarketingSchema();
     await ensureStaffOnboardingCollation();
     await ensureLeadCollation();
   } catch (err) {

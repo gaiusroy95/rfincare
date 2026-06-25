@@ -20,6 +20,11 @@ import {
 import { testMsg91Connection } from '../lib/msg91.js';
 import { getOAuthAdminPayload, updateOAuthSettings } from '../lib/oauthProviderSettings.js';
 import { getAboutPageContent, upsertAboutPageContent } from '../lib/aboutPageContent.js';
+import {
+  getMarketingSettings,
+  updateMarketingSettings,
+  getMarketingEventStats,
+} from '../lib/marketingSettings.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { requireRoles } from '../middleware/requireRoles.js';
 
@@ -532,6 +537,86 @@ cmsRouter.post('/success-stories/:id/moderate', async (req, res, next) => {
       },
     );
     res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+const PageSeoSchema = z.object({
+  path: z.string().min(1),
+  title: z.string().optional(),
+  description: z.string().optional(),
+  keywords: z.string().optional(),
+  ogImage: z.string().optional(),
+  robots: z.string().optional(),
+});
+
+const AdCampaignSchema = z.object({
+  id: z.string().min(1),
+  name: z.string().min(1),
+  platform: z.enum(['google', 'meta', 'other']).optional(),
+  utmSource: z.string().optional(),
+  utmMedium: z.string().optional(),
+  utmCampaign: z.string().min(1),
+  utmContent: z.string().optional(),
+  utmTerm: z.string().optional(),
+  notes: z.string().optional(),
+  active: z.boolean().optional(),
+});
+
+const CustomTagSchema = z.object({
+  id: z.string().min(1),
+  name: z.string().min(1),
+  placement: z.enum(['head', 'body']).optional(),
+  scriptHtml: z.string().optional(),
+  enabled: z.boolean().optional(),
+});
+
+const MarketingSettingsSchema = z.object({
+  gaMeasurementId: z.string().optional(),
+  gtmContainerId: z.string().optional(),
+  gaEnabled: z.boolean().optional(),
+  metaPixelId: z.string().optional(),
+  metaPixelEnabled: z.boolean().optional(),
+  metaConversionsApiToken: z.string().optional(),
+  customHeadHtml: z.string().optional(),
+  customBodyHtml: z.string().optional(),
+  seoSiteName: z.string().optional(),
+  seoDefaultTitle: z.string().optional(),
+  seoDefaultDescription: z.string().optional(),
+  seoKeywords: z.string().optional(),
+  seoOgImage: z.string().optional(),
+  seoTwitterCard: z.string().optional(),
+  seoCanonicalUrl: z.string().optional(),
+  seoRobots: z.string().optional(),
+  googleSiteVerification: z.string().optional(),
+  pageSeo: z.array(PageSeoSchema).optional(),
+  adCampaigns: z.array(AdCampaignSchema).optional(),
+  customTags: z.array(CustomTagSchema).optional(),
+});
+
+cmsRouter.get('/marketing-settings', async (_req, res, next) => {
+  try {
+    res.json(await getMarketingSettings());
+  } catch (err) {
+    next(err);
+  }
+});
+
+cmsRouter.put('/marketing-settings', async (req, res, next) => {
+  try {
+    const input = MarketingSettingsSchema.parse(req.body);
+    const updated = await updateMarketingSettings(input, req.auth.userId);
+    res.json(updated);
+  } catch (err) {
+    next(err);
+  }
+});
+
+cmsRouter.get('/marketing-analytics', async (req, res, next) => {
+  try {
+    const days = Number(req.query.days) || 30;
+    res.json(await getMarketingEventStats({ days }));
   } catch (err) {
     next(err);
   }
