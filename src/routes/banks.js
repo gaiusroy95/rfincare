@@ -142,6 +142,10 @@ const BankSchema = z.object({
   customers_served: z.preprocess(emptyToNull, z.string().nullable().optional()),
   partnership_duration: z.preprocess(emptyToNull, z.string().nullable().optional()),
   certifications: z.array(z.string()).optional().nullable(),
+  apply_url: z.preprocess(
+    emptyToNull,
+    z.union([z.string().url(), z.null()]).optional(),
+  ),
 });
 
 function normalizeBankBody(body = {}, { partial = false } = {}) {
@@ -161,12 +165,13 @@ function normalizeBankBody(body = {}, { partial = false } = {}) {
   if (raw.partnershipDuration !== undefined && raw.partnership_duration === undefined) {
     raw.partnership_duration = raw.partnershipDuration;
   }
+  if (raw.applyUrl !== undefined && raw.apply_url === undefined) raw.apply_url = raw.applyUrl;
   return partial ? BankSchema.partial().parse(raw) : BankSchema.parse(raw);
 }
 
 const BANK_COLUMNS = `
   id, name, logo_url, logo_alt, bank_type, status, rating, reviews_count,
-  customers_served, partnership_duration, certifications, display_priority, created_by,
+  customers_served, partnership_duration, certifications, apply_url, display_priority, created_by,
   created_at, updated_at
 `;
 
@@ -204,7 +209,7 @@ function formatBankRow(row) {
 
 const BANK_LIST_COLUMNS = `
   id, name, logo_url, logo_alt, bank_type, status, rating, reviews_count,
-  customers_served, partnership_duration, certifications, display_priority
+  customers_served, partnership_duration, certifications, apply_url, display_priority
 `;
 
 function slimProductData(rawData) {
@@ -362,10 +367,10 @@ banksRouter.post(
       await pool.execute(
         `INSERT INTO banks (
           id, name, logo_url, logo_alt, bank_type, status, rating, reviews_count,
-          customers_served, partnership_duration, certifications, display_priority, created_by
+          customers_served, partnership_duration, certifications, apply_url, display_priority, created_by
         ) VALUES (
           :id, :name, :logo_url, :logo_alt, :bank_type, :status, :rating, :reviews_count,
-          :customers_served, :partnership_duration, :certifications, :display_priority, :created_by
+          :customers_served, :partnership_duration, :certifications, :apply_url, :display_priority, :created_by
         )`,
         {
           id,
@@ -379,6 +384,7 @@ banksRouter.post(
           customers_served: input.customers_served ?? null,
           partnership_duration: input.partnership_duration ?? null,
           certifications: serializeCertifications(input.certifications ?? []),
+          apply_url: input.apply_url ?? null,
           display_priority: input.display_priority ?? 0,
           created_by: req.auth.userId,
         },
@@ -451,6 +457,7 @@ banksRouter.patch(
              customers_served = COALESCE(:customers_served, customers_served),
              partnership_duration = COALESCE(:partnership_duration, partnership_duration),
              certifications = COALESCE(:certifications, certifications),
+             apply_url = COALESCE(:apply_url, apply_url),
              display_priority = COALESCE(:display_priority, display_priority)
          WHERE id = :id`,
         {
@@ -467,6 +474,7 @@ banksRouter.patch(
           certifications: input.certifications != null
             ? serializeCertifications(input.certifications)
             : null,
+          apply_url: input.apply_url ?? null,
           display_priority: input.display_priority ?? null,
         },
       );

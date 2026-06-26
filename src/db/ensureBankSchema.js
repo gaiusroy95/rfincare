@@ -9,6 +9,7 @@ const COLUMN_DDLS = [
   'ADD COLUMN customers_served VARCHAR(64) NULL AFTER reviews_count',
   'ADD COLUMN partnership_duration VARCHAR(128) NULL AFTER customers_served',
   'ADD COLUMN certifications JSON NULL AFTER partnership_duration',
+  'ADD COLUMN apply_url TEXT NULL AFTER certifications',
 ];
 
 export async function ensureBankSchema() {
