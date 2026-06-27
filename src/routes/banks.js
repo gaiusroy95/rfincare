@@ -259,6 +259,7 @@ function dedupeBankProducts(products) {
 }
 
 async function fetchBankList({ includeInactive, includeProducts, categoryQuery }) {
+  await ensureBankSchema();
   const pool = getPool();
   const category = categoryQuery
     ? await resolveProductCategoryQuery(pool, categoryQuery)

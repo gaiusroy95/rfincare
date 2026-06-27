@@ -27,10 +27,23 @@ const partnerUploadDir = () => {
 
 const upload = multer({
   storage: multer.diskStorage({
-    destination: (_req, _file, cb) => cb(null, partnerUploadDir()),
+    destination: (_req, _file, cb) => {
+      // Never throw synchronously inside a multer callback: an uncaught throw
+      // here kills the worker process (returns an empty-body 502/503 instead of
+      // a clean JSON error). Pass any filesystem error back through `cb`.
+      try {
+        cb(null, partnerUploadDir());
+      } catch (err) {
+        cb(err);
+      }
+    },
     filename: (_req, file, cb) => {
-      const safe = basename(file.originalname || 'file').replace(/[^a-zA-Z0-9._-]/g, '_');
-      cb(null, `${newId()}-${safe}`);
+      try {
+        const safe = basename(file.originalname || 'file').replace(/[^a-zA-Z0-9._-]/g, '_');
+        cb(null, `${newId()}-${safe}`);
+      } catch (err) {
+        cb(err);
+      }
     },
   }),
   limits: { fileSize: 10 * 1024 * 1024 },
