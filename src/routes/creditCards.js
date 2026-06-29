@@ -1,9 +1,13 @@
 import { Router } from 'express';
+import { mkdirSync } from 'node:fs';
+import { extname } from 'node:path';
+import multer from 'multer';
 import { z } from 'zod';
 
 import { getPool } from '../db/pool.js';
 import { ensureCreditCardSchema } from '../db/ensureCreditCardSchema.js';
 import { newId } from '../lib/ids.js';
+import { getUploadDir } from '../lib/uploadPaths.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { authorize } from '../middleware/authorize.js';
 
@@ -59,6 +63,65 @@ function formatCardRow(row) {
 
 const emptyToNull = (value) => (value === '' || value === undefined ? null : value);
 
+const logoUrlSchema = z.preprocess(
+  emptyToNull,
+  z
+    .union([
+      z.string().url(),
+      z.string().regex(/^\/uploads\/.+/i),
+      z.null(),
+    ])
+    .optional(),
+);
+
+function isCardLogoImage(file) {
+  const mime = (file.mimetype || '').toLowerCase();
+  if (mime.startsWith('image/')) return true;
+  const ext = extname(file.originalname || '').toLowerCase();
+  return ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg'].includes(ext);
+}
+
+function wrapMulter(uploadMiddleware) {
+  return (req, res, next) => {
+    uploadMiddleware(req, res, (err) => {
+      if (!err) return next();
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        err.status = 413;
+        err.message = 'Logo image must be 2 MB or smaller';
+      } else if (!err.status) {
+        err.status = 400;
+      }
+      next(err);
+    });
+  };
+}
+
+const cardLogoUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => {
+      try {
+        const dir = getUploadDir();
+        mkdirSync(dir, { recursive: true });
+        cb(null, dir);
+      } catch (err) {
+        cb(err);
+      }
+    },
+    filename: (_req, file, cb) => {
+      const ext = extname(file.originalname || '') || '.png';
+      const safeExt = ext.replace(/[^a-zA-Z0-9.]/g, '').slice(0, 8) || '.png';
+      cb(null, `credit-card-logo-${Date.now()}-${newId().slice(0, 8)}${safeExt}`);
+    },
+  }),
+  limits: { fileSize: 2 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (isCardLogoImage(file)) return cb(null, true);
+    const err = new Error('Only image files (JPEG, PNG, GIF, WebP, SVG) are allowed');
+    err.status = 400;
+    cb(err);
+  },
+});
+
 const CardSchema = z.object({
   features: z.union([z.array(z.string()), z.string()]).optional(),
   advantages: z.union([z.array(z.string()), z.string()]).optional(),
@@ -68,7 +131,7 @@ const CardSchema = z.object({
   name: z.string().min(1),
   slug: z.string().optional().nullable(),
   description: z.string().optional().nullable(),
-  logoUrl: z.string().optional().nullable(),
+  logoUrl: logoUrlSchema,
   cardNetwork: z.string().optional().nullable(),
   annualFee: z.coerce.number().optional().nullable(),
   joiningFee: z.coerce.number().optional().nullable(),
@@ -202,6 +265,37 @@ creditCardsRouter.put(
           status = :status
          WHERE id = :id`,
         { id: req.params.id, ...input },
+      );
+      const [[row]] = await pool.execute(`SELECT * FROM credit_cards WHERE id = :id`, { id: req.params.id });
+      res.json(formatCardRow(row));
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+creditCardsRouter.post(
+  '/:id/logo',
+  authenticate,
+  authorize({ resource: 'banks', action: 'update' }),
+  wrapMulter(cardLogoUpload.single('logo')),
+  async (req, res, next) => {
+    try {
+      await ensureCreditCardSchema();
+      if (!req.file) {
+        return res.status(400).json({ error: 'Logo image file is required (field name: logo)' });
+      }
+      const pool = getPool();
+      const [[existing]] = await pool.execute(
+        `SELECT id FROM credit_cards WHERE id = :id LIMIT 1`,
+        { id: req.params.id },
+      );
+      if (!existing) return res.status(404).json({ error: 'Credit card not found' });
+
+      const logoUrl = `/uploads/${req.file.filename}`;
+      await pool.execute(
+        `UPDATE credit_cards SET logo_url = :logo_url WHERE id = :id`,
+        { id: req.params.id, logo_url: logoUrl },
       );
       const [[row]] = await pool.execute(`SELECT * FROM credit_cards WHERE id = :id`, { id: req.params.id });
       res.json(formatCardRow(row));
