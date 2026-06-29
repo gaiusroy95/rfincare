@@ -63,7 +63,7 @@ const CardSchema = z.object({
   features: z.union([z.array(z.string()), z.string()]).optional(),
   advantages: z.union([z.array(z.string()), z.string()]).optional(),
   benefits: z.union([z.array(z.string()), z.string()]).optional(),
-  bankId: z.string().uuid().optional().nullable(),
+  bankId: z.preprocess(emptyToNull, z.union([z.string().min(1), z.null()]).optional()),
   bankName: z.string().min(1),
   name: z.string().min(1),
   slug: z.string().optional().nullable(),
