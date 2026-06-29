@@ -10,12 +10,18 @@ function escapePdfText(line) {
 }
 
 function buildPageStream(pageLines) {
-  let y = START_Y;
-  const contentParts = ['BT', '/F1 11 Tf'];
+  // `Td` moves relative to the start of the PREVIOUS text line, so the start
+  // position is set once and each subsequent line only advances by LINE_HEIGHT.
+  // Re-issuing an absolute-style `50 <y> Td` per line would accumulate offsets
+  // and push every line after the first off the page (blank PDF symptom).
+  const contentParts = ['BT', '/F1 11 Tf', `50 ${START_Y} Td`];
+  let isFirstLine = true;
   for (const line of pageLines) {
-    contentParts.push(`50 ${y} Td (${escapePdfText(line)}) Tj`);
-    contentParts.push(`0 -${LINE_HEIGHT} Td`);
-    y -= LINE_HEIGHT;
+    if (!isFirstLine) {
+      contentParts.push(`0 -${LINE_HEIGHT} Td`);
+    }
+    contentParts.push(`(${escapePdfText(line)}) Tj`);
+    isFirstLine = false;
   }
   contentParts.push('ET');
   return contentParts.join('\n');

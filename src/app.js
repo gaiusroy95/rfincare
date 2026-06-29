@@ -46,6 +46,7 @@ import { milestone4AdminRouter } from './routes/milestone4Admin.js';
 import { portalEmployeeMilestone4Router } from './routes/portalEmployeeMilestone4.js';
 import { portalAgentMilestone4Router } from './routes/portalAgentMilestone4.js';
 import { partnersRouter } from './routes/partners.js';
+import { creditCardsRouter } from './routes/creditCards.js';
 import { translateRouter } from './routes/translate.js';
 import { getCorsOptions } from './lib/corsOptions.js';
 import { getUploadDir } from './lib/uploadPaths.js';
@@ -106,6 +107,8 @@ export function createApp({ serveStatic = true } = {}) {
   app.use('/admin/document-requirements', documentRequirementsRouter);
   app.use('/partners', partnersRouter);
   app.use('/api/partners', partnersRouter);
+  app.use('/credit-cards', creditCardsRouter);
+  app.use('/api/credit-cards', creditCardsRouter);
   app.use('/translate', translateRouter);
   app.use('/api/translate', translateRouter);
 
