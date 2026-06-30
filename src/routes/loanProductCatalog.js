@@ -104,8 +104,8 @@ const ProductSchema = z.object({
   color: z.string().max(32).optional(),
   sort_order: z.coerce.number().int().optional(),
   is_active: z.boolean().optional(),
-  category_id: z.preprocess(emptyToNull, z.string().uuid().nullable().optional()),
-  bank_id: z.preprocess(emptyToNull, z.string().uuid().nullable().optional()),
+  category_id: z.preprocess(emptyToNull, z.union([z.string().min(1), z.null()]).optional()),
+  bank_id: z.preprocess(emptyToNull, z.union([z.string().min(1), z.null()]).optional()),
 });
 
 const CategorySchema = z.object({

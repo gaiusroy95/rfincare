@@ -499,7 +499,12 @@ cmsRouter.put('/legal/:slug', async (req, res, next) => {
   try {
     const { title, bodyHtml } = z.object({ title: z.string(), bodyHtml: z.string() }).parse(req.body);
     await getPool().execute(
-      `UPDATE legal_pages SET title = :title, body_html = :body, updated_by = :by WHERE slug = :slug`,
+      `INSERT INTO legal_pages (slug, title, body_html, updated_by)
+       VALUES (:slug, :title, :body, :by)
+       ON DUPLICATE KEY UPDATE
+         title = VALUES(title),
+         body_html = VALUES(body_html),
+         updated_by = VALUES(updated_by)`,
       { slug: req.params.slug, title, body: bodyHtml, by: req.auth.userId },
     );
     res.json({ ok: true });
