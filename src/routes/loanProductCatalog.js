@@ -83,12 +83,6 @@ function slugify(input) {
     .replace(/^_|_$/g, '');
 }
 
-function toApiKey(slug) {
-  const s = slugify(slug);
-  if (!s) return null;
-  return s.endsWith('_loan') ? s : `${s}_loan`;
-}
-
 function bankProductApiKey(id) {
   return `bp_${String(id).replace(/-/g, '')}`.slice(0, 64);
 }
@@ -125,6 +119,24 @@ async function buildCatalogSlug(pool, { slugInput, label, bankId, category, excl
       ? slugify(`${await getBankSlugPart(pool, bankId)}_${slugBase}_${category.slug}`)
       : slugBase;
   return resolveUniqueCatalogSlug(pool, preferred, excludeId);
+}
+
+async function resolveUniqueCatalogApiKey(pool, preferred, excludeId = null) {
+  let base = slugify(preferred);
+  if (!base) base = 'product';
+  base = (base.endsWith('_loan') ? base : `${base}_loan`).slice(0, 64);
+
+  let candidate = base;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const [[row]] = await pool.execute(
+      `SELECT id FROM loan_product_catalog WHERE api_key = :apiKey LIMIT 1`,
+      { apiKey: candidate },
+    );
+    if (!row || (excludeId && row.id === excludeId)) return candidate;
+    const suffix = attempt === 0 ? newId().replace(/-/g, '').slice(0, 8) : String(attempt + 1);
+    candidate = `${base.slice(0, 55)}_${suffix}`;
+  }
+  return `${base.slice(0, 40)}_${newId().replace(/-/g, '').slice(0, 20)}`;
 }
 
 const emptyToNull = (value) => (value === '' || value === undefined ? null : value);
@@ -237,11 +249,7 @@ loanProductCatalogRouter.post(
       });
       const apiKey = body.bank_id
         ? bankProductApiKey(id)
-        : body.api_key
-          ? slugify(body.api_key)
-          : category
-            ? (category.slug.endsWith('_loan') ? category.slug : `${category.slug}_loan`)
-            : toApiKey(slug);
+        : await resolveUniqueCatalogApiKey(pool, body.api_key ? slugify(body.api_key) : slug);
       if (!slug || !apiKey) {
         const e = new Error('Invalid slug or API key');
         e.status = 400;
@@ -343,9 +351,15 @@ loanProductCatalogRouter.patch(
       const apiKey =
         bankId && !existing.bank_id
           ? bankProductApiKey(req.params.id)
-          : body.api_key != null
-            ? slugify(body.api_key)
-            : existing.api_key;
+          : existing.bank_id && !bankId
+            ? await resolveUniqueCatalogApiKey(
+                pool,
+                body.api_key ? slugify(body.api_key) : slug,
+                req.params.id,
+              )
+            : body.api_key != null
+              ? slugify(body.api_key)
+              : existing.api_key;
       const features =
         body.features !== undefined
           ? parseFeatures(body.features)
