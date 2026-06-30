@@ -89,6 +89,44 @@ function toApiKey(slug) {
   return s.endsWith('_loan') ? s : `${s}_loan`;
 }
 
+function bankProductApiKey(id) {
+  return `bp_${String(id).replace(/-/g, '')}`.slice(0, 64);
+}
+
+async function getBankSlugPart(pool, bankId) {
+  const [[row]] = await pool.execute(`SELECT name FROM banks WHERE id = :id LIMIT 1`, { id: bankId });
+  return slugify(row?.name || 'bank');
+}
+
+async function resolveUniqueCatalogSlug(pool, preferred, excludeId = null) {
+  let base = slugify(preferred);
+  if (!base) base = 'product';
+  base = base.slice(0, 64);
+
+  let candidate = base;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const [[row]] = await pool.execute(
+      `SELECT id FROM loan_product_catalog WHERE slug = :slug LIMIT 1`,
+      { slug: candidate },
+    );
+    if (!row || (excludeId && row.id === excludeId)) return candidate;
+    const suffix =
+      attempt === 0 ? newId().replace(/-/g, '').slice(0, 8) : String(attempt + 1);
+    candidate = `${base.slice(0, 55)}_${suffix}`;
+  }
+
+  return `${base.slice(0, 40)}_${newId().replace(/-/g, '').slice(0, 20)}`;
+}
+
+async function buildCatalogSlug(pool, { slugInput, label, bankId, category, excludeId = null }) {
+  const slugBase = slugify(slugInput || label);
+  const preferred =
+    bankId && category
+      ? slugify(`${await getBankSlugPart(pool, bankId)}_${slugBase}_${category.slug}`)
+      : slugBase;
+  return resolveUniqueCatalogSlug(pool, preferred, excludeId);
+}
+
 const emptyToNull = (value) => (value === '' || value === undefined ? null : value);
 
 const ProductSchema = z.object({
@@ -189,23 +227,27 @@ loanProductCatalogRouter.post(
       await ensureProductCategorySchema();
       const body = ProductSchema.parse(req.body);
       const category = body.category_id ? await getProductCategoryById(body.category_id) : null;
-      const slugBase = slugify(body.slug || body.label);
-      const slug = body.bank_id && category
-        ? slugify(`${slugBase}_${category.slug}`)
-        : slugBase;
-      const apiKey = body.api_key
-        ? slugify(body.api_key)
-        : category
-          ? (category.slug.endsWith('_loan') ? category.slug : `${category.slug}_loan`)
-          : toApiKey(slug);
+      const pool = getPool();
+      const id = newId();
+      const slug = await buildCatalogSlug(pool, {
+        slugInput: body.slug,
+        label: body.label,
+        bankId: body.bank_id,
+        category,
+      });
+      const apiKey = body.bank_id
+        ? bankProductApiKey(id)
+        : body.api_key
+          ? slugify(body.api_key)
+          : category
+            ? (category.slug.endsWith('_loan') ? category.slug : `${category.slug}_loan`)
+            : toApiKey(slug);
       if (!slug || !apiKey) {
         const e = new Error('Invalid slug or API key');
         e.status = 400;
         throw e;
       }
 
-      const pool = getPool();
-      const id = newId();
       const features = parseFeatures(body.features);
 
       await pool.execute(
@@ -221,7 +263,7 @@ loanProductCatalogRouter.post(
         {
           id,
           slug,
-          api_key: body.bank_id ? `${slug}_${id.replace(/-/g, '').slice(0, 12)}` : apiKey,
+          api_key: apiKey,
           label: body.label,
           short_label: body.short_label || body.label.split(' ')[0],
           icon: body.icon || 'Wallet',
@@ -287,13 +329,27 @@ loanProductCatalogRouter.patch(
       const categoryId = body.category_id !== undefined ? body.category_id : existing.category_id;
       const bankId = body.bank_id !== undefined ? body.bank_id : existing.bank_id;
       const category = categoryId ? await getProductCategoryById(categoryId) : null;
-      const slug = body.slug != null ? slugify(body.slug) : existing.slug;
-      const apiKey = body.api_key != null ? slugify(body.api_key) : existing.api_key;
+      const label = body.label ?? existing.label;
+      const slugInputChanged = body.slug != null || body.label != null || body.bank_id != null || body.category_id != null;
+      const slug = slugInputChanged
+        ? await buildCatalogSlug(pool, {
+            slugInput: body.slug ?? existing.slug,
+            label,
+            bankId,
+            category,
+            excludeId: req.params.id,
+          })
+        : existing.slug;
+      const apiKey =
+        bankId && !existing.bank_id
+          ? bankProductApiKey(req.params.id)
+          : body.api_key != null
+            ? slugify(body.api_key)
+            : existing.api_key;
       const features =
         body.features !== undefined
           ? parseFeatures(body.features)
           : parseFeatures(existing.features);
-      const label = body.label ?? existing.label;
 
       await pool.execute(
         `UPDATE loan_product_catalog SET
