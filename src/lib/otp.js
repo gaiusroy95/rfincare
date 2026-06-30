@@ -201,7 +201,13 @@ async function sendEmailOtp({ email, otp, settings }) {
       { email, provider },
       process.env.LOG_OTP === 'true' ? otp : '(hidden)',
     );
-    return { sent: true, provider: 'console' };
+    return {
+      sent: true,
+      provider: 'console',
+      delivered: false,
+      warning:
+        'Email operator is set to Console, so no email was actually sent. Set the email operator to SMTP or MSG91 in Admin → OTP settings (and configure the server credentials) to deliver OTP emails.',
+    };
   }
 
   if (provider === 'smtp') {

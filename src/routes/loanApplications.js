@@ -441,19 +441,58 @@ loanApplicationsRouter.post(
         },
       );
 
-      await sendOtpNotification({
-        email: profile.email,
-        otp,
-        channel: 'email',
-      });
+      let delivery = null;
+      let deliveryError = null;
+      try {
+        delivery = await sendOtpNotification({
+          email: profile.email,
+          otp,
+          channel: 'email',
+        });
+      } catch (sendErr) {
+        deliveryError = sendErr;
+      }
+
+      const emailResult = delivery?.email;
+      const emailDelivered =
+        !deliveryError && emailResult?.sent !== false && emailResult?.delivered !== false;
+      const logOtp = process.env.LOG_OTP === 'true';
+
+      if (!emailDelivered) {
+        const reason =
+          deliveryError?.message ||
+          emailResult?.warning ||
+          'Email could not be delivered. Configure an email operator (SMTP or MSG91) in Admin → OTP settings.';
+
+        // In dev/testing the OTP is exposed via LOG_OTP so deletion can still be tested.
+        if (logOtp) {
+          return res.json({
+            success: true,
+            email: profile.email,
+            otpId,
+            expiresInSeconds: 600,
+            emailDelivered: false,
+            message: `Email delivery is not configured, so the OTP was not emailed. ${reason}`,
+            warning: reason,
+            devOtp: otp,
+          });
+        }
+
+        return res.status(502).json({
+          error: `OTP generated but could not be emailed to ${profile.email}. ${reason}`,
+          email: profile.email,
+          emailDelivered: false,
+        });
+      }
 
       res.json({
         success: true,
         email: profile.email,
         otpId,
         expiresInSeconds: 600,
+        emailDelivered: true,
         message: `OTP sent to ${profile.email}`,
-        ...(process.env.LOG_OTP === 'true' ? { devOtp: otp } : {}),
+        ...(logOtp ? { devOtp: otp } : {}),
       });
     } catch (err) {
       next(err);
