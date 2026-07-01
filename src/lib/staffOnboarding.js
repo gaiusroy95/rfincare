@@ -1,7 +1,8 @@
 import bcrypt from 'bcryptjs';
 import { z } from 'zod';
 
-import { getPool, isDuplicateEntryError, isDuplicateColumnError, isNoSuchTableError, isIgnorableMigrationError, isTableExistsError, isBadFieldError } from '../db/pool.js';
+import { getPool, isDuplicateEntryError } from '../db/pool.js';
+import { ensureOnboardingSchema } from '../db/ensureOnboardingSchema.js';
 import { newId } from './ids.js';
 import { sendStaffWelcomeEmail } from './email.js';
 import { reserveUniqueAgentCode } from './agentCode.js';
@@ -73,7 +74,7 @@ export async function createAgentAccount(input, createdByUserId, options = {}) {
       `INSERT INTO user_profiles (
          id, email, full_name, phone, role, account_status, is_active, onboarding_status
        ) VALUES (
-         :id, :email, :fullName, :phone, 'agent', 'pending', 0, 'pending'
+         :id, :email, :fullName, :phone, 'agent', 'pending', FALSE, 'pending'
        )`,
       {
         id: userId,
@@ -161,7 +162,7 @@ export async function createEmployeeAccount(input, createdByUserId) {
       `INSERT INTO user_profiles (
          id, email, full_name, phone, role, account_status, is_active, onboarding_status
        ) VALUES (
-         :id, :email, :fullName, :phone, 'employee', 'active', 1, 'active'
+         :id, :email, :fullName, :phone, 'employee', 'active', TRUE, 'active'
        )`,
       {
         id: userId,

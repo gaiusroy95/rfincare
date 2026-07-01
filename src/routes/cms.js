@@ -500,7 +500,7 @@ cmsRouter.put('/legal/:slug', async (req, res, next) => {
     const { title, bodyHtml } = z.object({ title: z.string(), bodyHtml: z.string() }).parse(req.body);
     await getPool().execute(
       `INSERT INTO legal_pages (slug, title, body_html, updated_by)
-       VALUES (:slug, :title, :body, :by) ON CONFLICT (id) DO UPDATE SET title = EXCLUDED.title,
+       VALUES (:slug, :title, :body, :by) ON CONFLICT (slug) DO UPDATE SET title = EXCLUDED.title,
          body_html = EXCLUDED.body_html,
          updated_by = EXCLUDED.updated_by`,
       { slug: req.params.slug, title, body: bodyHtml, by: req.auth.userId },

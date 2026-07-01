@@ -14,6 +14,45 @@ function resolveSslOption() {
   return { rejectUnauthorized: false };
 }
 
+function formatQueryResult(result) {
+  const command = String(result.command || '').toUpperCase();
+  if (command === 'SELECT' || command === 'SHOW') {
+    return [result.rows, result.fields || []];
+  }
+  return [
+    {
+      affectedRows: result.rowCount ?? 0,
+      insertId: result.rows?.[0]?.id ?? null,
+    },
+    result.fields || [],
+  ];
+}
+
+function wrapClient(client) {
+  async function run(sql, params) {
+    const prepared = Array.isArray(params)
+      ? convertPositionalParams(sql, params)
+      : convertNamedParams(sql, params || {});
+    const result = await client.query(prepared.text, prepared.values);
+    return formatQueryResult(result);
+  }
+
+  return {
+    execute: run,
+    query: run,
+    beginTransaction: async () => {
+      await client.query('BEGIN');
+    },
+    commit: async () => {
+      await client.query('COMMIT');
+    },
+    rollback: async () => {
+      await client.query('ROLLBACK');
+    },
+    release: () => client.release(),
+  };
+}
+
 export function createPool() {
   if (pool) return pool;
 
@@ -37,24 +76,13 @@ export function createPool() {
       ? convertPositionalParams(sql, params)
       : convertNamedParams(sql, params || {});
     const result = await pgPool.query(prepared.text, prepared.values);
-    const command = String(result.command || '').toUpperCase();
-
-    if (command === 'SELECT' || command === 'SHOW') {
-      return [result.rows, result.fields || []];
-    }
-
-    return [
-      {
-        affectedRows: result.rowCount ?? 0,
-        insertId: result.rows?.[0]?.id ?? null,
-      },
-      result.fields || [],
-    ];
+    return formatQueryResult(result);
   }
 
   pool = {
     execute: run,
     query: run,
+    getConnection: async () => wrapClient(await pgPool.connect()),
     end: () => pgPool.end(),
     _pgPool: pgPool,
   };

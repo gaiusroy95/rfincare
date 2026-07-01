@@ -17,7 +17,7 @@ INSERT INTO cibil_vendors (vendor_key, display_name, sandbox_mode, is_active) VA
   ('experian', 'Experian', 1, 0),
   ('equifax', 'Equifax', 1, 0),
   ('crif_high_mark', 'CRIF High Mark', 1, 0)
-ON CONFLICT (id) DO UPDATE SET display_name = EXCLUDED.display_name;
+ON CONFLICT (vendor_key) DO UPDATE SET display_name = EXCLUDED.display_name;
 
 CREATE TABLE IF NOT EXISTS cibil_checks (
   id CHAR(36) NOT NULL PRIMARY KEY,

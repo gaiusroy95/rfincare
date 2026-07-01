@@ -370,8 +370,9 @@ portalEmployeeLearningRouter.post('/:id/progress', async (req, res, next) => {
     const progressId = newId();
     await pool.execute(
       `INSERT INTO employee_learning_progress (id, employee_user_id, content_id, progress_percent, completed_at)
-       VALUES (:id, :employee_id, :content_id, :progress, :completed_at) ON CONFLICT (id) DO UPDATE SET progress_percent = :progress,
-         completed_at = :completed_at,
+       VALUES (:id, :employee_id, :content_id, :progress, :completed_at)
+       ON CONFLICT (employee_user_id, content_id) DO UPDATE SET progress_percent = EXCLUDED.progress_percent,
+         completed_at = EXCLUDED.completed_at,
          updated_at = NOW()`,
       {
         id: progressId,
