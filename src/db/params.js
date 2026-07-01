@@ -163,6 +163,12 @@ export function normalizeBooleanSqlLiterals(sql) {
     ':allowed_file_types_json, TRUE, :sort_order, TRUE,',
   );
 
+  // loan_product_catalog INSERT: ..., :sort_order, 1)
+  s = s.replace(
+    /:sort_order\s*,\s*1(\s*\))/gi,
+    ':sort_order, TRUE$1',
+  );
+
   return s;
 }
 

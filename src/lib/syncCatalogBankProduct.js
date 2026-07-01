@@ -70,11 +70,12 @@ export async function syncCatalogBankProduct({
     targetId = newId();
     await pool.execute(
       `INSERT INTO bank_products (id, bank_id, name, is_active, data)
-       VALUES (:id, :bankId, :name, 1, :data)`,
+       VALUES (:id, :bankId, :name, :is_active, :data)`,
       {
         id: targetId,
         bankId,
         name: label,
+        is_active: true,
         data: JSON.stringify(productData),
       },
     );
@@ -108,7 +109,7 @@ export async function ensureCategoryLandingCatalog(pool, category) {
       category_id, bank_id, sort_order, is_active
     ) VALUES (
       :id, :slug, :api_key, :label, :short_label, 'Briefcase', :description,
-      :category_id, NULL, :sort_order, 1
+      :category_id, NULL, :sort_order, :is_active
     )`,
     {
       id: newId(),
@@ -119,6 +120,7 @@ export async function ensureCategoryLandingCatalog(pool, category) {
       description: `${category.label} products from partner banks.`,
       category_id: category.id,
       sort_order: category.sortOrder ?? category.sort_order ?? 50,
+      is_active: true,
     },
   );
 }

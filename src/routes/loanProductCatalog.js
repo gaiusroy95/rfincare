@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { authenticate } from '../middleware/authenticate.js';
 import { requireRoles } from '../middleware/requireRoles.js';
 import { getPool, isDuplicateEntryError, isDuplicateColumnError, isNoSuchTableError, isIgnorableMigrationError, isTableExistsError, isBadFieldError } from '../db/pool.js';
+import { toDbBool } from '../db/boolean.js';
 import { newId } from '../lib/ids.js';
 import {
   createProductCategory,
@@ -283,7 +284,7 @@ loanProductCatalogRouter.post(
           features: JSON.stringify(features),
           color: body.color || 'var(--color-primary)',
           sort_order: body.sort_order ?? 0,
-          is_active: body.is_active === false ? 0 : 1,
+          is_active: body.is_active !== false,
         },
       );
 
@@ -397,7 +398,7 @@ loanProductCatalogRouter.patch(
           features: JSON.stringify(features),
           color: body.color ?? null,
           sort_order: body.sort_order ?? null,
-          is_active: body.is_active === undefined ? null : body.is_active ? 1 : 0,
+          is_active: body.is_active === undefined ? null : toDbBool(body.is_active),
         },
       );
 
