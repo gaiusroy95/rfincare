@@ -101,7 +101,8 @@ translateRouter.post('/', async (req, res, next) => {
         await pool.execute(
           `INSERT INTO translation_cache
              (source_lang, target_lang, source_hash, source_text, translated_text)
-           VALUES ${valuesSql}`,
+           VALUES ${valuesSql}
+           ON CONFLICT (target_lang, source_hash, source_lang) DO NOTHING`,
           inserts.flat(),
         );
       }
@@ -119,4 +120,4 @@ translateRouter.post('/', async (req, res, next) => {
   } catch (err) {
     next(err);
   }
-}) ON CONFLICT (target_lang, source_hash, source_lang) DO NOTHING
+});
