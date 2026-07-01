@@ -1,5 +1,5 @@
 import { newId } from './ids.js';
-import { sqlCastParam, sqlParamEquals, sqlParamEqualsLower } from './sqlCollation.js';
+import { sqlCastParam, sqlCoalescePatch, sqlParamEquals, sqlParamEqualsLower } from './sqlCollation.js';
 
 export function normalizeLeadEmail(email) {
   return String(email || '').trim().toLowerCase();
@@ -69,11 +69,11 @@ export async function upsertMarketingLead(
          full_name = CASE WHEN :use_name THEN ${sqlCastParam('full_name')} ELSE full_name END,
          email = ${sqlCastParam('email')},
          phone = ${sqlCastParam('phone')},
-         loan_type = CASE WHEN :loan_type IS NULL THEN loan_type ELSE ${sqlCastParam('loan_type')} END,
-         source = CASE WHEN :source IS NULL THEN source ELSE ${sqlCastParam('source')} END,
+         loan_type = ${sqlCoalescePatch('loan_type', 'loan_type')},
+         source = ${sqlCoalescePatch('source', 'source')},
          consent_accepted = consent_accepted OR :consent,
-         session_key = CASE WHEN :session_key IS NULL THEN session_key ELSE ${sqlCastParam('session_key')} END,
-         application_id = CASE WHEN :application_id IS NULL THEN application_id ELSE :application_id END,
+         session_key = ${sqlCoalescePatch('session_key', 'session_key')},
+         application_id = ${sqlCoalescePatch('application_id', 'application_id', 'INTEGER')},
          updated_at = NOW()
        WHERE id = :id`,
       {

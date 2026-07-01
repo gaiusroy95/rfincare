@@ -120,9 +120,23 @@ function extractAddKeyIndexes(sql) {
   const tableMatch = sql.match(/ALTER\s+TABLE\s+(\w+)/i);
   if (!tableMatch) return [sql];
   const table = tableMatch[1];
-  const indexes = [...sql.matchAll(/ADD\s+KEY\s+IF\s+NOT\s+EXISTS\s+(\w+)\s*\(([^)]+)\)/gi)];
-  if (!indexes.length) return [];
-  return indexes.map(([, name, cols]) => `CREATE INDEX IF NOT EXISTS ${name} ON ${table} (${cols})`);
+
+  const indexes = [
+    ...sql.matchAll(/ADD\s+KEY\s+IF\s+NOT\s+EXISTS\s+(\w+)\s*\(([^)]+)\)/gi),
+    ...sql.matchAll(/ADD\s+KEY\s+(\w+)\s*\(([^)]+)\)/gi),
+  ];
+  if (!indexes.length) return [sql];
+
+  const addColumnOnly = sql
+    .replace(/,\s*ADD\s+KEY\s+IF\s+NOT\s+EXISTS\s+\w+\s*\([^)]+\)/gi, '')
+    .replace(/,\s*ADD\s+KEY\s+\w+\s*\([^)]+\)/gi, '')
+    .trim();
+
+  const statements = addColumnOnly.endsWith(';') ? [addColumnOnly] : [addColumnOnly];
+  for (const [, name, cols] of indexes) {
+    statements.push(`CREATE INDEX IF NOT EXISTS ${name} ON ${table} (${cols})`);
+  }
+  return statements.filter(Boolean);
 }
 
 /** UPDATE ... JOIN ... → PostgreSQL UPDATE ... FROM ... */

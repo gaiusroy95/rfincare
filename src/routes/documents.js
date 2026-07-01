@@ -179,7 +179,7 @@ async function resolveRequirementsForApplication(pool, applicationId) {
     `SELECT *
      FROM document_requirements
      WHERE is_active = TRUE
-       AND (bank_id = :bank_id OR bank_id IS NULL)
+       AND (CAST(:bank_id AS TEXT) IS NULL OR bank_id = CAST(:bank_id AS TEXT))
        AND (
          LOWER(CAST(COALESCE(product_type, '') AS TEXT))
            = LOWER(CAST(COALESCE(:product_type, '') AS TEXT))

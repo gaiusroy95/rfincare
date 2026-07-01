@@ -4,7 +4,7 @@ import { getPool } from '../db/pool.js';
 import { ensureOnboardingSchema } from '../db/ensureOnboardingSchema.js';
 import { sendStaffWelcomeEmail } from './email.js';
 import { ensureAgentCodeForUser } from './agentCode.js';
-import { sqlCastParam, sqlLiteralEquals, sqlParamEqualsLower } from './sqlCollation.js';
+import { sqlCastParam, sqlCoalescePatch, sqlLiteralEquals, sqlParamEqualsLower } from './sqlCollation.js';
 
 function pick(body, ...keys) {
   for (const key of keys) {
@@ -16,13 +16,9 @@ function pick(body, ...keys) {
 }
 
 function resolveActiveFlag(accountStatus) {
-  if (accountStatus === 'active') return 1;
-  if (accountStatus === 'inactive' || accountStatus === 'suspended') return 0;
+  if (accountStatus === 'active') return true;
+  if (accountStatus === 'inactive' || accountStatus === 'suspended') return false;
   return null;
-}
-
-function sqlSetFromParam(column, param) {
-  return `${column} = CASE WHEN :${param} IS NULL THEN ${column} ELSE ${sqlCastParam(param)} END`;
 }
 
 export async function fetchAgentDetail(userId) {
@@ -132,12 +128,12 @@ export async function updateAgentDetails(userId, body) {
 
   await pool.execute(
     `UPDATE user_profiles SET
-       ${sqlSetFromParam('full_name', 'full_name')},
-       ${email ? `${sqlSetFromParam('email', 'email')},` : ''}
-       ${sqlSetFromParam('phone', 'phone')},
-       ${sqlSetFromParam('account_status', 'account_status')},
-       ${sqlSetFromParam('onboarding_status', 'onboarding_status')},
-       is_active = CASE WHEN :is_active IS NULL THEN is_active ELSE :is_active END
+       ${sqlCoalescePatch('full_name', 'full_name')},
+       ${email ? `${sqlCoalescePatch('email', 'email')},` : ''}
+       ${sqlCoalescePatch('phone', 'phone')},
+       ${sqlCoalescePatch('account_status', 'account_status')},
+       ${sqlCoalescePatch('onboarding_status', 'onboarding_status')},
+       ${sqlCoalescePatch('is_active', 'is_active', 'BOOLEAN')}
      WHERE id = :id AND ${sqlLiteralEquals('role', 'agent')}`,
     {
       id: userId,
@@ -152,14 +148,14 @@ export async function updateAgentDetails(userId, body) {
 
   await pool.execute(
     `UPDATE agent_onboarding SET
-       ${sqlSetFromParam('agent_name', 'agent_name')},
-       ${email ? `${sqlSetFromParam('email', 'email')},` : ''}
-       ${sqlSetFromParam('mobile_number', 'mobile_number')},
-       ${sqlSetFromParam('username', 'username')},
-       ${sqlSetFromParam('account_number', 'account_number')},
-       ${sqlSetFromParam('bank_name', 'bank_name')},
-       ${sqlSetFromParam('ifsc_code', 'ifsc_code')},
-       ${sqlSetFromParam('onboarding_status', 'onboarding_status')}
+       ${sqlCoalescePatch('agent_name', 'agent_name')},
+       ${email ? `${sqlCoalescePatch('email', 'email')},` : ''}
+       ${sqlCoalescePatch('mobile_number', 'mobile_number')},
+       ${sqlCoalescePatch('username', 'username')},
+       ${sqlCoalescePatch('account_number', 'account_number')},
+       ${sqlCoalescePatch('bank_name', 'bank_name')},
+       ${sqlCoalescePatch('ifsc_code', 'ifsc_code')},
+       ${sqlCoalescePatch('onboarding_status', 'onboarding_status')}
      WHERE user_id = :id`,
     {
       id: userId,
@@ -212,12 +208,12 @@ export async function updateEmployeeDetails(userId, body) {
 
   await pool.execute(
     `UPDATE user_profiles SET
-       ${sqlSetFromParam('full_name', 'full_name')},
-       ${email ? `${sqlSetFromParam('email', 'email')},` : ''}
-       ${sqlSetFromParam('phone', 'phone')},
-       ${sqlSetFromParam('account_status', 'account_status')},
-       ${sqlSetFromParam('onboarding_status', 'onboarding_status')},
-       is_active = CASE WHEN :is_active IS NULL THEN is_active ELSE :is_active END
+       ${sqlCoalescePatch('full_name', 'full_name')},
+       ${email ? `${sqlCoalescePatch('email', 'email')},` : ''}
+       ${sqlCoalescePatch('phone', 'phone')},
+       ${sqlCoalescePatch('account_status', 'account_status')},
+       ${sqlCoalescePatch('onboarding_status', 'onboarding_status')},
+       ${sqlCoalescePatch('is_active', 'is_active', 'BOOLEAN')}
      WHERE id = :id AND ${sqlLiteralEquals('role', 'employee')}`,
     {
       id: userId,
@@ -232,15 +228,15 @@ export async function updateEmployeeDetails(userId, body) {
 
   await pool.execute(
     `UPDATE employee_onboarding SET
-       ${sqlSetFromParam('employee_name', 'employee_name')},
-       ${email ? `${sqlSetFromParam('email', 'email')},` : ''}
-       ${sqlSetFromParam('mobile_number', 'mobile_number')},
-       ${sqlSetFromParam('username', 'username')},
-       ${sqlSetFromParam('employee_code', 'employee_code')},
-       ${sqlSetFromParam('account_number', 'account_number')},
-       ${sqlSetFromParam('bank_name', 'bank_name')},
-       ${sqlSetFromParam('ifsc_code', 'ifsc_code')},
-       ${sqlSetFromParam('onboarding_status', 'onboarding_status')}
+       ${sqlCoalescePatch('employee_name', 'employee_name')},
+       ${email ? `${sqlCoalescePatch('email', 'email')},` : ''}
+       ${sqlCoalescePatch('mobile_number', 'mobile_number')},
+       ${sqlCoalescePatch('username', 'username')},
+       ${sqlCoalescePatch('employee_code', 'employee_code')},
+       ${sqlCoalescePatch('account_number', 'account_number')},
+       ${sqlCoalescePatch('bank_name', 'bank_name')},
+       ${sqlCoalescePatch('ifsc_code', 'ifsc_code')},
+       ${sqlCoalescePatch('onboarding_status', 'onboarding_status')}
      WHERE user_id = :id`,
     {
       id: userId,
@@ -272,7 +268,7 @@ export async function resetStaffPassword({ userId, password, role, fullName, ema
     id: userId,
   });
   await pool.execute(
-    `UPDATE user_profiles SET password_change_required = 0 WHERE id = :id`,
+    `UPDATE user_profiles SET password_change_required = FALSE WHERE id = :id`,
     { id: userId },
   );
 

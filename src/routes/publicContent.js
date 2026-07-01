@@ -71,9 +71,9 @@ publicContentRouter.get('/homepage/news', async (req, res, next) => {
   try {
     const pool = getPool();
     const [rows] = await pool.query(
-      `SELECT id, title, excerpt, blog_url AS blogUrl, image_url AS imageUrl, image_alt AS imageAlt,
-              category, published_at AS publishedAt
-       FROM homepage_news WHERE is_published = 1 ORDER BY sort_order DESC, published_at DESC LIMIT 12`,
+      `SELECT id, title, excerpt, blog_url AS "blogUrl", image_url AS "imageUrl", image_alt AS "imageAlt",
+              category, published_at AS "publishedAt"
+       FROM homepage_news WHERE is_published = TRUE ORDER BY sort_order DESC, published_at DESC LIMIT 12`,
     );
     res.json(rows);
   } catch (err) {
@@ -85,9 +85,9 @@ publicContentRouter.get('/homepage/videos', async (req, res, next) => {
   try {
     const pool = getPool();
     const [rows] = await pool.query(
-      `SELECT id, title, description, youtube_url AS youtubeUrl, thumbnail_url AS thumbnailUrl,
-              thumbnail_alt AS thumbnailAlt, duration_label AS durationLabel
-       FROM homepage_videos WHERE is_published = 1 ORDER BY sort_order DESC LIMIT 12`,
+      `SELECT id, title, description, youtube_url AS "youtubeUrl", thumbnail_url AS "thumbnailUrl",
+              thumbnail_alt AS "thumbnailAlt", duration_label AS "durationLabel"
+       FROM homepage_videos WHERE is_published = TRUE ORDER BY sort_order DESC LIMIT 12`,
     );
     res.json(rows);
   } catch (err) {

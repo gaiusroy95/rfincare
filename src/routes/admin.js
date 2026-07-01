@@ -1,7 +1,5 @@
 import { Router } from 'express';
 import multer from 'multer';
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { basename, resolve } from 'node:path';
 
 import { getPool } from '../db/pool.js';
 import { ensureOnboardingSchema } from '../db/ensureOnboardingSchema.js';
@@ -37,33 +35,58 @@ import {
   normalizeCommissionCsvRow,
   upsertAgentCommissionConfig,
 } from '../lib/agentCommission.js';
+import { createUploadMiddleware, spreadUpload } from '../lib/multerUpload.js';
+import { saveUploadedFile } from '../lib/storage/index.js';
+import { toStoredPath } from '../lib/storage/keys.js';
+import { basename } from 'node:path';
 
 export const adminRouter = Router();
 
 adminRouter.use('/hierarchy', adminHierarchyRouter);
 
-const uploadRoot = process.env.UPLOAD_DIR || './uploads';
-const circularDir = resolve(uploadRoot, 'commission-circulars');
-mkdirSync(circularDir, { recursive: true });
-const circularUpload = multer({
-  storage: multer.diskStorage({
-    destination: (_req, _file, cb) => cb(null, circularDir),
-    filename: (_req, file, cb) => {
-      const safe = `${Date.now()}-${Math.random().toString(36).slice(2)}-${file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
-      cb(null, safe);
-    },
-  }),
-  fileFilter: (_req, file, cb) => {
-    const ok = file.mimetype === 'application/pdf' || file.originalname.toLowerCase().endsWith('.pdf');
-    cb(ok ? null : new Error('Only PDF files are allowed'), ok);
-  },
-  limits: { fileSize: 20 * 1024 * 1024 },
+const pdfFileFilter = (_req, file, cb) => {
+  const ok = file.mimetype === 'application/pdf' || file.originalname.toLowerCase().endsWith('.pdf');
+  cb(ok ? null : new Error('Only PDF files are allowed'), ok);
+};
+
+const circularUpload = createUploadMiddleware({
+  subfolder: 'commission-circulars',
+  maxBytes: 20 * 1024 * 1024,
+  fileFilter: pdfFileFilter,
 });
 
 const commissionBulkUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 25 * 1024 * 1024 },
 });
+
+function circularStoredUrl(file) {
+  if (!file) return null;
+  return file.storedPath || toStoredPath(file.filename) || `/uploads/commission-circulars/${basename(file.filename || '')}`;
+}
+
+async function storeCircularUploads(files = []) {
+  const map = {};
+  for (const f of files) {
+    const saved = await saveUploadedFile({
+      buffer: f.buffer,
+      originalName: f.originalname,
+      folder: 'commission-circulars',
+      mimeType: f.mimetype || 'application/pdf',
+    });
+    const entry = {
+      storedUrl: saved.storedPath,
+      filename: saved.key,
+      filePath: saved.storedPath,
+      originalName: f.originalname,
+    };
+    map[f.originalname] = entry;
+    map[f.originalname.toLowerCase()] = entry;
+    map[basename(f.originalname)] = entry;
+    map[basename(f.originalname).toLowerCase()] = entry;
+  }
+  return map;
+}
 
 function wrapMulter(uploadMiddleware) {
   return (req, res, next) => {
@@ -73,23 +96,6 @@ function wrapMulter(uploadMiddleware) {
       next(err);
     });
   };
-}
-
-function storeCircularUploads(files = []) {
-  const map = {};
-  for (const f of files) {
-    const safe = f.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
-    const filename = `${Date.now()}-${Math.random().toString(36).slice(2)}-${safe}`;
-    const fullPath = resolve(circularDir, filename);
-    writeFileSync(fullPath, f.buffer);
-    const storedUrl = `/uploads/commission-circulars/${filename}`;
-    const entry = { storedUrl, filename, filePath: fullPath, originalName: f.originalname };
-    map[f.originalname] = entry;
-    map[f.originalname.toLowerCase()] = entry;
-    map[basename(f.originalname)] = entry;
-    map[basename(f.originalname).toLowerCase()] = entry;
-  }
-  return map;
 }
 
 adminRouter.use('/status-check', statusCheckAdminRouter);
@@ -648,7 +654,7 @@ adminRouter.post(
 
       const text = csvFile.buffer.toString('utf8');
       const rawRows = parseCsvToRows(text);
-      const circularFilesByName = storeCircularUploads(req.files?.circulars || []);
+      const circularFilesByName = await storeCircularUploads(req.files?.circulars || []);
       const pool = getPool();
       const summary = await importAgentCommissionRows(pool, rawRows, {
         updatedBy: req.auth.userId,
@@ -770,7 +776,7 @@ adminRouter.post(
   '/commission/circulars',
   authenticate,
   authorize({ resource: 'agents', action: 'update' }),
-  circularUpload.single('file'),
+  ...spreadUpload(circularUpload, 'single', 'file'),
   async (req, res, next) => {
     try {
       await ensureStaffExtrasSchema();
@@ -779,7 +785,7 @@ adminRouter.post(
       const id = newId();
       const title = req.body?.title?.trim() || req.file.originalname;
       const description = req.body?.description?.trim() || null;
-      const fileUrl = `/uploads/commission-circulars/${req.file.filename}`;
+      const fileUrl = circularStoredUrl(req.file);
       await pool.execute(
         `INSERT INTO agent_commission_circulars
          (id, title, description, file_name, file_path, file_url, uploaded_by)
@@ -789,7 +795,7 @@ adminRouter.post(
           title,
           description,
           file_name: req.file.originalname,
-          file_path: req.file.path,
+          file_path: fileUrl,
           file_url: fileUrl,
           uploaded_by: req.auth.userId,
         },

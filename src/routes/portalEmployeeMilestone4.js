@@ -8,7 +8,7 @@ import { ensureMilestone4Schema } from '../db/ensureMilestone4Schema.js';
 import { dispatchFileUpdateNotification } from '../lib/fileNotificationService.js';
 import { ensureAgentCodeForUser } from '../lib/agentCode.js';
 import { sendStaffWelcomeEmail } from '../lib/email.js';
-import { sqlCastParam } from '../lib/sqlCollation.js';
+import { sqlCastParam, sqlCoalescePatch } from '../lib/sqlCollation.js';
 import {
   assertEmployeeAccess,
   getEffectiveEmployeeAccess,
@@ -147,7 +147,7 @@ portalEmployeeMilestone4Router.post('/agent-onboarding/:userId/qc', async (req, 
         `UPDATE agent_onboarding
          SET qc_status = ${sqlCastParam('qc_status')},
              qc_employee_id = :emp,
-             qc_notes = CASE WHEN :notes IS NULL THEN qc_notes ELSE ${sqlCastParam('notes')} END,
+             qc_notes = ${sqlCoalescePatch('qc_notes', 'notes')},
              qc_at = NOW(),
              qc_approved_by = :emp,
              onboarding_status = ${sqlCastParam('onboarding_status')}

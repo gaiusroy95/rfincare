@@ -7,6 +7,7 @@ import { newId } from './ids.js';
 import { sendStaffWelcomeEmail } from './email.js';
 import { reserveUniqueAgentCode } from './agentCode.js';
 import { ensureAgentOnboardingQcSchema } from '../db/ensureMilestone4Schema.js';
+import { releaseRejectedAgentCredentials } from './releaseRejectedStaffCredentials.js';
 
 const baseStaffFields = {
   username: z.string().min(3).max(128),
@@ -58,8 +59,14 @@ export async function createAgentAccount(input, createdByUserId, options = {}) {
   const userId = newId();
   const onboardingId = newId();
   const passwordHash = await bcrypt.hash(data.password, 12);
+  const normalizedEmail = String(data.email).trim().toLowerCase();
   const agentCode =
     data.agentCode?.trim() || (await reserveUniqueAgentCode(pool));
+
+  await releaseRejectedAgentCredentials(pool, {
+    email: normalizedEmail,
+    username: data.username,
+  });
 
   const conn = await pool.getConnection();
   try {
@@ -67,7 +74,7 @@ export async function createAgentAccount(input, createdByUserId, options = {}) {
 
     await conn.execute(
       `INSERT INTO auth_users (id, email, password_hash) VALUES (:id, :email, :ph)`,
-      { id: userId, email: data.email, ph: passwordHash },
+      { id: userId, email: normalizedEmail, ph: passwordHash },
     );
 
     await conn.execute(
@@ -78,7 +85,7 @@ export async function createAgentAccount(input, createdByUserId, options = {}) {
        )`,
       {
         id: userId,
-        email: data.email,
+        email: normalizedEmail,
         fullName: data.agentName,
         phone: data.mobileNumber,
       },
@@ -98,7 +105,7 @@ export async function createAgentAccount(input, createdByUserId, options = {}) {
         username: data.username,
         agent_name: data.agentName,
         agent_code: agentCode,
-        email: data.email,
+        email: normalizedEmail,
         mobile_number: data.mobileNumber,
         account_number: data.accountNumber,
         bank_name: data.bankName,
@@ -119,7 +126,7 @@ export async function createAgentAccount(input, createdByUserId, options = {}) {
 
     if (!options.skipWelcomeEmail) {
       await sendStaffWelcomeEmail({
-        email: data.email,
+        email: normalizedEmail,
         fullName: data.agentName,
         role: 'agent',
         password: data.password,

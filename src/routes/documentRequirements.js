@@ -117,6 +117,31 @@ const RequirementSchema = z.object({
   isActive: z.boolean().optional(),
 });
 
+function buildListFilters(query = {}) {
+  const conditions = [];
+  const params = {};
+
+  if (query.bankId) {
+    conditions.push('bank_id = CAST(:bank_id AS TEXT)');
+    params.bank_id = query.bankId;
+  }
+  if (query.productType) {
+    conditions.push(
+      `LOWER(CAST(COALESCE(product_type, '') AS TEXT)) = LOWER(CAST(:product_type AS TEXT))`,
+    );
+    params.product_type = query.productType;
+  }
+  if (query.loanType) {
+    conditions.push(
+      `LOWER(CAST(COALESCE(loan_type, '') AS TEXT)) = LOWER(CAST(:loan_type AS TEXT))`,
+    );
+    params.loan_type = query.loanType;
+  }
+
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  return { where, params };
+}
+
 async function resolveRequirements({ bankId, productType, loanType }) {
   await ensureDocumentRequirementsSchema();
   const pool = getPool();
@@ -124,7 +149,7 @@ async function resolveRequirements({ bankId, productType, loanType }) {
     `SELECT *
      FROM document_requirements
      WHERE is_active = TRUE
-       AND (bank_id = :bank_id OR bank_id IS NULL)
+       AND (CAST(:bank_id AS TEXT) IS NULL OR bank_id = CAST(:bank_id AS TEXT))
        AND (
          LOWER(CAST(COALESCE(product_type, '') AS TEXT))
            = LOWER(CAST(COALESCE(:product_type, '') AS TEXT))
@@ -167,26 +192,13 @@ documentRequirementsRouter.get(
     try {
       await ensureDocumentRequirementsSchema();
       const pool = getPool();
+      const { where, params } = buildListFilters(req.query);
       const [rows] = await pool.execute(
         `SELECT *
          FROM document_requirements
-         WHERE (:bank_id IS NULL OR bank_id = :bank_id)
-           AND (
-             :product_type IS NULL
-             OR LOWER(CAST(COALESCE(product_type, '') AS TEXT))
-                = LOWER(CAST(:product_type AS TEXT))
-           )
-           AND (
-             :loan_type IS NULL
-             OR LOWER(CAST(COALESCE(loan_type, '') AS TEXT))
-                = LOWER(CAST(:loan_type AS TEXT))
-           )
+         ${where}
          ORDER BY sort_order ASC, created_at DESC`,
-        {
-          bank_id: req.query.bankId || null,
-          product_type: req.query.productType || null,
-          loan_type: req.query.loanType || null,
-        },
+        params,
       );
       res.json(rows.map(formatRequirement));
     } catch (err) {
@@ -265,9 +277,9 @@ documentRequirementsRouter.post(
           title: input.title,
           subtitle: input.subtitle || null,
           allowed_file_types_json: JSON.stringify(normalizeAllowedTypes(input.allowedFileTypes || [])),
-          is_required: input.isRequired === false ? 0 : 1,
+          is_required: input.isRequired !== false,
           sort_order: Number(input.sortOrder || 0),
-          is_active: input.isActive === false ? 0 : 1,
+          is_active: input.isActive !== false,
           created_by: req.auth.userId,
         },
       );
@@ -383,9 +395,9 @@ documentRequirementsRouter.patch(
           title: merged.title,
           subtitle: merged.subtitle || null,
           allowed_file_types_json: JSON.stringify(normalizeAllowedTypes(merged.allowedFileTypes || [])),
-          is_required: merged.isRequired === false ? 0 : 1,
+          is_required: merged.isRequired !== false,
           sort_order: Number(merged.sortOrder || 0),
-          is_active: merged.isActive === false ? 0 : 1,
+          is_active: merged.isActive !== false,
         },
       );
       const [[row]] = await pool.execute(`SELECT * FROM document_requirements WHERE id = :id`, {
@@ -481,7 +493,7 @@ documentRequirementsRouter.post(
                  allowed_file_types_json, is_required, sort_order, is_active, created_by
                ) VALUES (
                  :id, :bank_id, :product_type, :loan_type, :document_type, :title, :subtitle,
-                 :allowed_file_types_json, 1, :sort_order, 1, :created_by
+                 :allowed_file_types_json, TRUE, :sort_order, TRUE, :created_by
                )`,
               {
                 id: newId(),

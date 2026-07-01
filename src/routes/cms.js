@@ -25,6 +25,7 @@ import {
   updateMarketingSettings,
   getMarketingEventStats,
 } from '../lib/marketingSettings.js';
+import { normalizeYoutubeWatchUrl } from '../lib/youtube.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { requireRoles } from '../middleware/requireRoles.js';
 
@@ -48,7 +49,13 @@ const NewsSchema = z.object({
 const VideoSchema = z.object({
   title: z.string().min(1),
   description: z.string().optional(),
-  youtubeUrl: z.string().url(),
+  youtubeUrl: z
+    .string()
+    .min(1)
+    .transform((value) => normalizeYoutubeWatchUrl(value) || value)
+    .refine((value) => Boolean(normalizeYoutubeWatchUrl(value)), {
+      message: 'Enter a valid YouTube link (youtube.com or youtu.be)',
+    }),
   thumbnailUrl: z.string().optional(),
   thumbnailAlt: z.string().optional(),
   durationLabel: z.string().optional(),
@@ -362,7 +369,7 @@ cmsRouter.post('/news', async (req, res, next) => {
         imageAlt: input.imageAlt ?? null,
         category: input.category ?? null,
         pubAt: input.publishedAt ? new Date(input.publishedAt) : new Date(),
-        pub: input.isPublished ? 1 : 0,
+        pub: input.isPublished ? true : false,
         sort: input.sortOrder ?? 0,
         by: req.auth.userId,
       },
@@ -395,7 +402,7 @@ cmsRouter.put('/news/:id', async (req, res, next) => {
         imageUrl: input.imageUrl ?? null,
         imageAlt: input.imageAlt ?? null,
         category: input.category ?? null,
-        pub: input.isPublished === undefined ? null : input.isPublished ? 1 : 0,
+        pub: input.isPublished === undefined ? null : input.isPublished ? true : false,
         sort: input.sortOrder ?? null,
       },
     );
@@ -416,7 +423,12 @@ cmsRouter.delete('/news/:id', async (req, res, next) => {
 
 cmsRouter.get('/videos', async (req, res, next) => {
   try {
-    const [rows] = await getPool().query(`SELECT * FROM homepage_videos ORDER BY sort_order DESC`);
+    const [rows] = await getPool().query(
+      `SELECT id, title, description, youtube_url AS "youtubeUrl", thumbnail_url AS "thumbnailUrl",
+              thumbnail_alt AS "thumbnailAlt", duration_label AS "durationLabel",
+              is_published AS "isPublished", sort_order AS "sortOrder"
+       FROM homepage_videos ORDER BY sort_order DESC`,
+    );
     res.json(rows);
   } catch (err) {
     next(err);
@@ -438,7 +450,7 @@ cmsRouter.post('/videos', async (req, res, next) => {
         thumb: input.thumbnailUrl ?? null,
         thumbAlt: input.thumbnailAlt ?? null,
         dur: input.durationLabel ?? null,
-        pub: input.isPublished ? 1 : 0,
+        pub: input.isPublished ? true : false,
         sort: input.sortOrder ?? 0,
         by: req.auth.userId,
       },
@@ -467,7 +479,7 @@ cmsRouter.put('/videos/:id', async (req, res, next) => {
         desc: input.description ?? null,
         url: input.youtubeUrl ?? null,
         thumb: input.thumbnailUrl ?? null,
-        pub: input.isPublished === undefined ? null : input.isPublished ? 1 : 0,
+        pub: input.isPublished === undefined ? null : input.isPublished ? true : false,
         sort: input.sortOrder ?? null,
       },
     );
