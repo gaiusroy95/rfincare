@@ -1,6 +1,6 @@
 import pg from 'pg';
 
-import { convertNamedParams, convertPositionalParams } from './params.js';
+import { prepareQuery } from './params.js';
 
 const { Pool } = pg;
 
@@ -30,9 +30,7 @@ function formatQueryResult(result) {
 
 function wrapClient(client) {
   async function run(sql, params) {
-    const prepared = Array.isArray(params)
-      ? convertPositionalParams(sql, params)
-      : convertNamedParams(sql, params || {});
+    const prepared = prepareQuery(sql, params);
     const result = await client.query(prepared.text, prepared.values);
     return formatQueryResult(result);
   }
@@ -72,9 +70,7 @@ export function createPool() {
   });
 
   async function run(sql, params) {
-    const prepared = Array.isArray(params)
-      ? convertPositionalParams(sql, params)
-      : convertNamedParams(sql, params || {});
+    const prepared = prepareQuery(sql, params);
     const result = await pgPool.query(prepared.text, prepared.values);
     return formatQueryResult(result);
   }
