@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 
-import { getPool, isPostgres } from '../db/pool.js';
+import { getPool } from '../db/pool.js';
 import { ensureMilestone3Schema } from '../db/ensureMilestone3Schema.js';
 import { newId } from '../lib/ids.js';
 import { authenticate } from '../middleware/authenticate.js';
@@ -126,7 +126,7 @@ reportsRouter.get(
 
       const [[agents]] = await pool.execute(
         `SELECT COUNT(*) AS active_agents FROM user_profiles
-         WHERE role = 'agent' AND is_active = 1 AND account_status = 'active'`,
+         WHERE role = 'agent' AND is_active = TRUE AND account_status = 'active'`,
       );
 
       const [[newAgents]] = await pool.execute(
@@ -190,7 +190,7 @@ reportsRouter.get(
             value: String(
               (
                 await pool.execute(
-                  `SELECT COUNT(*) AS c FROM user_profiles WHERE role = 'customer' AND is_active = 1`,
+                  `SELECT COUNT(*) AS c FROM user_profiles WHERE role = 'customer' AND is_active = TRUE`,
                 )
               )[0][0]?.c || 0,
             ),
@@ -230,8 +230,7 @@ reportsRouter.get(
   async (req, res, next) => {
     try {
       const pool = getPool();
-      const volumeSql = isPostgres()
-        ? `SELECT TO_CHAR(created_at, 'Mon') AS month,
+      const volumeSql = `SELECT TO_CHAR(created_at, 'Mon') AS month,
                   EXTRACT(MONTH FROM created_at)::int AS m,
                   EXTRACT(YEAR FROM created_at)::int AS y,
                   COUNT(*) AS submitted,
@@ -241,17 +240,6 @@ reportsRouter.get(
            FROM loan_applications
            WHERE created_at >= NOW() - INTERVAL '12 months'
            GROUP BY EXTRACT(YEAR FROM created_at), EXTRACT(MONTH FROM created_at), TO_CHAR(created_at, 'Mon')
-           ORDER BY y, m`
-        : `SELECT DATE_FORMAT(created_at, '%b') AS month,
-                  MONTH(created_at) AS m,
-                  YEAR(created_at) AS y,
-                  COUNT(*) AS submitted,
-                  SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) AS approved,
-                  SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected,
-                  SUM(CASE WHEN status IN ('draft','submitted','pending','under_review') THEN 1 ELSE 0 END) AS pending
-           FROM loan_applications
-           WHERE created_at >= DATE_SUB(NOW(), INTERVAL 12 MONTH)
-           GROUP BY YEAR(created_at), MONTH(created_at)
            ORDER BY y, m`;
       const [rows] = await pool.execute(volumeSql);
       res.json(rows);
@@ -274,7 +262,7 @@ reportsRouter.get(
                 SUM(CASE WHEN la.status = 'approved' THEN 1 ELSE 0 END) AS conversions
          FROM user_profiles up
          LEFT JOIN loan_applications la ON la.agent_id = up.id
-         WHERE up.role = 'agent' AND up.is_active = 1
+         WHERE up.role = 'agent' AND up.is_active = TRUE
          GROUP BY up.id, up.full_name
          ORDER BY conversions DESC
          LIMIT 12`,
@@ -305,7 +293,7 @@ reportsRouter.get(
     try {
       const pool = getPool();
       const [rows] = await pool.execute(
-        `SELECT COALESCE(JSON_UNQUOTE(JSON_EXTRACT(data, '$.loan_type')), 'personal') AS loan_type,
+        `SELECT COALESCE(data->>'loan_type', 'personal') AS loan_type,
                 COUNT(*) AS count
          FROM loan_applications
          GROUP BY loan_type`,
@@ -334,13 +322,13 @@ reportsRouter.get(
       const pool = getPool();
       const [schedules] = await pool.execute(
         `SELECT report_key, MAX(last_run_at) AS last_run_at
-         FROM report_schedules WHERE is_active = 1 GROUP BY report_key`,
+         FROM report_schedules WHERE is_active = TRUE GROUP BY report_key`,
       );
       const scheduleMap = Object.fromEntries(
         schedules.map((s) => [s.report_key, s.last_run_at]),
       );
       const [activeSchedules] = await pool.execute(
-        `SELECT report_key FROM report_schedules WHERE is_active = 1`,
+        `SELECT report_key FROM report_schedules WHERE is_active = TRUE`,
       );
       const scheduledKeys = new Set(activeSchedules.map((s) => s.report_key));
 
@@ -414,7 +402,7 @@ reportsRouter.get(
       await ensureMilestone3Schema();
       const pool = getPool();
       const [rows] = await pool.execute(
-        `SELECT * FROM report_schedules WHERE is_active = 1 ORDER BY created_at DESC`,
+        `SELECT * FROM report_schedules WHERE is_active = TRUE ORDER BY created_at DESC`,
       );
       res.json(rows);
     } catch (err) {

@@ -1,4 +1,4 @@
-/** Interpret MySQL TINYINT(1) or PostgreSQL BOOLEAN column values in application code. */
+/** Interpret BOOLEAN column values from the database driver. */
 export function dbBool(value, defaultValue = false) {
   if (value === null || value === undefined) return defaultValue;
   if (typeof value === 'boolean') return value;

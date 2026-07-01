@@ -123,17 +123,17 @@ async function resolveRequirements({ bankId, productType, loanType }) {
   const [rows] = await pool.execute(
     `SELECT *
      FROM document_requirements
-     WHERE is_active = 1
+     WHERE is_active = TRUE
        AND (bank_id = :bank_id OR bank_id IS NULL)
        AND (
-         LOWER(CONVERT(COALESCE(product_type, '') USING utf8mb4)) COLLATE utf8mb4_unicode_ci
-           = LOWER(CONVERT(COALESCE(:product_type, '') USING utf8mb4)) COLLATE utf8mb4_unicode_ci
+         LOWER(CAST(COALESCE(product_type, '') AS TEXT))
+           = LOWER(CAST(COALESCE(:product_type, '') AS TEXT))
          OR product_type IS NULL
          OR product_type = ''
        )
        AND (
-         LOWER(CONVERT(COALESCE(loan_type, '') USING utf8mb4)) COLLATE utf8mb4_unicode_ci
-           = LOWER(CONVERT(COALESCE(:loan_type, '') USING utf8mb4)) COLLATE utf8mb4_unicode_ci
+         LOWER(CAST(COALESCE(loan_type, '') AS TEXT))
+           = LOWER(CAST(COALESCE(:loan_type, '') AS TEXT))
          OR loan_type IS NULL
          OR loan_type = ''
        )
@@ -173,13 +173,13 @@ documentRequirementsRouter.get(
          WHERE (:bank_id IS NULL OR bank_id = :bank_id)
            AND (
              :product_type IS NULL
-             OR LOWER(CONVERT(COALESCE(product_type, '') USING utf8mb4)) COLLATE utf8mb4_unicode_ci
-                = LOWER(CONVERT(:product_type USING utf8mb4)) COLLATE utf8mb4_unicode_ci
+             OR LOWER(CAST(COALESCE(product_type, '') AS TEXT))
+                = LOWER(CAST(:product_type AS TEXT))
            )
            AND (
              :loan_type IS NULL
-             OR LOWER(CONVERT(COALESCE(loan_type, '') USING utf8mb4)) COLLATE utf8mb4_unicode_ci
-                = LOWER(CONVERT(:loan_type USING utf8mb4)) COLLATE utf8mb4_unicode_ci
+             OR LOWER(CAST(COALESCE(loan_type, '') AS TEXT))
+                = LOWER(CAST(:loan_type AS TEXT))
            )
          ORDER BY sort_order ASC, created_at DESC`,
         {

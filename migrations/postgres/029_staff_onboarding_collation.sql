@@ -1,4 +1,4 @@
--- Fix "Illegal mix of collations" on agent/employee onboarding (hosted MySQL defaults).
+-- Legacy collation patch (no-op on PostgreSQL).
 
 ALTER TABLE auth_users
   MODIFY email VARCHAR(320) NOT NULL;

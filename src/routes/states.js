@@ -10,7 +10,7 @@ statesRouter.get('/', async (_req, res, next) => {
     const [rows] = await pool.execute(
       `SELECT id, state_name, is_active
        FROM indian_states
-       WHERE is_active = 1
+       WHERE is_active = TRUE
        ORDER BY state_name ASC`,
     );
     res.json(rows);

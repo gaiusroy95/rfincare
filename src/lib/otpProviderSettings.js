@@ -1,12 +1,5 @@
-import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-
 import { dbBool } from '../db/boolean.js';
-import { skipRuntimeSchemaOnPostgres } from '../db/ensureHelpers.js';
 import { getPool } from '../db/pool.js';
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
 const SETTINGS_ID = 'default';
 let ensured = false;
 
@@ -48,49 +41,6 @@ function parseConfig(value) {
 }
 
 export async function ensureOtpProviderSchema() {
-  if (ensured) return;
-  if (skipRuntimeSchemaOnPostgres()) {
-    ensured = true;
-    return;
-  }
-  const sql = readFileSync(
-    join(__dirname, '../../migrations/015_otp_provider_settings.sql'),
-    'utf8',
-  );
-  const pool = getPool();
-  const statements = sql
-    .split(';')
-    .map((s) => s.trim())
-    .filter((s) => s && !s.startsWith('--'));
-
-  for (const statement of statements) {
-    try {
-      await pool.execute(statement);
-    } catch (err) {
-      if (err.code !== 'ER_TABLE_EXISTS_ERROR' && err.code !== 'ER_DUP_ENTRY') {
-        throw err;
-      }
-    }
-  }
-
-  // Backward-compatible column upgrades for older databases.
-  try {
-    await pool.execute(
-      `ALTER TABLE otp_provider_settings
-       ADD COLUMN whatsapp_provider VARCHAR(32) NOT NULL DEFAULT 'console' AFTER sms_provider`,
-    );
-  } catch (err) {
-    if (err.code !== 'ER_DUP_FIELDNAME') throw err;
-  }
-  try {
-    await pool.execute(
-      `ALTER TABLE otp_provider_settings
-       ADD COLUMN require_whatsapp_otp TINYINT(1) NOT NULL DEFAULT 0 AFTER require_email_otp`,
-    );
-  } catch (err) {
-    if (err.code !== 'ER_DUP_FIELDNAME') throw err;
-  }
-
   ensured = true;
 }
 
@@ -141,16 +91,14 @@ export async function updateOtpProviderSettings(input, updatedBy) {
        provider_config_json, updated_by
      ) VALUES (
        :id, :sms, :whatsapp, :email, :req_mobile, :req_email, :req_whatsapp, :config, :updated_by
-     )
-     ON DUPLICATE KEY UPDATE
-       sms_provider = VALUES(sms_provider),
-       whatsapp_provider = VALUES(whatsapp_provider),
-       email_provider = VALUES(email_provider),
-       require_mobile_otp = VALUES(require_mobile_otp),
-       require_email_otp = VALUES(require_email_otp),
-       require_whatsapp_otp = VALUES(require_whatsapp_otp),
-       provider_config_json = VALUES(provider_config_json),
-       updated_by = VALUES(updated_by)`,
+     ) ON CONFLICT (id) DO UPDATE SET sms_provider = EXCLUDED.sms_provider,
+       whatsapp_provider = EXCLUDED.whatsapp_provider,
+       email_provider = EXCLUDED.email_provider,
+       require_mobile_otp = EXCLUDED.require_mobile_otp,
+       require_email_otp = EXCLUDED.require_email_otp,
+       require_whatsapp_otp = EXCLUDED.require_whatsapp_otp,
+       provider_config_json = EXCLUDED.provider_config_json,
+       updated_by = EXCLUDED.updated_by`,
     {
       id: SETTINGS_ID,
       sms: smsProvider,

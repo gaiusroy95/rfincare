@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import bcrypt from 'bcryptjs';
 
-import { getPool } from '../db/pool.js';
+import { getPool, isDuplicateEntryError, isDuplicateColumnError, isNoSuchTableError, isIgnorableMigrationError, isTableExistsError, isBadFieldError } from '../db/pool.js';
 import { ensurePartnerRegistrationSchema } from '../db/ensurePartnerRegistrationSchema.js';
 import { ensureOnboardingSchema } from '../db/ensureOnboardingSchema.js';
 import { newId } from './ids.js';
@@ -127,7 +127,7 @@ async function upgradeCustomerToAgentAccount(pool, { userId, reg, username, pass
            full_name = COALESCE(NULLIF(:fullName, ''), full_name),
            phone = COALESCE(NULLIF(:phone, ''), phone),
            account_status = 'active',
-           is_active = 1,
+           is_active = TRUE,
            onboarding_status = 'active'
        WHERE id = :id`,
       { id: userId, fullName: reg.full_name || '', phone: reg.phone || '' },
@@ -157,7 +157,7 @@ async function upgradeCustomerToAgentAccount(pool, { userId, reg, username, pass
          SET username = :username, agent_name = :agent_name, agent_code = :agent_code,
              email = :email, mobile_number = :mobile, account_number = :acc,
              bank_name = :bank, ifsc_code = :ifsc, onboarding_status = 'active',
-             qc_status = 'qc_approved', qc_at = NOW(3), qc_approved_by = :by
+             qc_status = 'qc_approved', qc_at = NOW(), qc_approved_by = :by
          WHERE user_id = :user_id`,
         onbParams,
       );
@@ -169,7 +169,7 @@ async function upgradeCustomerToAgentAccount(pool, { userId, reg, username, pass
            qc_at, qc_approved_by, created_by
          ) VALUES (
            :id, :user_id, :username, :agent_name, :agent_code, :email, :mobile,
-           :acc, :bank, :ifsc, 'active', 'qc_approved', NOW(3), :by, :by
+           :acc, :bank, :ifsc, 'active', 'qc_approved', NOW(), :by, :by
          )`,
         { ...onbParams, id: newId() },
       );
@@ -179,7 +179,7 @@ async function upgradeCustomerToAgentAccount(pool, { userId, reg, username, pass
     return userId;
   } catch (err) {
     await conn.rollback();
-    if (err?.code === 'ER_DUP_ENTRY') {
+    if (isDuplicateEntryError(err)) {
       const e = new Error('Could not convert account: username or agent code already exists');
       e.status = 409;
       throw e;
@@ -260,13 +260,13 @@ export async function approvePartnerRegistration(registrationId, reviewerUserId)
 
   await pool.execute(
     `UPDATE user_profiles
-     SET account_status = 'active', is_active = 1, onboarding_status = 'active'
+     SET account_status = 'active', is_active = TRUE, onboarding_status = 'active'
      WHERE id = :id`,
     { id: agentUserId },
   );
   await pool.execute(
     `UPDATE agent_onboarding
-     SET onboarding_status = 'active', qc_status = 'qc_approved', qc_at = NOW(3), qc_approved_by = :by
+     SET onboarding_status = 'active', qc_status = 'qc_approved', qc_at = NOW(), qc_approved_by = :by
      WHERE user_id = :id`,
     { id: agentUserId, by: reviewerUserId },
   );
@@ -275,8 +275,8 @@ export async function approvePartnerRegistration(registrationId, reviewerUserId)
     `UPDATE partner_registrations
      SET registration_status = 'approved',
          reviewed_by = :by,
-         reviewed_at = NOW(3),
-         approved_at = NOW(3),
+         reviewed_at = NOW(),
+         approved_at = NOW(),
          approved_user_id = :userId,
          assigned_agent_code = :code,
          financial_year = :fy
@@ -340,7 +340,7 @@ export async function rejectPartnerRegistration(registrationId, reviewerUserId, 
      SET registration_status = 'rejected',
          rejection_reason = :reason,
          reviewed_by = :by,
-         reviewed_at = NOW(3)
+         reviewed_at = NOW()
      WHERE id = :id`,
     { id: registrationId, reason: reason || null, by: reviewerUserId },
   );

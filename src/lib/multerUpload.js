@@ -30,7 +30,7 @@ function diskStorageFor(subfolder = '') {
 }
 
 /**
- * After cloud multer runs, persist memory buffer to object storage and
+ *  multer runs, persist memory buffer to object storage and
  * attach legacy multer fields (`filename`, `path`) for existing route handlers.
  */
 export function persistCloudUpload(subfolder = '') {

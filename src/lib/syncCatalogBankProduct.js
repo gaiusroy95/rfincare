@@ -50,7 +50,7 @@ export async function syncCatalogBankProduct({
 
   if (!targetId) {
     const [rows] = await pool.execute(
-      `SELECT id, data FROM bank_products WHERE bank_id = :bankId AND is_active = 1`,
+      `SELECT id, data FROM bank_products WHERE bank_id = :bankId AND is_active = TRUE`,
       { bankId },
     );
     const match = rows.find((row) => productMatchesCategory(row, category.slug));

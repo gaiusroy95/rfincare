@@ -275,7 +275,7 @@ async function resolveCircularFileUrl(pool, row, circularFilesByName) {
   if (row.circularTitle) {
     const [[existing]] = await pool.execute(
       `SELECT file_url FROM agent_commission_circulars
-       WHERE title = :title AND is_active = 1
+       WHERE title = :title AND is_active = TRUE
        ORDER BY created_at DESC LIMIT 1`,
       { title: row.circularTitle },
     );
@@ -310,7 +310,7 @@ export async function ensureCommissionCircularRecord(
 
   const [[existingByUrl]] = await pool.execute(
     `SELECT id FROM agent_commission_circulars
-     WHERE file_url = :url AND is_active = 1
+     WHERE file_url = :url AND is_active = TRUE
      LIMIT 1`,
     { url: fileUrl },
   );
@@ -318,7 +318,7 @@ export async function ensureCommissionCircularRecord(
 
   const [[existingByTitle]] = await pool.execute(
     `SELECT id FROM agent_commission_circulars
-     WHERE title = :title AND is_active = 1
+     WHERE title = :title AND is_active = TRUE
      LIMIT 1`,
     { title: circularTitle },
   );
@@ -360,7 +360,7 @@ export async function fetchAgentCommissionCirculars(pool) {
   const [rows] = await pool.execute(
     `SELECT id, title, description, file_name, file_url, created_at
      FROM agent_commission_circulars
-     WHERE is_active = 1
+     WHERE is_active = TRUE
      ORDER BY created_at DESC`,
   );
 

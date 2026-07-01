@@ -169,7 +169,7 @@ adminRouter.get(
       const [[agentStats]] = await pool.execute(
         `SELECT COUNT(*) AS active_agents
          FROM user_profiles
-         WHERE role = 'agent' AND is_active = 1 AND account_status = 'active'`,
+         WHERE role = 'agent' AND is_active = TRUE AND account_status = 'active'`,
       );
 
       const total = Number(appStats?.total || 0);
@@ -302,7 +302,7 @@ adminRouter.get(
                 eo.onboarding_status AS eo_status
          FROM user_profiles up
          LEFT JOIN employee_onboarding eo ON eo.user_id = up.id
-         WHERE up.role COLLATE utf8mb4_unicode_ci = 'employee'
+         WHERE up.role = 'employee'
          ORDER BY up.created_at DESC`,
       );
       const accessByUser = await fetchEmployeeAccessControlsMap(rows.map((r) => r.id));
@@ -847,12 +847,10 @@ async function upsertEmployeeModuleAccess(pool, employeeUserId, entry, { isActiv
        id, employee_user_id, module_name, permissions_json, is_active, expires_at, updated_by
      ) VALUES (
        :id, :employee_user_id, :module_name, :permissions_json, :is_active, :expires_at, :updated_by
-     )
-     ON DUPLICATE KEY UPDATE
-       permissions_json = VALUES(permissions_json),
-       is_active = VALUES(is_active),
-       expires_at = VALUES(expires_at),
-       updated_by = VALUES(updated_by)`,
+     ) ON CONFLICT (id) DO UPDATE SET permissions_json = EXCLUDED.permissions_json,
+       is_active = EXCLUDED.is_active,
+       expires_at = EXCLUDED.expires_at,
+       updated_by = EXCLUDED.updated_by`,
     {
       id: newId(),
       employee_user_id: employeeUserId,
@@ -908,4 +906,4 @@ adminRouter.put(
       next(err);
     }
   },
-);
+)

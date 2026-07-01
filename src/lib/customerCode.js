@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
-import { getPool } from '../db/pool.js';
+import { getPool, isDuplicateEntryError, isDuplicateColumnError, isNoSuchTableError, isIgnorableMigrationError, isTableExistsError, isBadFieldError } from '../db/pool.js';
 
 /** Customer display ID: CUST-{first 8 hex chars of UUID, uppercase} */
 export function generateCustomerCode() {
@@ -24,7 +24,7 @@ export async function assignUniqueCustomerCode(connOrPool, userId) {
       );
       if (row?.customer_code) return row.customer_code;
     } catch (err) {
-      if (err?.code === 'ER_DUP_ENTRY') continue;
+      if (isDuplicateEntryError(err)) continue;
       throw err;
     }
   }

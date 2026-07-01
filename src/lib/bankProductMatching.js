@@ -60,7 +60,7 @@ export function getProductCategoryFields(product) {
 }
 
 /**
- * @param {import('mysql2/promise').Pool} pool
+ * @param {import('pg').Pool} pool
  */
 export async function resolveProductCategoryQuery(pool, rawQuery) {
   if (!rawQuery) return null;
@@ -78,7 +78,7 @@ export async function resolveProductCategoryQuery(pool, rawQuery) {
   try {
     const [[row]] = await pool.execute(
       `SELECT slug, api_key FROM loan_product_catalog
-       WHERE is_active = 1
+       WHERE is_active = TRUE
          AND (
            LOWER(slug) = :key
            OR LOWER(api_key) = :key
@@ -99,7 +99,7 @@ export async function resolveProductCategoryQuery(pool, rawQuery) {
 
     const [[catRow]] = await pool.execute(
       `SELECT slug, parent_loan_type FROM product_categories
-       WHERE is_active = 1
+       WHERE is_active = TRUE
          AND (LOWER(slug) = :key OR LOWER(slug) = :raw)
        LIMIT 1`,
       { key, raw: String(rawQuery).trim().toLowerCase() },

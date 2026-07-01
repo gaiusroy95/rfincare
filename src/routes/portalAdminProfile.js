@@ -92,12 +92,12 @@ async function verifyLatestOtp(pool, { adminUserId, purpose, otp }) {
   const [[row]] = await pool.execute(
     `SELECT id FROM admin_profile_otps
      WHERE admin_user_id = :uid AND purpose = :purpose AND otp_hash = :hash
-       AND verified_at IS NULL AND expires_at > NOW(3)
+       AND verified_at IS NULL AND expires_at > NOW()
      ORDER BY created_at DESC LIMIT 1`,
     { uid: adminUserId, purpose, hash: hashOtp(otp) },
   );
   if (!row) return false;
-  await pool.execute(`UPDATE admin_profile_otps SET verified_at = NOW(3) WHERE id = :id`, {
+  await pool.execute(`UPDATE admin_profile_otps SET verified_at = NOW() WHERE id = :id`, {
     id: row.id,
   });
   return true;

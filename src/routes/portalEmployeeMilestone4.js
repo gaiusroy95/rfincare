@@ -5,7 +5,6 @@ import bcrypt from 'bcryptjs';
 import { authenticate } from '../middleware/authenticate.js';
 import { getPool } from '../db/pool.js';
 import { ensureMilestone4Schema } from '../db/ensureMilestone4Schema.js';
-import { ensureStaffOnboardingCollation } from '../db/ensureOnboardingSchema.js';
 import { dispatchFileUpdateNotification } from '../lib/fileNotificationService.js';
 import { ensureAgentCodeForUser } from '../lib/agentCode.js';
 import { sendStaffWelcomeEmail } from '../lib/email.js';
@@ -70,13 +69,12 @@ portalEmployeeMilestone4Router.get('/agent-onboarding/pending', async (req, res,
       requireEmployeeModuleAccess(access, 'agents', 'read');
     }
     await ensureMilestone4Schema();
-    await ensureStaffOnboardingCollation();
     const pool = getPool();
     const [rows] = await pool.execute(
       `SELECT ao.*, up.full_name, up.email, up.phone
        FROM agent_onboarding ao
        JOIN user_profiles up ON up.id = ao.user_id
-       WHERE CONVERT(ao.qc_status USING utf8mb4) COLLATE utf8mb4_general_ci
+       WHERE CAST(ao.qc_status AS TEXT)
          IN ('pending_qc', 'qc_review')
        ORDER BY ao.created_at ASC`,
     );
@@ -113,7 +111,6 @@ portalEmployeeMilestone4Router.post('/agent-onboarding/:userId/qc', async (req, 
   try {
     requireEmployee(req);
     await ensureMilestone4Schema();
-    await ensureStaffOnboardingCollation();
     const input = QcDecisionSchema.parse(req.body);
     const tempPassword = input.temporaryPassword || input.password || null;
     if (req.auth.role === 'employee') {
@@ -150,8 +147,8 @@ portalEmployeeMilestone4Router.post('/agent-onboarding/:userId/qc', async (req, 
         `UPDATE agent_onboarding
          SET qc_status = ${sqlCastParam('qc_status')},
              qc_employee_id = :emp,
-             qc_notes = IF(:notes IS NULL, qc_notes, ${sqlCastParam('notes')}),
-             qc_at = NOW(3),
+             qc_notes = CASE WHEN :notes IS NULL THEN qc_notes ELSE ${sqlCastParam('notes')} END,
+             qc_at = NOW(),
              qc_approved_by = :emp,
              onboarding_status = ${sqlCastParam('onboarding_status')}
          WHERE user_id = :id`,
@@ -165,7 +162,7 @@ portalEmployeeMilestone4Router.post('/agent-onboarding/:userId/qc', async (req, 
       );
       await pool.execute(
         `UPDATE user_profiles SET
-           is_active = 1,
+           is_active = TRUE,
            account_status = ${sqlCastParam('account_status')},
            onboarding_status = ${sqlCastParam('profile_onboarding_status')}
          WHERE id = :id`,
@@ -191,7 +188,7 @@ portalEmployeeMilestone4Router.post('/agent-onboarding/:userId/qc', async (req, 
          SET qc_status = ${sqlCastParam('qc_status')},
              qc_employee_id = :emp,
              qc_notes = ${sqlCastParam('notes')},
-             qc_at = NOW(3),
+             qc_at = NOW(),
              onboarding_status = ${sqlCastParam('onboarding_status')}
          WHERE user_id = :id`,
         {
@@ -204,7 +201,7 @@ portalEmployeeMilestone4Router.post('/agent-onboarding/:userId/qc', async (req, 
       );
       await pool.execute(
         `UPDATE user_profiles SET
-           is_active = 0,
+           is_active = FALSE,
            account_status = ${sqlCastParam('account_status')},
            onboarding_status = ${sqlCastParam('profile_onboarding_status')}
          WHERE id = :id`,

@@ -100,7 +100,7 @@ async function fetchLearningForEmployee(pool, employeeUserId) {
      FROM agent_learning_content c
      LEFT JOIN employee_learning_progress p
        ON p.content_id = c.id AND p.employee_user_id = :employeeId
-     WHERE c.is_active = 1 AND c.audience IN ('employee', 'all')
+     WHERE c.is_active = TRUE AND c.audience IN ('employee', 'all')
      ORDER BY c.is_new DESC, c.sort_order ASC, c.created_at DESC`,
     { employeeId: employeeUserId },
   );
@@ -278,7 +278,7 @@ adminEmployeeLearningRouter.delete(
       await ensureAgentLearningSchema();
       const pool = getPool();
       await pool.execute(
-        `UPDATE agent_learning_content SET is_active = 0
+        `UPDATE agent_learning_content SET is_active = FALSE
          WHERE id = :id AND audience IN ('employee', 'all')`,
         { id: req.params.id },
       );
@@ -321,7 +321,7 @@ portalEmployeeLearningRouter.get('/content/:id/file', async (req, res, next) => 
     const [[row]] = await pool.execute(
       `SELECT id, title, file_name, file_path, file_url, mime_type
        FROM agent_learning_content
-       WHERE id = :id AND is_active = 1 AND audience IN ('employee', 'all')
+       WHERE id = :id AND is_active = TRUE AND audience IN ('employee', 'all')
        LIMIT 1`,
       { id: req.params.id },
     );
@@ -362,7 +362,7 @@ portalEmployeeLearningRouter.post('/:id/progress', async (req, res, next) => {
 
     const [[content]] = await pool.execute(
       `SELECT id FROM agent_learning_content
-       WHERE id = :id AND is_active = 1 AND audience IN ('employee', 'all') LIMIT 1`,
+       WHERE id = :id AND is_active = TRUE AND audience IN ('employee', 'all') LIMIT 1`,
       { id: contentId },
     );
     if (!content) return res.status(404).json({ error: 'Content not found' });
@@ -370,11 +370,9 @@ portalEmployeeLearningRouter.post('/:id/progress', async (req, res, next) => {
     const progressId = newId();
     await pool.execute(
       `INSERT INTO employee_learning_progress (id, employee_user_id, content_id, progress_percent, completed_at)
-       VALUES (:id, :employee_id, :content_id, :progress, :completed_at)
-       ON DUPLICATE KEY UPDATE
-         progress_percent = :progress,
+       VALUES (:id, :employee_id, :content_id, :progress, :completed_at) ON CONFLICT (id) DO UPDATE SET progress_percent = :progress,
          completed_at = :completed_at,
-         updated_at = NOW(3)`,
+         updated_at = NOW()`,
       {
         id: progressId,
         employee_id: req.auth.userId,
@@ -388,4 +386,4 @@ portalEmployeeLearningRouter.post('/:id/progress', async (req, res, next) => {
   } catch (err) {
     next(err);
   }
-});
+})

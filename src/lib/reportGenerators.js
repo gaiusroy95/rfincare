@@ -80,9 +80,9 @@ export async function generateReportSection(pool, reportKey, params) {
             la.application_number,
             COALESCE(cust.full_name, '') AS customer_name,
             COALESCE(
-              NULLIF(JSON_UNQUOTE(JSON_EXTRACT(la.data, '$.loan_type_label')), ''),
-              NULLIF(JSON_UNQUOTE(JSON_EXTRACT(la.data, '$.loan_type')), ''),
-              NULLIF(JSON_UNQUOTE(JSON_EXTRACT(la.data, '$.loan_purpose')), ''),
+              NULLIF(la.data->>'loan_type_label', ''),
+              NULLIF(la.data->>'loan_type', ''),
+              NULLIF(la.data->>'loan_purpose', ''),
               ''
             ) AS loan_type,
             la.status,

@@ -19,7 +19,7 @@ import { listRulesForBank } from './approvalMatrixRules.js';
 
 const BANK_LIST_CACHE_PREFIX = 'banks:list:';
 
-/** Clears any legacy in-memory bank list entries after writes. */
+/** Clears any legacy in-memory bank list entries . */
 function invalidateBankListCache() {
   cacheDeletePrefix(BANK_LIST_CACHE_PREFIX);
 }
@@ -278,7 +278,7 @@ async function fetchBankList({ includeInactive, includeProducts, categoryQuery }
   const [products] = await pool.execute(
     `SELECT id, bank_id, name, is_active, data
      FROM bank_products
-     WHERE is_active = 1`,
+     WHERE is_active = TRUE`,
   );
 
   const productsByBank = new Map();
@@ -511,7 +511,7 @@ banksRouter.get('/:id/products', async (req, res, next) => {
   try {
     const pool = getPool();
     const [rows] = await pool.execute(
-      `SELECT * FROM bank_products WHERE bank_id = :bankId AND is_active = 1`,
+      `SELECT * FROM bank_products WHERE bank_id = :bankId AND is_active = TRUE`,
       { bankId: req.params.id },
     );
     res.json(rows);

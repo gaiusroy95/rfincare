@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { unlink } from 'node:fs/promises';
 
-import { getPool } from '../db/pool.js';
+import { getPool, isNoSuchTableError } from '../db/pool.js';
 import { newId } from '../lib/ids.js';
 import { generateOtp, hashOtp, sendOtpNotification } from '../lib/otp.js';
 import { authenticate } from '../middleware/authenticate.js';
@@ -374,7 +374,7 @@ loanApplicationsRouter.post(
              review_notes = COALESCE(:review_notes, review_notes),
              rejection_reason = COALESCE(:rejection_reason, rejection_reason),
              reviewed_by = :reviewed_by,
-             reviewed_at = NOW(3)
+             reviewed_at = NOW()
            WHERE id = :id`,
           {
             id,
@@ -531,7 +531,7 @@ loanApplicationsRouter.post(
       const [[otpRow]] = await pool.execute(
         `SELECT id FROM lead_otps
          WHERE email = :email AND otp_hash = :hash AND purpose = :purpose
-           AND verified_at IS NULL AND expires_at > NOW(3)
+           AND verified_at IS NULL AND expires_at > NOW()
          ORDER BY created_at DESC LIMIT 1`,
         {
           email: profile.email,
@@ -544,7 +544,7 @@ loanApplicationsRouter.post(
         return res.status(401).json({ error: 'Invalid or expired OTP' });
       }
 
-      await pool.execute(`UPDATE lead_otps SET verified_at = NOW(3) WHERE id = :id`, {
+      await pool.execute(`UPDATE lead_otps SET verified_at = NOW() WHERE id = :id`, {
         id: otpRow.id,
       });
 
@@ -802,14 +802,14 @@ loanApplicationsRouter.patch(
             ELSE qc_admin_id
           END,
           qc_updated_at = CASE
-            WHEN :set_qc_updated = 1 THEN NOW(3)
+            WHEN :set_qc_updated = 1 THEN NOW()
             ELSE qc_updated_at
           END,
           document_stage_status = COALESCE(:document_stage_status, document_stage_status),
           bank_approval_status = COALESCE(:bank_approval_status, bank_approval_status),
           eligibility_status = COALESCE(:eligibility_status, eligibility_status),
           reviewed_by = CASE WHEN :mark_reviewed = 1 THEN :reviewed_by ELSE reviewed_by END,
-          reviewed_at = CASE WHEN :mark_reviewed = 1 THEN NOW(3) ELSE reviewed_at END,
+          reviewed_at = CASE WHEN :mark_reviewed = 1 THEN NOW() ELSE reviewed_at END,
           data = :data
          WHERE id = :id`,
         {
@@ -983,7 +983,7 @@ loanApplicationsRouter.post(
           });
         }
         const skipCibil =
-          cibilErr.code === 'ER_NO_SUCH_TABLE'
+          isNoSuchTableError(cibilErr)
           || cibilErr.status === 400
           || /cibil_vendors/i.test(String(cibilErr.message || ''));
         if (!skipCibil) throw cibilErr;
@@ -996,7 +996,7 @@ loanApplicationsRouter.post(
              journey_mode = 'document_only',
              document_stage_status = COALESCE(document_stage_status, 'documents_pending'),
              bank_approval_status = 'submitted_to_bank',
-             submitted_at = NOW(3),
+             submitted_at = NOW(),
              selected_bank_id = COALESCE(:selected_bank_id, selected_bank_id)
          WHERE id = :id`,
         { id: req.params.id, selected_bank_id: selectedBankId },

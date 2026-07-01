@@ -1,13 +1,6 @@
-import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-
-import { skipRuntimeSchemaOnPostgres } from '../db/ensureHelpers.js';
 import { dbBool } from '../db/boolean.js';
 import { getPool } from '../db/pool.js';
 import { getPublicSiteOrigin } from './publicUrl.js';
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
 const GLOBAL_ID = 'default';
 const PROVIDERS = ['google', 'microsoft', 'apple'];
 let ensured = false;
@@ -24,30 +17,6 @@ function parseCallbackUrls(value) {
 }
 
 export async function ensureOauthProviderSchema() {
-  if (ensured) return;
-  if (skipRuntimeSchemaOnPostgres()) {
-    ensured = true;
-    return;
-  }
-  const sql = readFileSync(
-    join(__dirname, '../../migrations/016_oauth_provider_settings.sql'),
-    'utf8',
-  );
-  const pool = getPool();
-  const statements = sql
-    .split(';')
-    .map((s) => s.trim())
-    .filter((s) => s && !s.startsWith('--'));
-
-  for (const statement of statements) {
-    try {
-      await pool.execute(statement);
-    } catch (err) {
-      if (err.code !== 'ER_TABLE_EXISTS_ERROR' && err.code !== 'ER_DUP_ENTRY') {
-        throw err;
-      }
-    }
-  }
   ensured = true;
 }
 
@@ -126,12 +95,10 @@ export async function updateOAuthSettings({ global: globalInput, providers: prov
     await pool.execute(
       `INSERT INTO oauth_global_settings (
          id, api_public_base_url, frontend_callback_urls_json, require_applied_customer_email, updated_by
-       ) VALUES (:id, :api_url, :callbacks, :require_email, :updated_by)
-       ON DUPLICATE KEY UPDATE
-         api_public_base_url = VALUES(api_public_base_url),
-         frontend_callback_urls_json = VALUES(frontend_callback_urls_json),
-         require_applied_customer_email = VALUES(require_applied_customer_email),
-         updated_by = VALUES(updated_by)`,
+       ) VALUES (:id, :api_url, :callbacks, :require_email, :updated_by) ON CONFLICT (id) DO UPDATE SET api_public_base_url = EXCLUDED.api_public_base_url,
+         frontend_callback_urls_json = EXCLUDED.frontend_callback_urls_json,
+         require_applied_customer_email = EXCLUDED.require_applied_customer_email,
+         updated_by = EXCLUDED.updated_by`,
       {
         id: GLOBAL_ID,
         api_url: globalInput.apiPublicBaseUrl?.replace(/\/$/, '') || null,
@@ -149,12 +116,12 @@ export async function updateOAuthSettings({ global: globalInput, providers: prov
         `INSERT INTO oauth_provider_config (
            provider, enabled, client_id, client_secret, redirect_uri, updated_by
          ) VALUES (:provider, :enabled, :client_id, :client_secret, :redirect_uri, :updated_by)
-         ON DUPLICATE KEY UPDATE
-           enabled = VALUES(enabled),
-           client_id = VALUES(client_id),
-           client_secret = COALESCE(NULLIF(VALUES(client_secret), ''), client_secret),
-           redirect_uri = VALUES(redirect_uri),
-           updated_by = VALUES(updated_by)`,
+         ON CONFLICT (provider) DO UPDATE SET
+           enabled = EXCLUDED.enabled,
+           client_id = EXCLUDED.client_id,
+           client_secret = COALESCE(NULLIF(EXCLUDED.client_secret, ''), client_secret),
+           redirect_uri = EXCLUDED.redirect_uri,
+           updated_by = EXCLUDED.updated_by`,
         {
           provider: p.provider,
           enabled: p.enabled ? 1 : 0,

@@ -51,13 +51,11 @@ export async function upsertHomepageTrustContent(input, userId) {
     `INSERT INTO homepage_trust_content
       (id, heading, subtitle, stats_json, certifications_json, updated_by)
      VALUES
-      ('default', :heading, :subtitle, :stats, :certs, :updated_by)
-     ON DUPLICATE KEY UPDATE
-      heading = VALUES(heading),
-      subtitle = VALUES(subtitle),
-      stats_json = VALUES(stats_json),
-      certifications_json = VALUES(certifications_json),
-      updated_by = VALUES(updated_by)`,
+      ('default', :heading, :subtitle, :stats, :certs, :updated_by) ON CONFLICT (id) DO UPDATE SET heading = EXCLUDED.heading,
+      subtitle = EXCLUDED.subtitle,
+      stats_json = EXCLUDED.stats_json,
+      certifications_json = EXCLUDED.certifications_json,
+      updated_by = EXCLUDED.updated_by`,
     {
       heading: input.heading,
       subtitle: input.subtitle || null,
@@ -69,4 +67,3 @@ export async function upsertHomepageTrustContent(input, userId) {
 
   return getHomepageTrustContent();
 }
-

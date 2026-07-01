@@ -1,6 +1,6 @@
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
--- Initial MySQL schema for replacing Supabase.
+-- Initial PostgreSQL schema for Rfincare.
 -- Focuses on fields currently referenced by the frontend code.
 
 CREATE TABLE IF NOT EXISTS auth_users (

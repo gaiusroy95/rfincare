@@ -174,7 +174,7 @@ statusCheckAdminRouter.post(
 
       const [[otpRow]] = await pool.execute(
         `SELECT id FROM status_check_otps
-         WHERE email = :email AND otp_hash = :hash AND verified_at IS NULL AND expires_at > NOW(3)
+         WHERE email = :email AND otp_hash = :hash AND verified_at IS NULL AND expires_at > NOW()
          ORDER BY created_at DESC LIMIT 1`,
         { email: input.email, hash: hashOtp(input.otp) },
       );
@@ -182,7 +182,7 @@ statusCheckAdminRouter.post(
         return res.status(401).json({ error: 'Invalid or expired OTP' });
       }
 
-      await pool.execute(`UPDATE status_check_otps SET verified_at = NOW(3) WHERE id = :id`, {
+      await pool.execute(`UPDATE status_check_otps SET verified_at = NOW() WHERE id = :id`, {
         id: otpRow.id,
       });
 

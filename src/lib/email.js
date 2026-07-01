@@ -104,7 +104,7 @@ export async function sendStaffWelcomeEmail({ email, fullName, role, password, l
     `Email: ${email}`,
     `Temporary password: ${password}`,
     '',
-    'Please sign in and change your password after first login.',
+    'Please sign in and change your password  login.',
     '',
     '— Rfincare Team',
   ].join('\n');
@@ -117,7 +117,7 @@ export async function sendStaffWelcomeEmail({ email, fullName, role, password, l
       <li><strong>Email:</strong> ${email}</li>
       <li><strong>Password:</strong> ${password}</li>
     </ul>
-    <p>Please change your password after your first sign-in.</p>
+    <p>Please change your password  first sign-in.</p>
   `;
 
   return sendEmail({ to: email, subject, text, html });
@@ -203,7 +203,7 @@ export async function sendPartnerWelcomeEmail({
       <li><strong>Email:</strong> ${email}</li>
       <li><strong>Temporary password:</strong> ${password}</li>
     </ul>
-    <p><a href="${resetUrl}">Reset your password after first sign-in</a></p>
+    <p><a href="${resetUrl}">Reset your password  sign-in</a></p>
   `;
 
   return sendEmail({ to: email, subject, text, html });
@@ -215,7 +215,7 @@ export async function sendPartnerRejectionEmail({ email, fullName, reason }) {
     `Hello ${fullName || email},`,
     '',
     'Thank you for applying to become an Rfincare partner.',
-    'After reviewing your application, we are unable to approve it at this time.',
+    ' your application, we are unable to approve it at this time.',
     reason ? `\nReason: ${reason}` : '',
     '',
     'You may contact support if you have questions.',

@@ -52,13 +52,11 @@ export async function saveAdminVerifierEmails(emails, updatedBy) {
   await pool.execute(
     `INSERT INTO admin_verification_settings
        (id, verifier_email_1, verifier_email_2, verifier_email_3, updated_by, updated_at)
-     VALUES (:id, :e1, :e2, :e3, :by, NOW(3))
-     ON DUPLICATE KEY UPDATE
-       verifier_email_1 = VALUES(verifier_email_1),
-       verifier_email_2 = VALUES(verifier_email_2),
-       verifier_email_3 = VALUES(verifier_email_3),
-       updated_by = VALUES(updated_by),
-       updated_at = VALUES(updated_at)`,
+     VALUES (:id, :e1, :e2, :e3, :by, NOW()) ON CONFLICT (id) DO UPDATE SET verifier_email_1 = EXCLUDED.verifier_email_1,
+       verifier_email_2 = EXCLUDED.verifier_email_2,
+       verifier_email_3 = EXCLUDED.verifier_email_3,
+       updated_by = EXCLUDED.updated_by,
+       updated_at = EXCLUDED.updated_at`,
     {
       id: SETTINGS_ID,
       e1: normalized[0],

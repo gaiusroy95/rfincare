@@ -108,7 +108,7 @@ export async function calculateEligibility(input) {
   const [banks] = await pool.query(
     `SELECT b.id, b.name, bp.id AS product_id, bp.name AS product_name, bp.data AS product_data
      FROM banks b
-     LEFT JOIN bank_products bp ON bp.bank_id = b.id AND bp.is_active = 1
+     LEFT JOIN bank_products bp ON bp.bank_id = b.id AND bp.is_active = TRUE
      WHERE b.status = 'active'
      ORDER BY b.display_priority DESC`,
   );
@@ -116,7 +116,7 @@ export async function calculateEligibility(input) {
   const [rules] = await pool.query(
     `SELECT bank_id, approval_probability, priority, data
      FROM approval_matrix_rules
-     WHERE is_active = 1
+     WHERE is_active = TRUE
      ORDER BY priority DESC`,
   );
 

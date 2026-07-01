@@ -11,7 +11,7 @@ const { Pool } = pg;
 const __dirname = dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: join(__dirname, '../.env') });
 
-/** MySQL-only collation patches — no-op on PostgreSQL / Neon. */
+/** Legacy collation patches — skipped on PostgreSQL. */
 const POSTGRES_SKIP_FILES = new Set([
   '006_collation_unicode_ci.sql',
   '029_staff_onboarding_collation.sql',
@@ -68,11 +68,8 @@ function stripLineComments(sql) {
     .trim();
 }
 
-/**
- * Convert simple MySQL ALTER ... MODIFY ... statements to PostgreSQL.
- * Returns an array of statements (may be empty if nothing to run).
- */
-function convertMysqlModifyAlter(sql) {
+/** Normalize legacy ALTER ... MODIFY ... statements for PostgreSQL. */
+function normalizeModifyAlter(sql) {
   const cleaned = stripLineComments(sql);
   if (!/ALTER\s+TABLE/i.test(cleaned) || !/MODIFY/i.test(cleaned)) {
     return [cleaned].filter(Boolean);
@@ -103,7 +100,7 @@ function convertMysqlModifyAlter(sql) {
   return statements.length ? statements : [];
 }
 
-function convertInlineMysqlIndexes(sql) {
+function extractInlineIndexes(sql) {
   if (!/CREATE\s+TABLE/i.test(sql) || !/\bINDEX\b/i.test(sql)) return [sql];
   const tableMatch = sql.match(/CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+(\w+)/i);
   if (!tableMatch) return [sql];
@@ -118,7 +115,7 @@ function convertInlineMysqlIndexes(sql) {
   return statements;
 }
 
-function convertMysqlAddKey(sql) {
+function extractAddKeyIndexes(sql) {
   if (!/ADD\s+KEY/i.test(sql)) return [sql];
   const tableMatch = sql.match(/ALTER\s+TABLE\s+(\w+)/i);
   if (!tableMatch) return [sql];
@@ -128,8 +125,8 @@ function convertMysqlAddKey(sql) {
   return indexes.map(([, name, cols]) => `CREATE INDEX IF NOT EXISTS ${name} ON ${table} (${cols})`);
 }
 
-/** MySQL UPDATE t JOIN ... SET ... WHERE → PostgreSQL UPDATE ... FROM ... */
-function convertMysqlUpdateJoin(sql) {
+/** UPDATE ... JOIN ... → PostgreSQL UPDATE ... FROM ... */
+function normalizeUpdateJoin(sql) {
   if (!/^\s*UPDATE\s+/i.test(sql) || !/LEFT\s+JOIN/i.test(sql)) return [sql];
   const match = sql.match(
     /UPDATE\s+(\w+)\s+(\w+)\s+LEFT\s+JOIN\s+(\w+)\s+(\w+)\s+ON\s+(.+?)\s+SET\s+(.+?)\s+WHERE\s+(.+)$/is,
@@ -177,10 +174,10 @@ function splitStatements(sql) {
     .split(/;\s*(?:\r?\n|$)/)
     .map((part) => stripLineComments(part))
     .filter((part) => part.length > 0)
-    .flatMap((part) => convertMysqlModifyAlter(part))
-    .flatMap((part) => convertInlineMysqlIndexes(part))
-    .flatMap((part) => convertMysqlAddKey(part))
-    .flatMap((part) => convertMysqlUpdateJoin(part))
+    .flatMap((part) => normalizeModifyAlter(part))
+    .flatMap((part) => extractInlineIndexes(part))
+    .flatMap((part) => extractAddKeyIndexes(part))
+    .flatMap((part) => normalizeUpdateJoin(part))
     .map((part) => normalizePostgresStatement(part))
     .filter((part) => part.length > 0);
 }
@@ -239,7 +236,7 @@ async function main() {
       if (POSTGRES_SKIP_FILES.has(file)) {
         await markApplied(client, file);
         // eslint-disable-next-line no-console
-        console.log(`Skipped (MySQL-only, no-op on Postgres): ${file}`);
+        console.log(`Skipped (legacy no-op patch): ${file}`);
         continue;
       }
 

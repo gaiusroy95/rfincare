@@ -1,17 +1,17 @@
 /**
- * Seed demo users into MySQL (auth_users + user_profiles).
+ * Seed demo users (auth_users + user_profiles).
  * Idempotent: creates missing users or resets password + role for existing emails.
  *
  * Usage (from backend/):
  *   npm run seed:demo-users
  */
-import mysql from 'mysql2/promise';
 import bcrypt from 'bcryptjs';
 import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import dotenv from 'dotenv';
+import { getPool } from '../src/db/pool.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: join(__dirname, '../.env') });
@@ -43,10 +43,10 @@ const DEMO_USERS = [
   },
 ];
 
-async function upsertDemoUser(connection, user) {
+async function upsertDemoUser(pool, user) {
   const passwordHash = await bcrypt.hash(user.password, 12);
 
-  const [existing] = await connection.execute(
+  const [existing] = await pool.execute(
     'SELECT id FROM auth_users WHERE email = :email LIMIT 1',
     { email: user.email },
   );
@@ -55,21 +55,21 @@ async function upsertDemoUser(connection, user) {
 
   if (existing.length > 0) {
     userId = existing[0].id;
-    await connection.execute(
-      'UPDATE auth_users SET password_hash = :ph, updated_at = CURRENT_TIMESTAMP(3) WHERE id = :id',
+    await pool.execute(
+      'UPDATE auth_users SET password_hash = :ph, updated_at = CURRENT_TIMESTAMP WHERE id = :id',
       { ph: passwordHash, id: userId },
     );
     console.log(`  ↻ Updated password: ${user.email}`);
   } else {
     userId = randomUUID();
-    await connection.execute(
+    await pool.execute(
       'INSERT INTO auth_users (id, email, password_hash) VALUES (:id, :email, :ph)',
       { id: userId, email: user.email, ph: passwordHash },
     );
     console.log(`  ✓ Created auth user: ${user.email}`);
   }
 
-  const [profileRows] = await connection.execute(
+  const [profileRows] = await pool.execute(
     'SELECT id FROM user_profiles WHERE id = :id OR email = :email LIMIT 1',
     { id: userId, email: user.email },
   );
@@ -77,32 +77,32 @@ async function upsertDemoUser(connection, user) {
   if (profileRows.length > 0) {
     const profileId = profileRows[0].id;
     if (profileId !== userId) {
-      await connection.execute('DELETE FROM user_profiles WHERE id = :id', { id: profileId });
-      await connection.execute(
+      await pool.execute('DELETE FROM user_profiles WHERE id = :id', { id: profileId });
+      await pool.execute(
         `INSERT INTO user_profiles (id, email, full_name, role, account_status, is_active, failed_login_attempts, locked_until)
-         VALUES (:id, :email, :fullName, :role, 'active', 1, 0, NULL)`,
+         VALUES (:id, :email, :fullName, :role, 'active', TRUE, 0, NULL)`,
         { id: userId, email: user.email, fullName: user.fullName, role: user.role },
       );
     } else {
-      await connection.execute(
+      await pool.execute(
         `UPDATE user_profiles SET
            email = :email,
            full_name = :fullName,
            role = :role,
            account_status = 'active',
-           is_active = 1,
+           is_active = TRUE,
            failed_login_attempts = 0,
            locked_until = NULL,
-           updated_at = CURRENT_TIMESTAMP(3)
+           updated_at = CURRENT_TIMESTAMP
          WHERE id = :id`,
         { id: userId, email: user.email, fullName: user.fullName, role: user.role },
       );
     }
     console.log(`  ↻ Updated profile (${user.role}): ${user.email}`);
   } else {
-    await connection.execute(
+    await pool.execute(
       `INSERT INTO user_profiles (id, email, full_name, role, account_status, is_active)
-       VALUES (:id, :email, :fullName, :role, 'active', 1)`,
+       VALUES (:id, :email, :fullName, :role, 'active', TRUE)`,
       { id: userId, email: user.email, fullName: user.fullName, role: user.role },
     );
     console.log(`  ✓ Created profile (${user.role}): ${user.email}`);
@@ -112,32 +112,14 @@ async function upsertDemoUser(connection, user) {
 }
 
 async function seedDemoUsers() {
-  const host = process.env.MYSQL_HOST;
-  const user = process.env.MYSQL_USER;
-  const password = process.env.MYSQL_PASSWORD;
-  const database = process.env.MYSQL_DATABASE;
-  const port = Number(process.env.MYSQL_PORT || 3306);
-
-  if (!host || !user || !database) {
-    console.error('Missing MySQL env vars (MYSQL_HOST, MYSQL_USER, MYSQL_DATABASE)');
-    process.exit(1);
-  }
-
-  const connection = await mysql.createConnection({
-    host,
-    user,
-    password,
-    database,
-    port,
-    namedPlaceholders: true,
-  });
+  const pool = getPool();
 
   try {
     console.log('Seeding demo users...\n');
 
     for (const demoUser of DEMO_USERS) {
       console.log(`→ ${demoUser.role}: ${demoUser.email}`);
-      await upsertDemoUser(connection, demoUser);
+      await upsertDemoUser(pool, demoUser);
     }
 
     console.log('\n✅ Demo users ready.\n');
@@ -156,7 +138,7 @@ async function seedDemoUsers() {
     console.error('Seed failed:', error);
     process.exit(1);
   } finally {
-    await connection.end();
+    if (typeof pool.end === 'function') await pool.end();
   }
 }
 

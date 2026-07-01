@@ -119,7 +119,7 @@ eligibilityAssessmentsRouter.post('/', async (req, res, next) => {
       bankResults,
     });
   } catch (err) {
-    if (err?.code === 'ER_NO_SUCH_TABLE') {
+    if (isNoSuchTableError(err)) {
       err.status = 503;
       err.message = 'Run database migration 007_milestone2_leads.sql';
     }

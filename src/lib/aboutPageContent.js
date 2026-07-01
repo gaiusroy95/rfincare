@@ -87,15 +87,13 @@ export async function upsertAboutPageContent(input, userId) {
     `INSERT INTO about_page_content
       (id, hero_title, hero_subtitle, stats_json, values_json, story_heading, story_paragraphs_json, updated_by)
      VALUES
-      ('default', :hero_title, :hero_subtitle, :stats_json, :values_json, :story_heading, :story_paragraphs_json, :updated_by)
-     ON DUPLICATE KEY UPDATE
-      hero_title = VALUES(hero_title),
-      hero_subtitle = VALUES(hero_subtitle),
-      stats_json = VALUES(stats_json),
-      values_json = VALUES(values_json),
-      story_heading = VALUES(story_heading),
-      story_paragraphs_json = VALUES(story_paragraphs_json),
-      updated_by = VALUES(updated_by)`,
+      ('default', :hero_title, :hero_subtitle, :stats_json, :values_json, :story_heading, :story_paragraphs_json, :updated_by) ON CONFLICT (id) DO UPDATE SET hero_title = EXCLUDED.hero_title,
+      hero_subtitle = EXCLUDED.hero_subtitle,
+      stats_json = EXCLUDED.stats_json,
+      values_json = EXCLUDED.values_json,
+      story_heading = EXCLUDED.story_heading,
+      story_paragraphs_json = EXCLUDED.story_paragraphs_json,
+      updated_by = EXCLUDED.updated_by`,
     {
       hero_title: input.heroTitle,
       hero_subtitle: input.heroSubtitle || null,
@@ -108,4 +106,3 @@ export async function upsertAboutPageContent(input, userId) {
   );
   return getAboutPageContent();
 }
-

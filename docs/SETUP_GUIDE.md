@@ -111,7 +111,7 @@ Click these tabs to access the dedicated management pages.
 
 1. **Hostinger Deployment:**
    - This system uses Supabase (PostgreSQL) as the database
-   - Supabase handles hosting, so no MySQL setup needed on Hostinger
+   - Use Neon PostgreSQL or another managed Postgres provider for the database
    - Your Hostinger hosting will serve the React frontend
    - Database is managed by Supabase cloud
 

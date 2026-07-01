@@ -22,7 +22,7 @@ function resolveActiveFlag(accountStatus) {
 }
 
 function sqlSetFromParam(column, param) {
-  return `${column} = IF(:${param} IS NULL, ${column}, ${sqlCastParam(param)})`;
+  return `${column} = CASE WHEN :${param} IS NULL THEN ${column} ELSE ${sqlCastParam(param)} END`;
 }
 
 export async function fetchAgentDetail(userId) {
@@ -137,7 +137,7 @@ export async function updateAgentDetails(userId, body) {
        ${sqlSetFromParam('phone', 'phone')},
        ${sqlSetFromParam('account_status', 'account_status')},
        ${sqlSetFromParam('onboarding_status', 'onboarding_status')},
-       is_active = IF(:is_active IS NULL, is_active, :is_active)
+       is_active = CASE WHEN :is_active IS NULL THEN is_active ELSE :is_active END
      WHERE id = :id AND ${sqlLiteralEquals('role', 'agent')}`,
     {
       id: userId,
@@ -217,7 +217,7 @@ export async function updateEmployeeDetails(userId, body) {
        ${sqlSetFromParam('phone', 'phone')},
        ${sqlSetFromParam('account_status', 'account_status')},
        ${sqlSetFromParam('onboarding_status', 'onboarding_status')},
-       is_active = IF(:is_active IS NULL, is_active, :is_active)
+       is_active = CASE WHEN :is_active IS NULL THEN is_active ELSE :is_active END
      WHERE id = :id AND ${sqlLiteralEquals('role', 'employee')}`,
     {
       id: userId,

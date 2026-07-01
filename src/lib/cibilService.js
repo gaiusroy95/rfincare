@@ -53,7 +53,7 @@ export async function updateCibilVendor(vendorKey, payload, updatedBy) {
          sandbox_mode = COALESCE(:sandbox, sandbox_mode),
          is_active = COALESCE(:active, is_active),
          updated_by = :by,
-         updated_at = NOW(3)
+         updated_at = NOW()
      WHERE vendor_key = :key`,
     {
       key: vendorKey,
@@ -65,10 +65,10 @@ export async function updateCibilVendor(vendorKey, payload, updatedBy) {
     },
   );
   if (payload.isActive) {
-    await pool.execute(`UPDATE cibil_vendors SET is_active = 0 WHERE vendor_key != :key`, {
+    await pool.execute(`UPDATE cibil_vendors SET is_active = FALSE WHERE vendor_key != :key`, {
       key: vendorKey,
     });
-    await pool.execute(`UPDATE cibil_vendors SET is_active = 1 WHERE vendor_key = :key`, {
+    await pool.execute(`UPDATE cibil_vendors SET is_active = TRUE WHERE vendor_key = :key`, {
       key: vendorKey,
     });
   }
@@ -77,7 +77,7 @@ export async function updateCibilVendor(vendorKey, payload, updatedBy) {
 
 async function getActiveVendor(pool) {
   const [[row]] = await pool.execute(
-    `SELECT * FROM cibil_vendors WHERE is_active = 1 LIMIT 1`,
+    `SELECT * FROM cibil_vendors WHERE is_active = TRUE LIMIT 1`,
   );
   return row;
 }
@@ -173,7 +173,7 @@ export async function pullCibilForApplication(applicationId, { forceSandbox = fa
 
   await pool.execute(
     `UPDATE loan_applications
-     SET cibil_status = :status, cibil_checked_at = NOW(3)
+     SET cibil_status = :status, cibil_checked_at = NOW()
      WHERE id = :id`,
     { id: applicationId, status: result.status },
   );

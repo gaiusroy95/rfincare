@@ -178,17 +178,17 @@ async function resolveRequirementsForApplication(pool, applicationId) {
   const [rows] = await pool.execute(
     `SELECT *
      FROM document_requirements
-     WHERE is_active = 1
+     WHERE is_active = TRUE
        AND (bank_id = :bank_id OR bank_id IS NULL)
        AND (
-         LOWER(CONVERT(COALESCE(product_type, '') USING utf8mb4)) COLLATE utf8mb4_unicode_ci
-           = LOWER(CONVERT(COALESCE(:product_type, '') USING utf8mb4)) COLLATE utf8mb4_unicode_ci
+         LOWER(CAST(COALESCE(product_type, '') AS TEXT))
+           = LOWER(CAST(COALESCE(:product_type, '') AS TEXT))
          OR product_type IS NULL
          OR product_type = ''
        )
        AND (
-         LOWER(CONVERT(COALESCE(loan_type, '') USING utf8mb4)) COLLATE utf8mb4_unicode_ci
-           = LOWER(CONVERT(COALESCE(:loan_type, '') USING utf8mb4)) COLLATE utf8mb4_unicode_ci
+         LOWER(CAST(COALESCE(loan_type, '') AS TEXT))
+           = LOWER(CAST(COALESCE(:loan_type, '') AS TEXT))
          OR loan_type IS NULL
          OR loan_type = ''
        )
@@ -245,11 +245,11 @@ documentsRouter.get(
       if (search) {
         const phoneDigits = search.replace(/\D/g, '');
         searchClause = `AND (
-          la.application_number COLLATE utf8mb4_unicode_ci LIKE CONVERT(:search USING utf8mb4) COLLATE utf8mb4_unicode_ci
-          OR la.id COLLATE utf8mb4_unicode_ci LIKE CONVERT(:search USING utf8mb4) COLLATE utf8mb4_unicode_ci
-          OR up.full_name COLLATE utf8mb4_unicode_ci LIKE CONVERT(:search USING utf8mb4) COLLATE utf8mb4_unicode_ci
-          OR up.email COLLATE utf8mb4_unicode_ci LIKE CONVERT(:search USING utf8mb4) COLLATE utf8mb4_unicode_ci
-          OR up.phone COLLATE utf8mb4_unicode_ci LIKE CONVERT(:search USING utf8mb4) COLLATE utf8mb4_unicode_ci
+          la.application_number LIKE CAST(:search AS TEXT)
+          OR la.id LIKE CAST(:search AS TEXT)
+          OR up.full_name LIKE CAST(:search AS TEXT)
+          OR up.email LIKE CAST(:search AS TEXT)
+          OR up.phone LIKE CAST(:search AS TEXT)
           OR REPLACE(REPLACE(REPLACE(up.phone, ' ', ''), '-', ''), '+', '') LIKE :phone_digits
         )`;
         params.search = `%${search}%`;
@@ -602,7 +602,7 @@ documentsRouter.patch(
              status = :status,
              verification_notes = :notes,
              verified_by = :verified_by,
-             verified_at = NOW(3)
+             verified_at = NOW()
          WHERE id = :id`,
         {
           id: req.params.id,

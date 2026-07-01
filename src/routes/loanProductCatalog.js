@@ -3,7 +3,7 @@ import { z } from 'zod';
 
 import { authenticate } from '../middleware/authenticate.js';
 import { requireRoles } from '../middleware/requireRoles.js';
-import { getPool } from '../db/pool.js';
+import { getPool, isDuplicateEntryError, isDuplicateColumnError, isNoSuchTableError, isIgnorableMigrationError, isTableExistsError, isBadFieldError } from '../db/pool.js';
 import { newId } from '../lib/ids.js';
 import {
   createProductCategory,
@@ -171,7 +171,7 @@ loanProductCatalogRouter.get('/', async (req, res, next) => {
     const pool = getPool();
     const [rows] = await pool.execute(
       `${CATALOG_SELECT}
-       WHERE c.is_active = 1 AND c.bank_id IS NULL
+       WHERE c.is_active = TRUE AND c.bank_id IS NULL
        ORDER BY c.sort_order ASC, c.label ASC`,
     );
     res.json(rows.map(formatRow));
@@ -306,7 +306,7 @@ loanProductCatalogRouter.post(
       const [[row]] = await pool.execute(`${CATALOG_SELECT} WHERE c.id = :id LIMIT 1`, { id });
       res.status(201).json(formatRow(row));
     } catch (err) {
-      if (err?.code === 'ER_DUP_ENTRY') {
+      if (isDuplicateEntryError(err)) {
         err.status = 409;
         err.message = 'A product with this slug or API key already exists';
       }
@@ -423,7 +423,7 @@ loanProductCatalogRouter.patch(
       });
       res.json(formatRow(row));
     } catch (err) {
-      if (err?.code === 'ER_DUP_ENTRY') {
+      if (isDuplicateEntryError(err)) {
         err.status = 409;
         err.message = 'A product with this slug or API key already exists';
       }

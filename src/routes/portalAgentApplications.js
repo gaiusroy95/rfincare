@@ -217,7 +217,7 @@ portalAgentApplicationsRouter.patch('/applications/:id', async (req, res, next) 
         status = COALESCE(:status, status),
         selected_bank_id = COALESCE(:selected_bank_id, selected_bank_id),
         data = :data,
-        updated_at = NOW(3)
+        updated_at = NOW()
        WHERE id = :id`,
       {
         id: req.params.id,
@@ -245,7 +245,7 @@ portalAgentApplicationsRouter.post('/applications/:id/submit', async (req, res, 
        SET status = 'submitted',
            document_stage_status = COALESCE(document_stage_status, 'documents_pending'),
            bank_approval_status = 'submitted_to_bank',
-           submitted_at = NOW(3)
+           submitted_at = NOW()
        WHERE id = :id`,
       { id: req.params.id },
     );

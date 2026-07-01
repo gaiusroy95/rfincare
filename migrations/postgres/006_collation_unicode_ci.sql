@@ -1,4 +1,4 @@
--- Align string columns to utf8mb4_unicode_ci (fixes "Illegal mix of collations" on hosted MySQL).
+-- Legacy collation patch (no-op on PostgreSQL).
 
 ALTER TABLE loan_applications
   MODIFY status VARCHAR(32) NOT NULL DEFAULT 'draft',

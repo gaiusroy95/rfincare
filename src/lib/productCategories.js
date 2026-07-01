@@ -1,5 +1,4 @@
-import { skipRuntimeSchemaOnPostgres } from '../db/ensureHelpers.js';
-import { getPool } from '../db/pool.js';
+import { getPool, isDuplicateEntryError } from '../db/pool.js';
 import { newId } from './ids.js';
 
 let ensured = false;
@@ -55,40 +54,7 @@ function slugify(input) {
 
 export async function ensureProductCategorySchema() {
   if (ensured) return;
-  if (skipRuntimeSchemaOnPostgres()) {
-    ensured = true;
-    return;
-  }
   const pool = getPool();
-
-  await pool.execute(`
-    CREATE TABLE IF NOT EXISTS product_categories (
-      id CHAR(36) NOT NULL,
-      slug VARCHAR(64) NOT NULL,
-      label VARCHAR(255) NOT NULL,
-      parent_loan_type VARCHAR(64) NULL,
-      sort_order INT NOT NULL DEFAULT 0,
-      is_active TINYINT(1) NOT NULL DEFAULT 1,
-      created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-      updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-      PRIMARY KEY (id),
-      UNIQUE KEY uq_product_categories_slug (slug),
-      KEY idx_product_categories_active (is_active, sort_order)
-    )
-  `);
-
-  const catalogAlters = [
-    'ADD COLUMN category_id CHAR(36) NULL AFTER api_key',
-    'ADD COLUMN bank_id CHAR(36) NULL AFTER category_id',
-    'ADD COLUMN bank_product_id CHAR(36) NULL AFTER bank_id',
-  ];
-  for (const ddl of catalogAlters) {
-    try {
-      await pool.execute(`ALTER TABLE loan_product_catalog ${ddl}`);
-    } catch (err) {
-      if (err.code !== 'ER_DUP_FIELDNAME') throw err;
-    }
-  }
 
   for (const cat of DEFAULT_PRODUCT_CATEGORIES) {
     const [[existing]] = await pool.execute(
@@ -98,7 +64,7 @@ export async function ensureProductCategorySchema() {
     if (existing) continue;
     await pool.execute(
       `INSERT INTO product_categories (id, slug, label, parent_loan_type, sort_order, is_active)
-       VALUES (:id, :slug, :label, :parent_loan_type, :sort_order, 1)`,
+       VALUES (:id, :slug, :label, :parent_loan_type, :sort_order, TRUE)`,
       { id: newId(), ...cat },
     );
   }
@@ -123,7 +89,7 @@ export async function listProductCategories({ includeInactive = false } = {}) {
   const pool = getPool();
   const [rows] = await pool.execute(
     `SELECT * FROM product_categories
-     ${includeInactive ? '' : 'WHERE is_active = 1'}
+     ${includeInactive ? '' : 'WHERE is_active = TRUE'}
      ORDER BY sort_order ASC, label ASC`,
   );
   return rows.map(formatCategoryRow);
@@ -153,7 +119,7 @@ export async function createProductCategory({ label, slug: slugInput, parentLoan
   try {
     await pool.execute(
       `INSERT INTO product_categories (id, slug, label, parent_loan_type, sort_order, is_active)
-       VALUES (:id, :slug, :label, :parent_loan_type, :sort_order, 1)`,
+       VALUES (:id, :slug, :label, :parent_loan_type, :sort_order, TRUE)`,
       {
         id,
         slug,
@@ -163,7 +129,7 @@ export async function createProductCategory({ label, slug: slugInput, parentLoan
       },
     );
   } catch (err) {
-    if (err.code === 'ER_DUP_ENTRY') {
+    if (isDuplicateEntryError(err)) {
       const [[existing]] = await pool.execute(
         `SELECT * FROM product_categories WHERE slug = :slug LIMIT 1`,
         { slug },

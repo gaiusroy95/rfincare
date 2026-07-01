@@ -87,12 +87,12 @@ async function verifyLatestOtp(pool, { agentUserId, purpose, otp }) {
   const [[row]] = await pool.execute(
     `SELECT id, payload FROM agent_profile_otps
      WHERE agent_user_id = :uid AND purpose = :purpose AND otp_hash = :hash
-       AND verified_at IS NULL AND expires_at > NOW(3)
+       AND verified_at IS NULL AND expires_at > NOW()
      ORDER BY created_at DESC LIMIT 1`,
     { uid: agentUserId, purpose, hash: hashOtp(otp) },
   );
   if (!row) return null;
-  await pool.execute(`UPDATE agent_profile_otps SET verified_at = NOW(3) WHERE id = :id`, { id: row.id });
+  await pool.execute(`UPDATE agent_profile_otps SET verified_at = NOW() WHERE id = :id`, { id: row.id });
   let payload = null;
   if (row.payload) {
     try {
@@ -243,7 +243,7 @@ portalAgentProfileRouter.post('/bank/confirm', async (req, res, next) => {
 
     await pool.execute(
       `UPDATE agent_onboarding
-       SET account_number = :acct, bank_name = :bank, ifsc_code = :ifsc, updated_at = NOW(3)
+       SET account_number = :acct, bank_name = :bank, ifsc_code = :ifsc, updated_at = NOW()
        WHERE user_id = :id`,
       {
         id: req.auth.userId,
@@ -451,7 +451,7 @@ portalAgentProfileRouter.post('/deactivate/confirm', async (req, res, next) => {
 
     await pool.execute(
       `UPDATE user_profiles
-       SET is_active = 0, account_status = 'inactive', onboarding_status = 'deactivated'
+       SET is_active = FALSE, account_status = 'inactive', onboarding_status = 'deactivated'
        WHERE id = :id`,
       { id: req.auth.userId },
     );
@@ -460,7 +460,7 @@ portalAgentProfileRouter.post('/deactivate/confirm', async (req, res, next) => {
       { id: req.auth.userId },
     );
     await pool.execute(
-      `UPDATE refresh_tokens SET revoked_at = NOW(3) WHERE user_id = :id AND revoked_at IS NULL`,
+      `UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = :id AND revoked_at IS NULL`,
       { id: req.auth.userId },
     );
 

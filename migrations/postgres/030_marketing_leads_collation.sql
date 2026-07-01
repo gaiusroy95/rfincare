@@ -1,4 +1,4 @@
--- Fix "Illegal mix of collations" on marketing leads / OTP (hosted MySQL defaults).
+-- Legacy collation patch (no-op on PostgreSQL).
 
 ALTER TABLE marketing_leads
   MODIFY full_name VARCHAR(255) NULL,

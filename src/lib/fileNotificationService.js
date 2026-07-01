@@ -41,8 +41,7 @@ export async function saveFileNotificationSettings(settings, updatedBy) {
   const pool = getPool();
   await pool.execute(
     `INSERT INTO file_notification_settings (id, settings_json, updated_by, updated_at)
-     VALUES ('default', :json, :by, NOW(3))
-     ON DUPLICATE KEY UPDATE settings_json = VALUES(settings_json), updated_by = VALUES(updated_by), updated_at = VALUES(updated_at)`,
+     VALUES ('default', :json, :by, NOW()) ON CONFLICT (id) DO UPDATE SET settings_json = EXCLUDED.settings_json, updated_by = EXCLUDED.updated_by, updated_at = EXCLUDED.updated_at`,
     { json: JSON.stringify(settings), by: updatedBy || null },
   );
   return getFileNotificationSettings();
@@ -176,7 +175,7 @@ export async function dispatchFileUpdateNotification(eventKey, { applicationId, 
     results.channels.push(...ch);
   } else if (shouldNotify(rule, 'employee')) {
     const [employees] = await pool.execute(
-      `SELECT id, email, phone FROM user_profiles WHERE role = 'employee' AND is_active = 1 LIMIT 20`,
+      `SELECT id, email, phone FROM user_profiles WHERE role = 'employee' AND is_active = TRUE LIMIT 20`,
     );
     for (const emp of employees) {
       await createStaffNotificationLocal(pool, {

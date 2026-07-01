@@ -35,7 +35,7 @@ async function seedAdmin() {
       await pool.execute(
         `UPDATE user_profiles SET
            role = 'super_admin',
-           is_active = 1,
+           is_active = TRUE,
            account_status = 'active',
            failed_login_attempts = 0,
            locked_until = NULL
@@ -49,7 +49,7 @@ async function seedAdmin() {
       );
 
       await pool.execute(
-        "INSERT INTO user_profiles (id, email, full_name, role, account_status, is_active) VALUES (:id, :email, 'System Admin', 'super_admin', 'active', 1)",
+        "INSERT INTO user_profiles (id, email, full_name, role, account_status, is_active) VALUES (:id, :email, 'System Admin', 'super_admin', 'active', TRUE)",
         { id: adminId, email: adminEmail },
       );
     }

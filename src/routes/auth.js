@@ -3,7 +3,7 @@ import bcrypt from 'bcryptjs';
 import crypto from 'node:crypto';
 import { z } from 'zod';
 
-import { getPool } from '../db/pool.js';
+import { getPool, isDuplicateEntryError, isDuplicateColumnError, isNoSuchTableError, isIgnorableMigrationError, isTableExistsError, isBadFieldError } from '../db/pool.js';
 import { newId } from '../lib/ids.js';
 import { sha256Hex } from '../lib/crypto.js';
 import { signAccessToken, signRefreshToken, verifyRefreshToken } from '../lib/jwt.js';
@@ -120,7 +120,7 @@ authRouter.post('/signup', async (req, res, next) => {
       }),
     );
   } catch (err) {
-    if (err?.code === 'ER_DUP_ENTRY') {
+    if (isDuplicateEntryError(err)) {
       err.status = 409;
       err.message = 'Email already exists';
     }
@@ -635,7 +635,7 @@ authRouter.post('/forgot-password/confirm', async (req, res, next) => {
     const [[otpRow]] = await pool.execute(
       `SELECT id FROM lead_otps
        WHERE email = :email AND otp_hash = :hash
-         AND purpose = 'password_reset' AND verified_at IS NULL AND expires_at > NOW(3)
+         AND purpose = 'password_reset' AND verified_at IS NULL AND expires_at > NOW()
        ORDER BY created_at DESC LIMIT 1`,
       { email: input.email.toLowerCase(), hash: hashOtp(input.otp) },
     );
@@ -657,9 +657,9 @@ authRouter.post('/forgot-password/confirm', async (req, res, next) => {
       ph: hashed,
       id: user.id,
     });
-    await pool.execute(`UPDATE lead_otps SET verified_at = NOW(3) WHERE id = :id`, { id: otpRow.id });
+    await pool.execute(`UPDATE lead_otps SET verified_at = NOW() WHERE id = :id`, { id: otpRow.id });
     await pool.execute(
-      `UPDATE refresh_tokens SET revoked_at = NOW(3) WHERE user_id = :id AND revoked_at IS NULL`,
+      `UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = :id AND revoked_at IS NULL`,
       { id: user.id },
     );
 
@@ -761,7 +761,7 @@ authRouter.post('/application/verify-otp', async (req, res, next) => {
     const [[otpRow]] = await pool.execute(
       `SELECT id FROM lead_otps
        WHERE phone = :phone AND otp_hash = :hash AND purpose = 'application_submit'
-         AND verified_at IS NULL AND expires_at > NOW(3)
+         AND verified_at IS NULL AND expires_at > NOW()
        ORDER BY created_at DESC LIMIT 1`,
       { phone, hash: hashOtp(input.otp) },
     );
@@ -770,7 +770,7 @@ authRouter.post('/application/verify-otp', async (req, res, next) => {
       return res.status(401).json({ error: 'Invalid or expired OTP' });
     }
 
-    await pool.execute(`UPDATE lead_otps SET verified_at = NOW(3) WHERE id = :id`, { id: otpRow.id });
+    await pool.execute(`UPDATE lead_otps SET verified_at = NOW() WHERE id = :id`, { id: otpRow.id });
 
     let [[profile]] = await pool.execute(
       `SELECT id, email, role FROM user_profiles

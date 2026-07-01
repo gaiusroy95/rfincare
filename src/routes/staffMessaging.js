@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 
-import { getPool } from '../db/pool.js';
+import { getPool, isDuplicateEntryError, isDuplicateColumnError, isNoSuchTableError, isIgnorableMigrationError, isTableExistsError, isBadFieldError } from '../db/pool.js';
 import { newId } from '../lib/ids.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { authorize } from '../middleware/authorize.js';
@@ -376,7 +376,7 @@ adminHierarchyRouter.post(
 
       res.status(201).json({ id });
     } catch (err) {
-      if (err?.code === 'ER_DUP_ENTRY') {
+      if (isDuplicateEntryError(err)) {
         return res.status(409).json({ error: 'This agent is already mapped to that employee' });
       }
       next(err);
@@ -577,7 +577,7 @@ staffCommunicationRouter.get('/messages', async (req, res, next) => {
     }
 
     await pool.execute(
-      `UPDATE staff_messages SET read_at = NOW(3)
+      `UPDATE staff_messages SET read_at = NOW()
        WHERE recipient_id = :userId AND read_at IS NULL
        AND ${messagePairSql()}`,
       { ...threadParams, userId: req.auth.userId },

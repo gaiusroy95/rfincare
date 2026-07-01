@@ -1,11 +1,5 @@
-import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-
-import { skipRuntimeSchemaOnPostgres } from '../db/ensureHelpers.js';
 import { getPool } from '../db/pool.js';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
 const SETTINGS_ID = 'default';
 let ensured = false;
 
@@ -65,30 +59,6 @@ function parseOffices(value) {
 }
 
 export async function ensureSiteContactSchema() {
-  if (ensured) return;
-  if (skipRuntimeSchemaOnPostgres()) {
-    ensured = true;
-    return;
-  }
-  const sql = readFileSync(
-    join(__dirname, '../../migrations/010_site_contact_settings.sql'),
-    'utf8',
-  );
-  const pool = getPool();
-  const statements = sql
-    .split(';')
-    .map((s) => s.trim())
-    .filter((s) => s && !s.startsWith('--'));
-
-  for (const statement of statements) {
-    try {
-      await pool.execute(statement);
-    } catch (err) {
-      if (err.code !== 'ER_TABLE_EXISTS_ERROR' && err.code !== 'ER_DUP_ENTRY') {
-        throw err;
-      }
-    }
-  }
   ensured = true;
 }
 
@@ -164,23 +134,21 @@ export async function updateSiteContactSettings(input, updatedBy) {
        :id, :tagline, :email, :phone, :emails_json, :phones_json,
        :reg_label, :reg_addr, :branch_label, :branch_addr, :offices_json,
        :fb, :tw, :li, :ig, :updated_by
-     )
-     ON DUPLICATE KEY UPDATE
-       tagline = VALUES(tagline),
-       email = VALUES(email),
-       phone = VALUES(phone),
-       emails_json = VALUES(emails_json),
-       phones_json = VALUES(phones_json),
-       registered_office_label = VALUES(registered_office_label),
-       registered_address = VALUES(registered_address),
-       branch_office_label = VALUES(branch_office_label),
-       branch_address = VALUES(branch_address),
-       offices_json = VALUES(offices_json),
-       social_facebook = VALUES(social_facebook),
-       social_twitter = VALUES(social_twitter),
-       social_linkedin = VALUES(social_linkedin),
-       social_instagram = VALUES(social_instagram),
-       updated_by = VALUES(updated_by)`,
+     ) ON CONFLICT (id) DO UPDATE SET tagline = EXCLUDED.tagline,
+       email = EXCLUDED.email,
+       phone = EXCLUDED.phone,
+       emails_json = EXCLUDED.emails_json,
+       phones_json = EXCLUDED.phones_json,
+       registered_office_label = EXCLUDED.registered_office_label,
+       registered_address = EXCLUDED.registered_address,
+       branch_office_label = EXCLUDED.branch_office_label,
+       branch_address = EXCLUDED.branch_address,
+       offices_json = EXCLUDED.offices_json,
+       social_facebook = EXCLUDED.social_facebook,
+       social_twitter = EXCLUDED.social_twitter,
+       social_linkedin = EXCLUDED.social_linkedin,
+       social_instagram = EXCLUDED.social_instagram,
+       updated_by = EXCLUDED.updated_by`,
     {
       id: SETTINGS_ID,
       tagline: input.tagline ?? DEFAULTS.tagline,

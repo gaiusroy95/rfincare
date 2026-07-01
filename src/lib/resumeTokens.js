@@ -71,7 +71,7 @@ export async function resolveResumeToken(token) {
   if (row.used_at) return { error: 'already_used' };
   if (new Date(row.expires_at) < new Date()) return { error: 'expired' };
 
-  await pool.execute(`UPDATE application_resume_tokens SET used_at = NOW(3) WHERE token_hash = :hash`, {
+  await pool.execute(`UPDATE application_resume_tokens SET used_at = NOW() WHERE token_hash = :hash`, {
     hash: hashResumeToken(token),
   });
 
@@ -145,7 +145,7 @@ export async function ensureLeadDraftSession(pool, lead) {
   );
 
   await pool.execute(
-    `UPDATE marketing_leads SET session_key = :sk, updated_at = NOW(3) WHERE id = :id`,
+    `UPDATE marketing_leads SET session_key = :sk, updated_at = NOW() WHERE id = :id`,
     { sk: sessionKey, id: leadId },
   );
 
@@ -175,7 +175,7 @@ export async function upsertLeadFromDraft({ sessionKey, formData, loanType, curr
          status = :status,
          session_key = :sk,
          application_id = COALESCE(:app_id, application_id),
-         updated_at = NOW(3)
+         updated_at = NOW()
        WHERE id = :id`,
       {
         id: existing.id,

@@ -13,7 +13,7 @@ function buildPageStream(pageLines) {
   // `Td` moves relative to the start of the PREVIOUS text line, so the start
   // position is set once and each subsequent line only advances by LINE_HEIGHT.
   // Re-issuing an absolute-style `50 <y> Td` per line would accumulate offsets
-  // and push every line after the first off the page (blank PDF symptom).
+  // and push every line  first off the page (blank PDF symptom).
   const contentParts = ['BT', '/F1 11 Tf', `50 ${START_Y} Td`];
   let isFirstLine = true;
   for (const line of pageLines) {

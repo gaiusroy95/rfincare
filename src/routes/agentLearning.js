@@ -93,7 +93,7 @@ async function fetchLearningForAgent(pool, agentUserId) {
      FROM agent_learning_content c
      LEFT JOIN agent_learning_progress p
        ON p.content_id = c.id AND p.agent_user_id = :agentId
-     WHERE c.is_active = 1 AND c.audience IN ('agent', 'all')
+     WHERE c.is_active = TRUE AND c.audience IN ('agent', 'all')
      ORDER BY c.is_new DESC, c.sort_order ASC, c.created_at DESC`,
     { agentId: agentUserId },
   );
@@ -294,7 +294,7 @@ adminAgentLearningRouter.delete(
       await ensureAgentLearningSchema();
       const pool = getPool();
       await pool.execute(
-        `UPDATE agent_learning_content SET is_active = 0 WHERE id = :id`,
+        `UPDATE agent_learning_content SET is_active = FALSE WHERE id = :id`,
         { id: req.params.id },
       );
       res.json({ ok: true });
@@ -334,7 +334,7 @@ async function lookupCommissionCircular(pool, rawId) {
   const [[row]] = await pool.execute(
     `SELECT title, file_name, file_path, file_url
      FROM agent_commission_circulars
-     WHERE id = :id AND is_active = 1
+     WHERE id = :id AND is_active = TRUE
      LIMIT 1`,
     { id },
   );
@@ -392,7 +392,7 @@ portalAgentLearningRouter.get('/content/:id/file', async (req, res, next) => {
     const [[row]] = await pool.execute(
       `SELECT id, title, file_name, file_path, file_url, mime_type, content_type
        FROM agent_learning_content
-       WHERE id = :id AND is_active = 1 AND audience IN ('agent', 'all')
+       WHERE id = :id AND is_active = TRUE AND audience IN ('agent', 'all')
        LIMIT 1`,
       { id: req.params.id },
     );
@@ -437,7 +437,7 @@ portalAgentLearningRouter.post('/:id/progress', async (req, res, next) => {
     const contentId = req.params.id;
 
     const [[content]] = await pool.execute(
-      `SELECT id FROM agent_learning_content WHERE id = :id AND is_active = 1 AND audience IN ('agent', 'all') LIMIT 1`,
+      `SELECT id FROM agent_learning_content WHERE id = :id AND is_active = TRUE AND audience IN ('agent', 'all') LIMIT 1`,
       { id: contentId },
     );
     if (!content) return res.status(404).json({ error: 'Content not found' });
@@ -445,11 +445,9 @@ portalAgentLearningRouter.post('/:id/progress', async (req, res, next) => {
     const progressId = newId();
     await pool.execute(
       `INSERT INTO agent_learning_progress (id, agent_user_id, content_id, progress_percent, completed_at)
-       VALUES (:id, :agent_id, :content_id, :progress, :completed_at)
-       ON DUPLICATE KEY UPDATE
-         progress_percent = :progress,
+       VALUES (:id, :agent_id, :content_id, :progress, :completed_at) ON CONFLICT (id) DO UPDATE SET progress_percent = :progress,
          completed_at = :completed_at,
-         updated_at = NOW(3)`,
+         updated_at = NOW()`,
       {
         id: progressId,
         agent_id: req.auth.userId,

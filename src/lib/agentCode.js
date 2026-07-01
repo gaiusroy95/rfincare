@@ -35,9 +35,9 @@ export function isValidAgentCode(code) {
 
 async function nextSequenceNumber(pool) {
   const [[row]] = await pool.execute(
-    `SELECT COALESCE(MAX(CAST(SUBSTRING(agent_code, 5) AS UNSIGNED)), 0) AS max_seq
+    `SELECT COALESCE(MAX(CAST(SUBSTRING(agent_code FROM 5) AS INTEGER)), 0) AS max_seq
      FROM agent_onboarding
-     WHERE agent_code REGEXP '^RFA-[0-9]{6}$'`,
+     WHERE agent_code ~ '^RFA-[0-9]{6}$'`,
   );
   return Number(row?.max_seq || 0) + 1;
 }
@@ -46,9 +46,9 @@ async function nextFySequenceNumber(pool, fyLabel) {
   const fy = String(fyLabel || getIndianFinancialYearLabel()).trim();
   const pattern = `^RFA-${fy}-[0-9]{4}$`;
   const [[row]] = await pool.execute(
-    `SELECT COALESCE(MAX(CAST(SUBSTRING_INDEX(agent_code, '-', -1) AS UNSIGNED)), 0) AS max_seq
+    `SELECT COALESCE(MAX(CAST(split_part(agent_code, '-', 3) AS INTEGER)), 0) AS max_seq
      FROM agent_onboarding
-     WHERE agent_code REGEXP :pattern`,
+     WHERE agent_code ~ :pattern`,
     { pattern },
   );
   return Number(row?.max_seq || 0) + 1;
@@ -107,7 +107,7 @@ export async function ensureAgentCodeForUser(connOrPool, userId) {
 
   const code = await reserveUniqueAgentCode(pool);
   await pool.execute(
-    `UPDATE agent_onboarding SET agent_code = ${sqlCastParam('code')}, updated_at = NOW(3)
+    `UPDATE agent_onboarding SET agent_code = ${sqlCastParam('code')}, updated_at = NOW()
      WHERE user_id = :id
        AND (agent_code IS NULL OR LENGTH(TRIM(agent_code)) = 0)`,
     { code, id: userId },

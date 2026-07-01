@@ -1,5 +1,4 @@
 import { newId } from './ids.js';
-import { ensureLeadCollation } from '../db/ensureLeadCollation.js';
 import { sqlCastParam, sqlParamEquals, sqlParamEqualsLower } from './sqlCollation.js';
 
 export function normalizeLeadEmail(email) {
@@ -12,12 +11,7 @@ export function normalizeLeadPhone(phone) {
   return digits;
 }
 
-/**
- * Find the most recently updated lead for the same contact (email + phone) or session.
- */
 export async function findMarketingLeadByContact(pool, { email, phone, sessionKey }) {
-  await ensureLeadCollation();
-
   if (sessionKey) {
     const [[row]] = await pool.execute(
       `SELECT * FROM marketing_leads WHERE ${sqlParamEquals('session_key', 'sk')} LIMIT 1`,
@@ -44,9 +38,6 @@ export async function findMarketingLeadByContact(pool, { email, phone, sessionKe
   return null;
 }
 
-/**
- * Create or update a marketing lead keyed by email + phone (or session).
- */
 export async function upsertMarketingLead(
   pool,
   {
@@ -61,8 +52,6 @@ export async function upsertMarketingLead(
     applicationId = null,
   },
 ) {
-  await ensureLeadCollation();
-
   const normalizedEmail = normalizeLeadEmail(email);
   const normalizedPhone = normalizeLeadPhone(phone);
   const trimmedName = String(fullName || '').trim();
@@ -72,24 +61,24 @@ export async function upsertMarketingLead(
     sessionKey,
   });
 
-  const consent = consentAccepted ? 1 : 0;
+  const consent = Boolean(consentAccepted);
 
   if (existing) {
     await pool.execute(
       `UPDATE marketing_leads SET
-         full_name = IF(:use_name = 1, ${sqlCastParam('full_name')}, full_name),
+         full_name = CASE WHEN :use_name THEN ${sqlCastParam('full_name')} ELSE full_name END,
          email = ${sqlCastParam('email')},
          phone = ${sqlCastParam('phone')},
-         loan_type = IF(:loan_type IS NULL, loan_type, ${sqlCastParam('loan_type')}),
-         source = IF(:source IS NULL, source, ${sqlCastParam('source')}),
-         consent_accepted = GREATEST(consent_accepted, :consent),
-         session_key = IF(:session_key IS NULL, session_key, ${sqlCastParam('session_key')}),
-         application_id = IF(:application_id IS NULL, application_id, :application_id),
-         updated_at = NOW(3)
+         loan_type = CASE WHEN :loan_type IS NULL THEN loan_type ELSE ${sqlCastParam('loan_type')} END,
+         source = CASE WHEN :source IS NULL THEN source ELSE ${sqlCastParam('source')} END,
+         consent_accepted = consent_accepted OR :consent,
+         session_key = CASE WHEN :session_key IS NULL THEN session_key ELSE ${sqlCastParam('session_key')} END,
+         application_id = CASE WHEN :application_id IS NULL THEN application_id ELSE :application_id END,
+         updated_at = NOW()
        WHERE id = :id`,
       {
         id: existing.id,
-        use_name: trimmedName ? 1 : 0,
+        use_name: Boolean(trimmedName),
         full_name: trimmedName,
         email: normalizedEmail,
         phone: normalizedPhone,
@@ -113,7 +102,7 @@ export async function upsertMarketingLead(
        id, full_name, email, phone, loan_type, source, status, consent_accepted, session_key, application_id
      ) VALUES (
        :id,
-       IF(:use_name = 1, ${sqlCastParam('full_name')}, NULL),
+       CASE WHEN :use_name THEN ${sqlCastParam('full_name')} ELSE NULL END,
        ${sqlCastParam('email')},
        ${sqlCastParam('phone')},
        ${sqlCastParam('loan_type')},
@@ -125,7 +114,7 @@ export async function upsertMarketingLead(
      )`,
     {
       id,
-      use_name: trimmedName ? 1 : 0,
+      use_name: Boolean(trimmedName),
       full_name: trimmedName,
       email: normalizedEmail,
       phone: normalizedPhone,

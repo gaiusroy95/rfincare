@@ -52,15 +52,13 @@ export async function registerPushToken({
     `INSERT INTO push_device_tokens (
        id, user_id, role, expo_push_token, platform, app_variant, is_active, updated_at
      ) VALUES (
-       :id, :uid, :role, :token, :platform, :variant, 1, NOW(3)
-     )
-     ON DUPLICATE KEY UPDATE
-       user_id = VALUES(user_id),
-       role = VALUES(role),
-       platform = VALUES(platform),
-       app_variant = VALUES(app_variant),
-       is_active = 1,
-       updated_at = NOW(3)`,
+       :id, :uid, :role, :token, :platform, :variant, 1, NOW()
+     ) ON CONFLICT (expo_push_token) DO UPDATE SET user_id = EXCLUDED.user_id,
+       role = EXCLUDED.role,
+       platform = EXCLUDED.platform,
+       app_variant = EXCLUDED.app_variant,
+       is_active = TRUE,
+       updated_at = NOW()`,
     {
       id,
       uid: userId,
@@ -78,7 +76,7 @@ export async function unregisterPushToken(expoPushToken) {
   await ensurePushNotificationSchema();
   const pool = getPool();
   await pool.execute(
-    `UPDATE push_device_tokens SET is_active = 0, updated_at = NOW(3) WHERE expo_push_token = :token`,
+    `UPDATE push_device_tokens SET is_active = FALSE, updated_at = NOW() WHERE expo_push_token = :token`,
     { token: expoPushToken },
   );
 }
@@ -90,7 +88,7 @@ export async function sendExpoPushToUser(userId, { title, body, data = {} }) {
   await ensurePushNotificationSchema();
   const pool = getPool();
   const [tokens] = await pool.execute(
-    `SELECT expo_push_token FROM push_device_tokens WHERE user_id = :uid AND is_active = 1`,
+    `SELECT expo_push_token FROM push_device_tokens WHERE user_id = :uid AND is_active = TRUE`,
     { uid: userId },
   );
   if (!tokens.length) return { skipped: true, reason: 'no_tokens' };

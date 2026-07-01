@@ -10,8 +10,6 @@ import { ensurePushNotificationSchema } from './db/ensurePushNotificationSchema.
 import { ensurePartnerRegistrationSchema } from './db/ensurePartnerRegistrationSchema.js';
 import { ensureTranslationCacheSchema } from './db/ensureTranslationCacheSchema.js';
 import { ensureMarketingSchema } from './lib/marketingSettings.js';
-import { ensureLeadCollation } from './db/ensureLeadCollation.js';
-import { ensureStaffOnboardingCollation } from './db/ensureOnboardingSchema.js';
 import { getPool } from './db/pool.js';
 import { getUploadDir } from './lib/uploadPaths.js';
 import { isCloudStorage } from './lib/storage/index.js';
@@ -42,8 +40,6 @@ async function bootstrap() {
     await ensurePartnerRegistrationSchema();
     await ensureTranslationCacheSchema();
     await ensureMarketingSchema();
-    await ensureStaffOnboardingCollation();
-    await ensureLeadCollation();
   } catch (err) {
     // eslint-disable-next-line no-console
     console.warn('[api] milestone4 schema bootstrap:', err.message);

@@ -185,7 +185,7 @@ publicContentRouter.post('/success-stories', storyPhotoUpload.single('photo'), a
     );
     res.status(201).json({ id, status: 'pending', photoUrl });
   } catch (err) {
-    if (err?.code === 'ER_BAD_FIELD_ERROR' && String(err?.message || '').includes('photo_url')) {
+    if (isBadFieldError(err) && String(err?.message || '').includes('photo_url')) {
       err.status = 500;
       err.message = 'Database missing photo_url column. Run: npm run db:migrate';
     }
@@ -355,7 +355,7 @@ publicContentRouter.post('/draft-recovery/verify', async (req, res, next) => {
     const [[otpRow]] = await pool.execute(
       `SELECT id, lead_id FROM lead_otps
        WHERE email = :email AND phone = :phone AND otp_hash = :hash
-         AND purpose = 'draft_resume' AND verified_at IS NULL AND expires_at > NOW(3)
+         AND purpose = 'draft_resume' AND verified_at IS NULL AND expires_at > NOW()
        ORDER BY created_at DESC LIMIT 1`,
       { email: input.email, phone, hash: hashOtp(input.otp) },
     );
@@ -364,7 +364,7 @@ publicContentRouter.post('/draft-recovery/verify', async (req, res, next) => {
       return res.status(401).json({ error: 'Invalid or expired OTP' });
     }
 
-    await pool.execute(`UPDATE lead_otps SET verified_at = NOW(3) WHERE id = :id`, { id: otpRow.id });
+    await pool.execute(`UPDATE lead_otps SET verified_at = NOW() WHERE id = :id`, { id: otpRow.id });
 
     const [[lead]] = await pool.execute(
       `SELECT ml.id, ml.session_key
@@ -387,7 +387,7 @@ publicContentRouter.post('/draft-recovery/verify', async (req, res, next) => {
 
     res.json({ resumeUrl: link.url, expiresAt: link.expiresAt });
   } catch (err) {
-    if (err?.code === 'ER_NO_SUCH_TABLE') {
+    if (isNoSuchTableError(err)) {
       err.status = 503;
       err.message = 'Run migration 008_milestone2_resume_tokens.sql';
     }
@@ -416,7 +416,7 @@ publicContentRouter.get('/resume-application/:token', async (req, res, next) => 
       applicationId: resolved.applicationId,
     });
   } catch (err) {
-    if (err?.code === 'ER_NO_SUCH_TABLE') {
+    if (isNoSuchTableError(err)) {
       return res.status(503).json({ error: 'Resume links not enabled on server yet' });
     }
     next(err);

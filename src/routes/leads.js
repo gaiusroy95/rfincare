@@ -16,7 +16,6 @@ import {
   normalizeLeadPhone,
   upsertMarketingLead,
 } from '../lib/marketingLeads.js';
-import { ensureLeadCollation } from '../db/ensureLeadCollation.js';
 import { sqlCastParam, sqlLiteralEquals, sqlParamEquals } from '../lib/sqlCollation.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { hasPermission } from '../auth/permissions.js';
@@ -107,7 +106,6 @@ leadsRouter.get('/otp-settings', async (_req, res, next) => {
 });
 
 async function persistLeadOtps(pool, { leadId, email, phone, settings, mobileOtp, emailOtp }) {
-  await ensureLeadCollation();
   const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
   const otpIds = {};
 
@@ -311,7 +309,6 @@ leadsRouter.post('/verify-otp', async (req, res, next) => {
     }
 
     const pool = getPool();
-    await ensureLeadCollation();
     let smsRow = null;
     let emailRow = null;
 
@@ -330,14 +327,14 @@ leadsRouter.post('/verify-otp', async (req, res, next) => {
              WHERE ${sqlParamEquals('phone', 'phone')}
                AND ${sqlLiteralEquals('purpose', 'lead_verify')}
                AND ${sqlLiteralEquals('channel', 'sms')}
-               AND verified_at IS NULL AND expires_at > NOW(3)
+               AND verified_at IS NULL AND expires_at > NOW()
              ORDER BY created_at DESC LIMIT 1`
           : `SELECT id, lead_id FROM lead_otps
              WHERE ${sqlParamEquals('phone', 'phone')}
                AND ${sqlParamEquals('otp_hash', 'hash')}
                AND ${sqlLiteralEquals('purpose', 'lead_verify')}
                AND ${sqlLiteralEquals('channel', 'sms')}
-               AND verified_at IS NULL AND expires_at > NOW(3)
+               AND verified_at IS NULL AND expires_at > NOW()
              ORDER BY created_at DESC LIMIT 1`,
         devTestOtp
           ? { phone }
@@ -356,14 +353,14 @@ leadsRouter.post('/verify-otp', async (req, res, next) => {
              WHERE ${sqlParamEquals('email', 'email')}
                AND ${sqlLiteralEquals('purpose', 'lead_verify')}
                AND ${sqlLiteralEquals('channel', 'email')}
-               AND verified_at IS NULL AND expires_at > NOW(3)
+               AND verified_at IS NULL AND expires_at > NOW()
              ORDER BY created_at DESC LIMIT 1`
           : `SELECT id, lead_id FROM lead_otps
              WHERE ${sqlParamEquals('email', 'email')}
                AND ${sqlParamEquals('otp_hash', 'hash')}
                AND ${sqlLiteralEquals('purpose', 'lead_verify')}
                AND ${sqlLiteralEquals('channel', 'email')}
-               AND verified_at IS NULL AND expires_at > NOW(3)
+               AND verified_at IS NULL AND expires_at > NOW()
              ORDER BY created_at DESC LIMIT 1`,
         devTestOtp
           ? { email }
@@ -377,7 +374,7 @@ leadsRouter.post('/verify-otp', async (req, res, next) => {
 
     const idsToMark = [smsRow?.id, emailRow?.id].filter(Boolean);
     for (const id of idsToMark) {
-      await pool.execute(`UPDATE lead_otps SET verified_at = NOW(3) WHERE id = :id`, { id });
+      await pool.execute(`UPDATE lead_otps SET verified_at = NOW() WHERE id = :id`, { id });
     }
 
     const targetLeadId =
@@ -390,7 +387,7 @@ leadsRouter.post('/verify-otp', async (req, res, next) => {
       }))?.id;
     if (targetLeadId) {
       await pool.execute(
-        `UPDATE marketing_leads SET consent_verified_at = NOW(3), status = 'verified' WHERE id = :id`,
+        `UPDATE marketing_leads SET consent_verified_at = NOW(), status = 'verified' WHERE id = :id`,
         { id: targetLeadId },
       );
       const [[row]] = await pool.execute(`SELECT * FROM marketing_leads WHERE id = :id`, {
@@ -557,7 +554,7 @@ leadsRouter.post('/drafts/resume-link', async (req, res, next) => {
       ...(process.env.LOG_OTP === 'true' ? { devToken: link.token } : {}),
     });
   } catch (err) {
-    if (err?.code === 'ER_NO_SUCH_TABLE') {
+    if (isNoSuchTableError(err)) {
       err.status = 503;
       err.message = 'Run migration 008_milestone2_resume_tokens.sql';
     }

@@ -77,7 +77,7 @@ export async function buildAgentCommissionReport(agentId, filters = {}) {
   }
   if (filters.loanType && filters.loanType !== 'all') {
     conditions.push(
-      `JSON_UNQUOTE(JSON_EXTRACT(la.data, '$.loan_type')) = :loanType OR JSON_UNQUOTE(JSON_EXTRACT(la.data, '$.loan_purpose')) = :loanType`,
+      `la.data->>'loan_type' = :loanType OR la.data->>'loan_purpose' = :loanType`,
     );
     params.loanType = filters.loanType;
   }

@@ -1,11 +1,7 @@
 import bcrypt from 'bcryptjs';
 import { z } from 'zod';
 
-import { getPool } from '../db/pool.js';
-import {
-  ensureOnboardingSchema,
-  ensureStaffOnboardingCollation,
-} from '../db/ensureOnboardingSchema.js';
+import { getPool, isDuplicateEntryError, isDuplicateColumnError, isNoSuchTableError, isIgnorableMigrationError, isTableExistsError, isBadFieldError } from '../db/pool.js';
 import { newId } from './ids.js';
 import { sendStaffWelcomeEmail } from './email.js';
 import { reserveUniqueAgentCode } from './agentCode.js';
@@ -55,7 +51,6 @@ function normalizeBody(body = {}) {
 
 export async function createAgentAccount(input, createdByUserId, options = {}) {
   await ensureOnboardingSchema();
-  await ensureStaffOnboardingCollation();
   await ensureAgentOnboardingQcSchema();
   const data = CreateAgentSchema.parse(normalizeBody(input));
   const pool = getPool();
@@ -134,7 +129,7 @@ export async function createAgentAccount(input, createdByUserId, options = {}) {
     return row;
   } catch (err) {
     await conn.rollback();
-    if (err?.code === 'ER_DUP_ENTRY') {
+    if (isDuplicateEntryError(err)) {
       const e = new Error('Username, agent code, or email already exists');
       e.status = 409;
       throw e;
@@ -220,7 +215,7 @@ export async function createEmployeeAccount(input, createdByUserId) {
     return row;
   } catch (err) {
     await conn.rollback();
-    if (err?.code === 'ER_DUP_ENTRY') {
+    if (isDuplicateEntryError(err)) {
       const e = new Error('Username, employee code, or email already exists');
       e.status = 409;
       throw e;
