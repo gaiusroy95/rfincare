@@ -1,4 +1,4 @@
-import { getPool } from './pool.js';
+import { getPool, isDuplicateColumnError } from './pool.js';
 
 let ensured = false;
 
@@ -10,7 +10,7 @@ export async function ensureDocumentSchema() {
       'ALTER TABLE customer_documents ADD COLUMN verification_notes TEXT NULL AFTER verification_status',
     );
   } catch (err) {
-    if (err.code !== 'ER_DUP_FIELDNAME') throw err;
+    if (!isDuplicateColumnError(err)) throw err;
   }
   ensured = true;
 }

@@ -6,6 +6,11 @@
   "scripts": {
     "start": "node src/server.js",
     "db:migrate": "node scripts/mysql-apply-migrations.mjs",
+    "db:migrate:postgres": "node scripts/postgres-apply-migrations.mjs",
+    "db:convert:postgres": "node scripts/convert-mysql-migrations-to-postgres.mjs",
+    "db:migrate:data": "node scripts/mysql-to-postgres-data.mjs",
+    "db:migrate:data:dry": "node scripts/mysql-to-postgres-data.mjs --dry-run",
+    "db:migrate:data:full": "node scripts/mysql-to-postgres-data.mjs --truncate",
     "db:patch:story-photo": "node scripts/run-sql-patch.mjs migrations/005_success_stories_photo.sql",
     "db:patch:collation": "node scripts/run-sql-patch.mjs migrations/006_collation_unicode_ci.sql",
     "db:patch:onboarding-collation": "node scripts/run-sql-patch.mjs migrations/029_staff_onboarding_collation.sql",
@@ -19,6 +24,8 @@
     "seed:approval-matrix": "node scripts/seed-approval-matrix.js"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1077.0",
+    "@aws-sdk/s3-request-presigner": "^3.1077.0",
     "axios": "^1.8.4",
     "bcryptjs": "^2.4.3",
     "cookie-parser": "^1.4.6",
@@ -29,6 +36,7 @@
     "multer": "^2.0.2",
     "mysql2": "^3.11.5",
     "nodemailer": "^6.10.1",
+    "pg": "^8.22.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {

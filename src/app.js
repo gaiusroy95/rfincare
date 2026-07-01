@@ -50,6 +50,8 @@ import { creditCardsRouter } from './routes/creditCards.js';
 import { translateRouter } from './routes/translate.js';
 import { getCorsOptions } from './lib/corsOptions.js';
 import { getUploadDir } from './lib/uploadPaths.js';
+import { isCloudStorage } from './lib/storage/index.js';
+import { uploadsRouter } from './routes/uploads.js';
 
 export function createApp({ serveStatic = true } = {}) {
   const __filename = fileURLToPath(import.meta.url);
@@ -112,7 +114,11 @@ export function createApp({ serveStatic = true } = {}) {
   app.use('/translate', translateRouter);
   app.use('/api/translate', translateRouter);
 
-  app.use('/uploads', express.static(getUploadDir()));
+  if (isCloudStorage()) {
+    app.use('/uploads', uploadsRouter);
+  } else {
+    app.use('/uploads', express.static(getUploadDir()));
+  }
   app.use('/uploads', (_req, res) => {
     res.status(404).json({ error: 'Upload not found' });
   });

@@ -1,36 +1,37 @@
-import mysql from 'mysql2/promise';
+import { getDbProvider, isPostgres } from './provider.js';
+import { createMysqlPool } from './mysqlPool.js';
+import { createPostgresPool } from './postgresPool.js';
 
-let pool;
+export { getDbProvider, isPostgres, isMysql } from './provider.js';
+export { isDuplicateColumnError, isIgnorableMigrationError } from './schemaErrors.js';
+export { prepareSql, normalizeMysqlSqlForPostgres, convertNamedParams } from './sqlAdapter.js';
 
 export function getPool() {
-  if (pool) return pool;
-
-  const host = process.env.MYSQL_HOST;
-  const user = process.env.MYSQL_USER;
-  const password = process.env.MYSQL_PASSWORD;
-  const database = process.env.MYSQL_DATABASE;
-  const port = Number(process.env.MYSQL_PORT || 3306);
-
-  if (!host || !user || !database) {
-    throw new Error('Missing MySQL env vars (MYSQL_HOST, MYSQL_USER, MYSQL_DATABASE)');
-  }
-
-  pool = mysql.createPool({
-    host,
-    user,
-    password,
-    database,
-    port,
-    waitForConnections: true,
-    connectionLimit: 10,
-    queueLimit: 0,
-    connectTimeout: Number(process.env.MYSQL_CONNECT_TIMEOUT_MS || 15000),
-    namedPlaceholders: true,
-    decimalNumbers: true,
-    timezone: 'Z',
-    charset: 'utf8mb4_unicode_ci',
-  });
-
-  return pool;
+  return isPostgres() ? createPostgresPool() : createMysqlPool();
 }
 
+export function getDatabaseEnvSummary() {
+  const provider = getDbProvider();
+  if (provider === 'postgres') {
+    const url = process.env.DATABASE_URL || '';
+    let host = null;
+    try {
+      host = url ? new URL(url).hostname : null;
+    } catch {
+      host = null;
+    }
+    return {
+      provider: 'postgres',
+      engine: 'postgresql',
+      host,
+      configured: Boolean(process.env.DATABASE_URL),
+    };
+  }
+
+  return {
+    provider: 'mysql',
+    engine: 'mysql',
+    host: process.env.MYSQL_HOST || null,
+    configured: Boolean(process.env.MYSQL_HOST && process.env.MYSQL_DATABASE),
+  };
+}

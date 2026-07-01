@@ -1,0 +1,12 @@
+CREATE TABLE IF NOT EXISTS push_device_tokens (
+  id CHAR(36) NOT NULL PRIMARY KEY,
+  user_id CHAR(36) NOT NULL,
+  role VARCHAR(32) NOT NULL,
+  expo_push_token VARCHAR(255) NOT NULL,
+  platform VARCHAR(16) NULL,
+  app_variant VARCHAR(32) NOT NULL DEFAULT 'customer',
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT uq_expo_push_token UNIQUE (expo_push_token)
+);

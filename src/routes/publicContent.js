@@ -18,6 +18,7 @@ import {
 import { createResumeToken, resolveResumeToken } from '../lib/resumeTokens.js';
 import { resolveFrontendEnvPath } from '../lib/envPaths.js';
 import { entriesToObject, readEnvFile } from '../lib/envFile.js';
+import { getPlatformArchitecture } from '../lib/architecture.js';
 
 export const publicContentRouter = Router();
 
@@ -56,7 +57,11 @@ publicContentRouter.get('/runtime-config', async (_req, res, next) => {
     const vite = Object.fromEntries(
       Object.entries(vars).filter(([key]) => key.startsWith('VITE_')),
     );
-    res.json({ vite, updatedAt: new Date().toISOString() });
+    res.json({
+      vite,
+      architecture: getPlatformArchitecture(),
+      updatedAt: new Date().toISOString(),
+    });
   } catch (err) {
     next(err);
   }

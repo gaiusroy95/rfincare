@@ -1,13 +1,11 @@
 import { Router } from 'express';
-import multer from 'multer';
 import { z } from 'zod';
 import { basename } from 'node:path';
-import { createReadStream } from 'node:fs';
 import {
-  getUploadDir,
   normalizeStoredUploadName,
-  resolveUploadFilePath,
+  streamStoredUpload,
 } from '../lib/uploadPaths.js';
+import { createUploadMiddleware, spreadUpload } from '../lib/multerUpload.js';
 
 import { authenticate } from '../middleware/authenticate.js';
 import { authorize } from '../middleware/authorize.js';
@@ -216,15 +214,7 @@ async function resolveRequirementsForApplication(pool, applicationId) {
   return Array.from(chosenByType.values());
 }
 
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, getUploadDir()),
-  filename: (_req, file, cb) => {
-    const original = String(file.originalname || 'document').replace(/[^a-zA-Z0-9._-]/g, '_');
-    const safe = `${Date.now()}-${Math.random().toString(36).slice(2)}-${original}`;
-    cb(null, safe);
-  },
-});
-const upload = multer({ storage });
+const documentUpload = createUploadMiddleware();
 
 documentsRouter.get(
   '/applications',
@@ -416,7 +406,7 @@ documentsRouter.post(
     action: 'update',
     getOwnerId: (req) => req.body.customerId || req.auth.userId,
   }),
-  upload.single('file'),
+  ...spreadUpload(documentUpload, 'single', 'file'),
   async (req, res, next) => {
     try {
       const file = req.file;
@@ -465,7 +455,10 @@ documentsRouter.post(
         }
       }
 
-      const storedFileName = file.filename || basename(file.path || '');
+      const storedFileName =
+        file.storedPath ||
+        (file.filename ? `/uploads/${String(file.filename).replace(/^\/uploads\//, '')}` : null) ||
+        basename(file.path || '');
       const filePath = storedFileName;
       const documentUrl = `/documents/${docId}/download`;
 
@@ -538,11 +531,8 @@ documentsRouter.get(
         }
       }
 
-      const resolvedPath = resolveUploadFilePath(doc.file_path, [
-        doc.document_name,
-        doc.document_url,
-      ]);
-      if (!resolvedPath) {
+      const opened = await streamStoredUpload(doc.file_path, [doc.document_name, doc.document_url]);
+      if (!opened?.stream) {
         return res.status(404).json({
           error: 'Document file not found on server. The file may need to be re-uploaded by the customer.',
         });
@@ -551,15 +541,14 @@ documentsRouter.get(
       const filename =
         doc.document_name ||
         normalizeStoredUploadName(doc.file_path) ||
-        basename(resolvedPath) ||
         'document';
       const inline = req.query.inline === '1' || req.query.inline === 'true';
-      res.setHeader('Content-Type', doc.mime_type || 'application/octet-stream');
+      res.setHeader('Content-Type', doc.mime_type || opened.contentType || 'application/octet-stream');
       res.setHeader(
         'Content-Disposition',
         `${inline ? 'inline' : 'attachment'}; filename="${filename.replace(/"/g, '')}"`,
       );
-      createReadStream(resolvedPath).pipe(res);
+      opened.stream.pipe(res);
     } catch (err) {
       next(err);
     }

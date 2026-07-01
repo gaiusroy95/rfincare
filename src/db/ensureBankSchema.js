@@ -1,4 +1,4 @@
-import { getPool } from './pool.js';
+import { getPool, isDuplicateColumnError } from './pool.js';
 
 let ensured = false;
 
@@ -20,7 +20,7 @@ export async function ensureBankSchema() {
     try {
       await pool.execute(`ALTER TABLE banks ${ddl}`);
     } catch (err) {
-      if (err.code !== 'ER_DUP_FIELDNAME') {
+      if (!isDuplicateColumnError(err)) {
         throw err;
       }
     }
