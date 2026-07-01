@@ -15,6 +15,7 @@ import { assignUniqueCustomerCode } from '../lib/customerCode.js';
 import { ensureMilestone3Schema } from '../db/ensureMilestone3Schema.js';
 import { writeAuditLog } from '../lib/audit.js';
 import { buildMobileAuthJson } from '../lib/mobileClient.js';
+import { verifyCurrentPassword } from '../lib/verifyCurrentPassword.js';
 
 export const authRouter = Router();
 
@@ -528,33 +529,145 @@ authRouter.post('/registrations/:id/reject', authenticate, authorize({ resource:
 });
 
 /**
- * PASSWORD MANAGEMENT
+ * PASSWORD MANAGEMENT — OTP only (no direct password change).
  */
 
-authRouter.post('/change-password', authenticate, async (req, res, next) => {
+authRouter.post('/change-password', authenticate, async (_req, res) => {
+  return res.status(403).json({
+    error:
+      'Direct password change is disabled. Use password reset with OTP verification in your portal settings.',
+  });
+});
+
+const AuthenticatedPasswordResetRequestSchema = z.object({
+  channel: z.enum(['email', 'sms', 'whatsapp']).default('email'),
+});
+
+const AuthenticatedPasswordResetConfirmSchema = z.object({
+  otp: z.string().length(6),
+  newPassword: z.string().min(8),
+  currentPassword: z.string().min(1),
+});
+
+/** Logged-in customer password reset via OTP (email and/or mobile on file). */
+authRouter.post('/password-reset/request-otp', authenticate, async (req, res, next) => {
   try {
-    const { currentPassword, newPassword } = req.body;
-    const pool = getPool();
-
-    const [[user]] = await pool.execute(
-      `SELECT password_hash FROM auth_users WHERE id = :id LIMIT 1`,
-      { id: req.auth.userId }
-    );
-
-    const ok = await bcrypt.compare(currentPassword, user.password_hash);
-    if (!ok) {
-      const e = new Error('Current password is incorrect');
-      e.status = 401;
-      throw e;
+    if (req.auth.role !== 'customer') {
+      return res.status(403).json({ error: 'Customer access only' });
     }
 
-    const hashed = await bcrypt.hash(newPassword, 12);
-    await pool.execute(
-      `UPDATE auth_users SET password_hash = :ph WHERE id = :id`,
-      { ph: hashed, id: req.auth.userId }
+    const input = AuthenticatedPasswordResetRequestSchema.parse(req.body ?? {});
+    const pool = getPool();
+
+    const [[profile]] = await pool.execute(
+      `SELECT au.id, au.email, up.phone
+       FROM auth_users au
+       JOIN user_profiles up ON up.id = au.id
+       WHERE au.id = :id AND up.role = 'customer'
+       LIMIT 1`,
+      { id: req.auth.userId },
     );
 
-    res.json({ success: true });
+    if (!profile) {
+      return res.status(404).json({ error: 'Customer profile not found' });
+    }
+
+    const email = String(profile.email || '').toLowerCase();
+    const phone = profile.phone ? String(profile.phone).replace(/\D/g, '').slice(-10) : null;
+
+    if (input.channel !== 'email' && !phone) {
+      return res.status(400).json({ error: 'No registered mobile number on file for SMS OTP' });
+    }
+
+    const otp = generateOtp();
+    const id = newId();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+
+    await pool.execute(
+      `INSERT INTO lead_otps (id, lead_id, email, phone, otp_hash, purpose, channel, expires_at)
+       VALUES (:id, NULL, :email, :phone, :hash, 'password_reset', :channel, :exp)`,
+      {
+        id,
+        email,
+        phone,
+        hash: hashOtp(otp),
+        channel: input.channel,
+        exp: expiresAt,
+      },
+    );
+
+    await sendOtpNotification({
+      email,
+      phone,
+      otp,
+      channel: input.channel,
+    });
+
+    res.json({
+      success: true,
+      message:
+        input.channel === 'email'
+          ? 'OTP sent to your registered email'
+          : 'OTP sent to your registered mobile number',
+      expiresInSeconds: 600,
+      ...(process.env.LOG_OTP === 'true' ? { devOtp: otp } : {}),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+authRouter.post('/password-reset/confirm', authenticate, async (req, res, next) => {
+  try {
+    if (req.auth.role !== 'customer') {
+      return res.status(403).json({ error: 'Customer access only' });
+    }
+
+    const input = AuthenticatedPasswordResetConfirmSchema.parse(req.body);
+    const pool = getPool();
+
+    await verifyCurrentPassword(req.auth.userId, input.currentPassword);
+
+    const [[user]] = await pool.execute(
+      `SELECT au.id, au.email FROM auth_users au
+       JOIN user_profiles up ON up.id = au.id
+       WHERE au.id = :id AND up.role = 'customer'
+       LIMIT 1`,
+      { id: req.auth.userId },
+    );
+    if (!user) {
+      return res.status(404).json({ error: 'Customer profile not found' });
+    }
+
+    const email = String(user.email || '').toLowerCase();
+    const [[otpRow]] = await pool.execute(
+      `SELECT id FROM lead_otps
+       WHERE email = :email AND otp_hash = :hash
+         AND purpose = 'password_reset' AND verified_at IS NULL AND expires_at > NOW()
+       ORDER BY created_at DESC LIMIT 1`,
+      { email, hash: hashOtp(input.otp) },
+    );
+
+    if (!otpRow) {
+      return res.status(401).json({ error: 'Invalid or expired OTP' });
+    }
+
+    const hashed = await bcrypt.hash(input.newPassword, 12);
+    await pool.execute(`UPDATE auth_users SET password_hash = :ph WHERE id = :id`, {
+      ph: hashed,
+      id: req.auth.userId,
+    });
+    await pool.execute(`UPDATE lead_otps SET verified_at = NOW() WHERE id = :id`, { id: otpRow.id });
+    await pool.execute(
+      `UPDATE user_profiles SET password_change_required = FALSE WHERE id = :id`,
+      { id: req.auth.userId },
+    );
+    await pool.execute(
+      `UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = :id AND revoked_at IS NULL`,
+      { id: req.auth.userId },
+    );
+
+    res.json({ success: true, message: 'Password updated. Please sign in again.' });
   } catch (err) {
     next(err);
   }

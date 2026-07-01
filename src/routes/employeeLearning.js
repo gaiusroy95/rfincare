@@ -13,6 +13,7 @@ import {
   resolveLearningDiskPath,
   resolveLearningOpenTarget,
 } from '../lib/learningFileDelivery.js';
+import { streamStoredUpload } from '../lib/uploadPaths.js';
 
 export const adminEmployeeLearningRouter = Router();
 export const portalEmployeeLearningRouter = Router();
@@ -294,19 +295,30 @@ adminEmployeeLearningRouter.delete(
 portalEmployeeLearningRouter.use(authenticate);
 
 function sendEmployeeLearningFile(res, record, next) {
-  const diskPath = resolveLearningDiskPath({
-    filePath: record.file_path,
-    fileUrl: record.file_url,
-    fileName: record.file_name,
-  });
-  if (!diskPath) {
-    const err = new Error('Learning file not found on server');
-    err.status = 404;
-    return next(err);
-  }
-  res.setHeader('Content-Type', record.mime_type || 'application/pdf');
-  res.setHeader('Content-Disposition', `inline; filename="${record.file_name || 'document.pdf'}"`);
-  return res.sendFile(diskPath);
+  streamStoredUpload(record.file_url || record.file_path, [record.file_name])
+    .then((opened) => {
+      if (opened?.stream) {
+        res.setHeader('Content-Type', record.mime_type || opened.contentType || 'application/pdf');
+        res.setHeader('Content-Disposition', `inline; filename="${record.file_name || 'document.pdf'}"`);
+        opened.stream.pipe(res);
+        return;
+      }
+
+      const diskPath = resolveLearningDiskPath({
+        filePath: record.file_path,
+        fileUrl: record.file_url,
+        fileName: record.file_name,
+      });
+      if (!diskPath) {
+        const err = new Error('Learning file not found on server');
+        err.status = 404;
+        return next(err);
+      }
+      res.setHeader('Content-Type', record.mime_type || 'application/pdf');
+      res.setHeader('Content-Disposition', `inline; filename="${record.file_name || 'document.pdf'}"`);
+      return res.sendFile(diskPath);
+    })
+    .catch(next);
 }
 
 portalEmployeeLearningRouter.get('/content/:id/file', async (req, res, next) => {

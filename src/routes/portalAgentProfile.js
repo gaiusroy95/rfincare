@@ -11,6 +11,7 @@ import { authenticate } from '../middleware/authenticate.js';
 import { generateOtp, hashOtp, sendOtpNotification } from '../lib/otp.js';
 import { ensureAgentProfileSchema } from '../db/ensureAgentProfileSchema.js';
 import { backfillMissingAgentCodes, ensureAgentCodeForUser } from '../lib/agentCode.js';
+import { verifyCurrentPassword } from '../lib/verifyCurrentPassword.js';
 
 export const portalAgentProfileRouter = Router();
 
@@ -373,12 +374,14 @@ portalAgentProfileRouter.post('/password-reset/request-otp', async (req, res, ne
 const PasswordResetConfirmSchema = z.object({
   otp: z.string().length(6),
   newPassword: z.string().min(8),
+  currentPassword: z.string().min(1),
 });
 
 portalAgentProfileRouter.post('/password-reset/confirm', async (req, res, next) => {
   try {
     requireAgent(req);
     const input = PasswordResetConfirmSchema.parse(req.body);
+    await verifyCurrentPassword(req.auth.userId, input.currentPassword);
     await ensureAgentProfileSchema();
     const pool = getPool();
     const verified = await verifyLatestOtp(pool, {

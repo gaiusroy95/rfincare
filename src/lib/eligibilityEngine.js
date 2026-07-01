@@ -1,4 +1,5 @@
 import { getPool } from '../db/pool.js';
+import { ensureMilestone3Schema } from '../db/ensureMilestone3Schema.js';
 
 const CREDIT_SCORE_MAP = {
   excellent: 780,
@@ -89,11 +90,43 @@ function getRuleNumber(ruleData, keys, fallback) {
   return fallback;
 }
 
+const MAX_INPUT_AMOUNT = 1e12;
+
+function clampAmount(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return Math.min(n, MAX_INPUT_AMOUNT);
+}
+
+function safeRound(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  return Math.round(n);
+}
+
+function employmentTypesMatch(ruleEmploymentTypes, employmentType) {
+  if (!ruleEmploymentTypes) return true;
+  if (Array.isArray(ruleEmploymentTypes)) {
+    return ruleEmploymentTypes.map((t) => String(t).toLowerCase()).includes(employmentType);
+  }
+  const raw = String(ruleEmploymentTypes);
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      return parsed.map((t) => String(t).toLowerCase()).includes(employmentType);
+    }
+  } catch {
+    /* use string match below */
+  }
+  return raw.toLowerCase().includes(employmentType);
+}
+
 export async function calculateEligibility(input) {
+  await ensureMilestone3Schema();
   const pool = getPool();
-  const monthlyIncome = Number(input.monthlyIncome) || 0;
-  const loanAmount = Number(input.loanAmount) || 0;
-  const existingLoans = Number(input.existingLoans) || 0;
+  const monthlyIncome = clampAmount(input.monthlyIncome);
+  const loanAmount = clampAmount(input.loanAmount);
+  const existingLoans = clampAmount(input.existingLoans);
   const creditKey = normalizeCreditScoreKey(input.creditScore || input.creditScoreRange);
   const creditScore =
     CREDIT_SCORE_MAP[creditKey] ??
@@ -103,7 +136,7 @@ export async function calculateEligibility(input) {
   const employmentType = normalizeEmploymentType(input.employmentType);
   const loanType = input.loanType || input.loanPurpose || null;
   const loanCategory = inferSecuredCategory(loanType);
-  const collateralValue = Number(input.collateralValue) || Number(input.propertyValue) || 0;
+  const collateralValue = clampAmount(input.collateralValue ?? input.propertyValue);
 
   const [banks] = await pool.query(
     `SELECT b.id, b.name, bp.id AS product_id, bp.name AS product_name, bp.data AS product_data
@@ -185,11 +218,12 @@ export async function calculateEligibility(input) {
         const maxCredit = Number(d.max_credit_score ?? d.maxCreditScore ?? 900);
         const minLoan = Number(d.min_loan_amount ?? d.minLoanAmount ?? 0);
         const maxLoan = Number(d.max_loan_amount ?? d.maxLoanAmount ?? Infinity);
+        const annualIncome = monthlyIncome * 12;
 
-        if (monthlyIncome < minIncome || monthlyIncome > maxIncome) score -= 25;
+        if (annualIncome < minIncome || (Number.isFinite(maxIncome) && annualIncome > maxIncome)) score -= 25;
         if (creditScore < minCredit || creditScore > maxCredit) score -= 20;
         if (loanAmount < minLoan || loanAmount > maxLoan) score -= 20;
-        if (d.employment_types && !String(d.employment_types).includes(employmentType)) score -= 15;
+        if (!employmentTypesMatch(d.employment_types, employmentType)) score -= 15;
         if (d.loan_types && loanType && !String(d.loan_types).includes(loanType)) score -= 10;
 
         const foirDefault = loanCategory === 'secured' ? 0.65 : employmentType === 'salaried' ? 0.55 : 0.5;
@@ -241,8 +275,8 @@ export async function calculateEligibility(input) {
 
     bank.bestProbability = probability;
     bank.loanCategory = loanCategory;
-    bank.eligibleAmount = Math.round(eligibleAmount);
-    bank.maxMonthlyEmi = Math.round(maxMonthlyEmi);
+    bank.eligibleAmount = safeRound(eligibleAmount);
+    bank.maxMonthlyEmi = safeRound(maxMonthlyEmi);
     bank.estimatedRate = Number(matchedRate.toFixed(2));
     bankResults.push(bank);
   }
@@ -253,13 +287,13 @@ export async function calculateEligibility(input) {
     : 0;
 
   const bestEligibleAmount = bankResults.reduce((max, bank) => Math.max(max, bank.eligibleAmount || 0), 0);
-  const maxMonthlyEmi = bankResults.reduce((max, bank) => Math.max(max, bank.maxMonthlyEmi || 0), 0);
+  const maxMonthlyEmiOverall = bankResults.reduce((max, bank) => Math.max(max, bank.maxMonthlyEmi || 0), 0);
   const approved = overallProbability >= 70 && loanAmount <= bestEligibleAmount;
 
   return {
     overallProbability,
-    eligibleAmount: Math.round(bestEligibleAmount),
-    maxMonthlyEmi: Math.round(maxMonthlyEmi),
+    eligibleAmount: safeRound(bestEligibleAmount),
+    maxMonthlyEmi: safeRound(maxMonthlyEmiOverall),
     loanCategory,
     status: approved ? 'likely_approved' : overallProbability >= 50 ? 'conditional' : 'unlikely',
     message: approved

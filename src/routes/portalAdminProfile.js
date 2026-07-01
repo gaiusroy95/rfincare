@@ -17,6 +17,7 @@ import {
   saveAdminVerifierEmails,
 } from '../lib/adminVerificationEmails.js';
 import { getUploadDir } from '../lib/uploadPaths.js';
+import { verifyCurrentPassword } from '../lib/verifyCurrentPassword.js';
 
 export const portalAdminProfileRouter = Router();
 
@@ -229,12 +230,14 @@ portalAdminProfileRouter.post('/password-reset/request-otp', async (req, res, ne
 const PasswordResetConfirmSchema = z.object({
   otp: z.string().length(6),
   newPassword: z.string().min(8),
+  currentPassword: z.string().min(1),
 });
 
 portalAdminProfileRouter.post('/password-reset/confirm', async (req, res, next) => {
   try {
     requireAdmin(req);
     const input = PasswordResetConfirmSchema.parse(req.body);
+    await verifyCurrentPassword(req.auth.userId, input.currentPassword);
     await ensureAdminProfileSchema();
     const pool = getPool();
 

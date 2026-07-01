@@ -195,7 +195,24 @@ publicContentRouter.post('/success-stories', storyPhotoUpload.single('photo'), a
 
 publicContentRouter.post('/eligibility/calculate', async (req, res, next) => {
   try {
-    const result = await calculateEligibility(req.body);
+    const EligibilityInputSchema = z.object({
+      loanType: z.string().min(1, 'Loan type is required'),
+      loanAmount: z.coerce.number().positive('Loan amount must be greater than zero').max(1e12),
+      monthlyIncome: z.coerce.number().positive('Monthly income must be greater than zero').max(1e12),
+      employmentType: z.string().min(1, 'Employment type is required'),
+      creditScore: z.string().optional(),
+      creditScoreRange: z.string().optional(),
+      existingLoans: z.coerce.number().min(0).max(1e12).optional().default(0),
+      collateralValue: z.coerce.number().min(0).max(1e12).optional(),
+      propertyValue: z.coerce.number().min(0).max(1e12).optional(),
+      loanPurpose: z.string().optional(),
+    }).refine((data) => data.creditScore || data.creditScoreRange, {
+      message: 'Credit score range is required',
+      path: ['creditScore'],
+    });
+
+    const input = EligibilityInputSchema.parse(req.body);
+    const result = await calculateEligibility(input);
     res.json(result);
   } catch (err) {
     next(err);

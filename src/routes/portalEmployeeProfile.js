@@ -10,6 +10,7 @@ import { newId } from '../lib/ids.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { generateOtp, hashOtp, sendOtpNotification } from '../lib/otp.js';
 import { ensureEmployeeProfileSchema } from '../db/ensureEmployeeProfileSchema.js';
+import { verifyCurrentPassword } from '../lib/verifyCurrentPassword.js';
 
 export const portalEmployeeProfileRouter = Router();
 
@@ -201,12 +202,14 @@ portalEmployeeProfileRouter.post('/password-reset/request-otp', async (req, res,
 const PasswordResetConfirmSchema = z.object({
   otp: z.string().length(6),
   newPassword: z.string().min(8),
+  currentPassword: z.string().min(1),
 });
 
 portalEmployeeProfileRouter.post('/password-reset/confirm', async (req, res, next) => {
   try {
     requireEmployee(req);
     const input = PasswordResetConfirmSchema.parse(req.body);
+    await verifyCurrentPassword(req.auth.userId, input.currentPassword);
     await ensureEmployeeProfileSchema();
     const pool = getPool();
     const verified = await verifyLatestOtp(pool, {
@@ -222,7 +225,7 @@ portalEmployeeProfileRouter.post('/password-reset/confirm', async (req, res, nex
       id: req.auth.userId,
     });
     await pool.execute(
-      `UPDATE user_profiles SET password_change_required = 0 WHERE id = :id`,
+      `UPDATE user_profiles SET password_change_required = FALSE WHERE id = :id`,
       { id: req.auth.userId },
     );
 
