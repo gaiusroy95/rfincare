@@ -1,5 +1,11 @@
 import pg from 'pg';
-import { convertNamedParams, normalizeMysqlSqlForPostgres } from './sqlAdapter.js';
+
+import { normalizeDbError } from './schemaErrors.js';
+import {
+  convertNamedParams,
+  convertPositionalParams,
+  normalizeMysqlSqlForPostgres,
+} from './sqlAdapter.js';
 
 const { Pool } = pg;
 
@@ -10,7 +16,6 @@ function resolveSslOption() {
   if (raw === 'false' || raw === '0' || raw === 'disable') {
     return false;
   }
-  // Neon and most managed Postgres require SSL
   return { rejectUnauthorized: false };
 }
 
@@ -34,9 +39,25 @@ export function createPostgresPool() {
 
   async function run(sql, params) {
     const normalized = normalizeMysqlSqlForPostgres(sql);
-    const { text, values } = convertNamedParams(normalized, params || {});
-    const result = await pgPool.query(text, values);
-    return [result.rows, result.fields || []];
+    try {
+      const prepared = Array.isArray(params)
+        ? convertPositionalParams(normalized, params)
+        : convertNamedParams(normalized, params || {}, { coerceBooleans: true });
+      const result = await pgPool.query(prepared.text, prepared.values);
+      const command = String(result.command || '').toUpperCase();
+
+      if (command === 'SELECT' || command === 'SHOW') {
+        return [result.rows, result.fields || []];
+      }
+
+      const header = {
+        affectedRows: result.rowCount ?? 0,
+        insertId: result.rows?.[0]?.id ?? null,
+      };
+      return [header, result.fields || []];
+    } catch (err) {
+      throw normalizeDbError(err);
+    }
   }
 
   pool = {

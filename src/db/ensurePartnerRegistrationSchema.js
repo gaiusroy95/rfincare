@@ -1,9 +1,14 @@
+import { skipRuntimeSchemaOnPostgres } from './ensureHelpers.js';
 import { getPool } from './pool.js';
 
 let ensured = false;
 
 export async function ensurePartnerRegistrationSchema(connOrPool) {
   if (ensured) return;
+  if (skipRuntimeSchemaOnPostgres()) {
+    ensured = true;
+    return;
+  }
   const pool = connOrPool?.execute ? connOrPool : getPool();
 
   await pool.execute(`

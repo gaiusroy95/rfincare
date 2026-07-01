@@ -1,9 +1,14 @@
+import { skipRuntimeSchemaOnPostgres } from './ensureHelpers.js';
 import { getPool } from './pool.js';
 
 let ensured = false;
 
 export async function ensureMilestone3Schema() {
   if (ensured) return;
+  if (skipRuntimeSchemaOnPostgres()) {
+    ensured = true;
+    return;
+  }
   const pool = getPool();
 
   try {

@@ -1,9 +1,14 @@
+import { skipRuntimeSchemaOnPostgres } from './ensureHelpers.js';
 import { getPool } from './pool.js';
 
 let ensured = false;
 
 export async function ensureAgentProfileSchema() {
   if (ensured) return;
+  if (skipRuntimeSchemaOnPostgres()) {
+    ensured = true;
+    return;
+  }
   const pool = getPool();
 
   try {

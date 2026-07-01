@@ -1,3 +1,4 @@
+import { isDbInactive } from '../db/boolean.js';
 import { getPool } from '../db/pool.js';
 import { getOAuthGlobalSettings } from './oauthProviderSettings.js';
 import { sqlParamEqualsLower } from './sqlCollation.js';
@@ -29,7 +30,7 @@ export async function checkCustomerEmailForOAuth(email) {
     if (profile.role !== 'customer') {
       return { allowed: false, reason: 'staff_account' };
     }
-    if (profile.is_active === 0) {
+    if (isDbInactive(profile.is_active)) {
       return { allowed: false, reason: 'account_inactive' };
     }
     return { allowed: true, existingUserId: profile.id };

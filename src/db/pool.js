@@ -4,7 +4,7 @@ import { createPostgresPool } from './postgresPool.js';
 
 export { getDbProvider, isPostgres, isMysql } from './provider.js';
 export { isDuplicateColumnError, isIgnorableMigrationError } from './schemaErrors.js';
-export { prepareSql, normalizeMysqlSqlForPostgres, convertNamedParams } from './sqlAdapter.js';
+export { prepareSql, normalizeMysqlSqlForPostgres, convertNamedParams, convertPositionalParams } from './sqlAdapter.js';
 
 export function getPool() {
   return isPostgres() ? createPostgresPool() : createMysqlPool();

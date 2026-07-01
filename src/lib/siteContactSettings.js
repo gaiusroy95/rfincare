@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { skipRuntimeSchemaOnPostgres } from '../db/ensureHelpers.js';
 import { getPool } from '../db/pool.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -65,6 +66,10 @@ function parseOffices(value) {
 
 export async function ensureSiteContactSchema() {
   if (ensured) return;
+  if (skipRuntimeSchemaOnPostgres()) {
+    ensured = true;
+    return;
+  }
   const sql = readFileSync(
     join(__dirname, '../../migrations/010_site_contact_settings.sql'),
     'utf8',

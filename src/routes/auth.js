@@ -201,7 +201,7 @@ authRouter.post('/login', async (req, res, next) => {
       await pool.execute(
         `UPDATE user_profiles
          SET failed_login_attempts = :attempts,
-             account_status = IF(:locked = 1, 'locked', account_status),
+             account_status = CASE WHEN :locked = 1 THEN 'locked' ELSE account_status END,
              locked_until = :lockedUntil
          WHERE id = :id`,
         { attempts: updates.attempts, locked: updates.locked, lockedUntil: updates.lockedUntil, id: profile.id },
@@ -216,7 +216,7 @@ authRouter.post('/login', async (req, res, next) => {
       `UPDATE user_profiles
        SET failed_login_attempts = 0,
            locked_until = NULL,
-           account_status = IF(account_status = 'locked', 'active', account_status)
+           account_status = CASE WHEN account_status = 'locked' THEN 'active' ELSE account_status END
        WHERE id = :id`,
       { id: profile.id },
     );

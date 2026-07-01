@@ -1,3 +1,4 @@
+import { skipRuntimeSchemaOnPostgres } from '../db/ensureHelpers.js';
 import { getPool } from '../db/pool.js';
 import { newId } from './ids.js';
 
@@ -94,6 +95,10 @@ export function formatPublicMarketingSettings(settings) {
 
 export async function ensureMarketingSchema() {
   if (ensured) return;
+  if (skipRuntimeSchemaOnPostgres()) {
+    ensured = true;
+    return;
+  }
   const pool = getPool();
 
   // Inlined (no readFileSync) so this works in serverless bundles (e.g. Vercel)

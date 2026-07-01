@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { skipRuntimeSchemaOnPostgres } from './ensureHelpers.js';
 import { getPool } from './pool.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -18,6 +19,10 @@ async function tryAlter(sql) {
 
 export async function ensurePushNotificationSchema() {
   if (ensured) return;
+  if (skipRuntimeSchemaOnPostgres()) {
+    ensured = true;
+    return;
+  }
   const pool = getPool();
   const sql = readFileSync(join(__dirname, '../../migrations/031_push_notifications.sql'), 'utf8');
   await pool.execute(sql.trim());

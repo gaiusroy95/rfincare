@@ -2,6 +2,8 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { dbBool } from '../db/boolean.js';
+import { skipRuntimeSchemaOnPostgres } from '../db/ensureHelpers.js';
 import { getPool } from '../db/pool.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -47,6 +49,10 @@ function parseConfig(value) {
 
 export async function ensureOtpProviderSchema() {
   if (ensured) return;
+  if (skipRuntimeSchemaOnPostgres()) {
+    ensured = true;
+    return;
+  }
   const sql = readFileSync(
     join(__dirname, '../../migrations/015_otp_provider_settings.sql'),
     'utf8',
@@ -98,9 +104,9 @@ function formatRow(row) {
       ? row.whatsapp_provider
       : 'console',
     emailProvider: EMAIL_PROVIDERS.includes(row.email_provider) ? row.email_provider : 'console',
-    requireMobileOtp: row.require_mobile_otp !== 0,
-    requireEmailOtp: row.require_email_otp !== 0,
-    requireWhatsappOtp: row.require_whatsapp_otp !== 0,
+    requireMobileOtp: dbBool(row.require_mobile_otp, true),
+    requireEmailOtp: dbBool(row.require_email_otp, true),
+    requireWhatsappOtp: dbBool(row.require_whatsapp_otp),
     providerConfig: parseConfig(row.provider_config_json),
     updatedAt: row.updated_at,
   };

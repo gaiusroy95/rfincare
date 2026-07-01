@@ -1,3 +1,4 @@
+import { skipRuntimeSchemaOnPostgres } from '../db/ensureHelpers.js';
 import { getPool } from '../db/pool.js';
 import { newId } from './ids.js';
 
@@ -54,6 +55,10 @@ function slugify(input) {
 
 export async function ensureProductCategorySchema() {
   if (ensured) return;
+  if (skipRuntimeSchemaOnPostgres()) {
+    ensured = true;
+    return;
+  }
   const pool = getPool();
 
   await pool.execute(`

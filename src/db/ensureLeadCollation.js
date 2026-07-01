@@ -1,3 +1,4 @@
+import { skipRuntimeSchemaOnPostgres } from './ensureHelpers.js';
 import { getPool } from './pool.js';
 
 let ensured = false;
@@ -53,6 +54,10 @@ const LEAD_OTPS_ALTERS = [
 /** Align lead/OTP tables to utf8mb4_unicode_ci (fixes hosted MySQL collation mix errors). */
 export async function ensureLeadCollation() {
   if (ensured) return;
+  if (skipRuntimeSchemaOnPostgres()) {
+    ensured = true;
+    return;
+  }
 
   const pool = getPool();
   const before = await readColumnCollation(pool, 'marketing_leads', 'email');

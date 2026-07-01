@@ -1,3 +1,4 @@
+import { skipRuntimeSchemaOnPostgres } from './ensureHelpers.js';
 import { getPool, isDuplicateColumnError } from './pool.js';
 
 let ensured = false;
@@ -14,6 +15,10 @@ const COLUMN_DDLS = [
 
 export async function ensureBankSchema() {
   if (ensured) return;
+  if (skipRuntimeSchemaOnPostgres()) {
+    ensured = true;
+    return;
+  }
   const pool = getPool();
 
   for (const ddl of COLUMN_DDLS) {

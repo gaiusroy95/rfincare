@@ -2,7 +2,9 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { skipRuntimeSchemaOnPostgres } from './ensureHelpers.js';
 import { getPool } from './pool.js';
+import { isDuplicateColumnError } from './schemaErrors.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 let ensured = false;
@@ -12,7 +14,7 @@ async function tryAlter(sql) {
   try {
     await pool.execute(sql);
   } catch (err) {
-    if (err.code !== 'ER_DUP_FIELDNAME') throw err;
+    if (!isDuplicateColumnError(err)) throw err;
   }
 }
 
@@ -24,6 +26,7 @@ function stripSqlComments(sql) {
 }
 
 export async function ensureCibilCoreTables(pool = getPool()) {
+  if (skipRuntimeSchemaOnPostgres()) return;
   await pool.execute(
     `CREATE TABLE IF NOT EXISTS cibil_vendors (
       vendor_key VARCHAR(32) NOT NULL PRIMARY KEY,
@@ -65,6 +68,7 @@ export async function ensureCibilCoreTables(pool = getPool()) {
 }
 
 export async function ensureAgentOnboardingQcSchema() {
+  if (skipRuntimeSchemaOnPostgres()) return;
   const pool = getPool();
   await tryAlter(
     `ALTER TABLE agent_onboarding ADD COLUMN qc_status VARCHAR(32) NOT NULL DEFAULT 'pending_qc'`,
@@ -76,6 +80,10 @@ export async function ensureAgentOnboardingQcSchema() {
 }
 
 export async function ensureMilestone4Schema() {
+  if (skipRuntimeSchemaOnPostgres()) {
+    ensured = true;
+    return;
+  }
   const pool = getPool();
   await ensureCibilCoreTables(pool);
   if (ensured) return;

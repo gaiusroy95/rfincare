@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { skipRuntimeSchemaOnPostgres } from './ensureHelpers.js';
 import { getPool } from './pool.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -78,6 +79,10 @@ const EMPLOYEE_ONBOARDING_ALTERS = [
 /** Align staff onboarding tables to utf8mb4_unicode_ci (fixes hosted MySQL collation mix errors). */
 export async function ensureStaffOnboardingCollation() {
   if (collationEnsured) return;
+  if (skipRuntimeSchemaOnPostgres()) {
+    collationEnsured = true;
+    return;
+  }
   const pool = getPool();
 
   const before = await readColumnCollation(pool, 'user_profiles', 'role');
@@ -114,6 +119,10 @@ function stripSqlComments(sql) {
 
 export async function ensureOnboardingSchema() {
   if (ensured) return;
+  if (skipRuntimeSchemaOnPostgres()) {
+    ensured = true;
+    return;
+  }
   const sql = stripSqlComments(
     readFileSync(join(__dirname, '../../migrations/009_agent_employee_onboarding.sql'), 'utf8'),
   );

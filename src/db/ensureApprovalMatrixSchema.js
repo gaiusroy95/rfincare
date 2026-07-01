@@ -1,9 +1,14 @@
+import { skipRuntimeSchemaOnPostgres } from './ensureHelpers.js';
 import { getPool } from './pool.js';
 
 let ensured = false;
 
 export async function ensureApprovalMatrixSchema() {
   if (ensured) return;
+  if (skipRuntimeSchemaOnPostgres()) {
+    ensured = true;
+    return;
+  }
   const pool = getPool();
   await pool.execute(`
     CREATE TABLE IF NOT EXISTS approval_matrix_rules (

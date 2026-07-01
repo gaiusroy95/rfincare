@@ -3,6 +3,7 @@ import axios from 'axios';
 import bcrypt from 'bcryptjs';
 import crypto from 'node:crypto';
 
+import { isDbInactive } from '../db/boolean.js';
 import { getPool } from '../db/pool.js';
 import { newId } from '../lib/ids.js';
 import { assignUniqueCustomerCode } from '../lib/customerCode.js';
@@ -118,7 +119,7 @@ async function findOrCreateOAuthUser({ provider, providerUserId, email, fullName
       err.code = 'staff_account';
       throw err;
     }
-    if (profile?.is_active === 0) {
+    if (isDbInactive(profile?.is_active)) {
       const err = new Error('Your account is inactive. Contact support.');
       err.code = 'account_inactive';
       throw err;
@@ -148,7 +149,7 @@ async function findOrCreateOAuthUser({ provider, providerUserId, email, fullName
         err.code = 'staff_account';
         throw err;
       }
-      if (byEmail.is_active === 0) {
+      if (isDbInactive(byEmail.is_active)) {
         const err = new Error('Your account is inactive. Contact support.');
         err.code = 'account_inactive';
         throw err;

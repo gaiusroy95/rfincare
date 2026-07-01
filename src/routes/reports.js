@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 
-import { getPool } from '../db/pool.js';
+import { getPool, isPostgres } from '../db/pool.js';
 import { ensureMilestone3Schema } from '../db/ensureMilestone3Schema.js';
 import { newId } from '../lib/ids.js';
 import { authenticate } from '../middleware/authenticate.js';
@@ -230,19 +230,30 @@ reportsRouter.get(
   async (req, res, next) => {
     try {
       const pool = getPool();
-      const [rows] = await pool.execute(
-        `SELECT DATE_FORMAT(created_at, '%b') AS month,
-                MONTH(created_at) AS m,
-                YEAR(created_at) AS y,
-                COUNT(*) AS submitted,
-                SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) AS approved,
-                SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected,
-                SUM(CASE WHEN status IN ('draft','submitted','pending','under_review') THEN 1 ELSE 0 END) AS pending
-         FROM loan_applications
-         WHERE created_at >= DATE_SUB(NOW(), INTERVAL 12 MONTH)
-         GROUP BY YEAR(created_at), MONTH(created_at)
-         ORDER BY y, m`,
-      );
+      const volumeSql = isPostgres()
+        ? `SELECT TO_CHAR(created_at, 'Mon') AS month,
+                  EXTRACT(MONTH FROM created_at)::int AS m,
+                  EXTRACT(YEAR FROM created_at)::int AS y,
+                  COUNT(*) AS submitted,
+                  SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) AS approved,
+                  SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected,
+                  SUM(CASE WHEN status IN ('draft','submitted','pending','under_review') THEN 1 ELSE 0 END) AS pending
+           FROM loan_applications
+           WHERE created_at >= NOW() - INTERVAL '12 months'
+           GROUP BY EXTRACT(YEAR FROM created_at), EXTRACT(MONTH FROM created_at), TO_CHAR(created_at, 'Mon')
+           ORDER BY y, m`
+        : `SELECT DATE_FORMAT(created_at, '%b') AS month,
+                  MONTH(created_at) AS m,
+                  YEAR(created_at) AS y,
+                  COUNT(*) AS submitted,
+                  SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) AS approved,
+                  SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected,
+                  SUM(CASE WHEN status IN ('draft','submitted','pending','under_review') THEN 1 ELSE 0 END) AS pending
+           FROM loan_applications
+           WHERE created_at >= DATE_SUB(NOW(), INTERVAL 12 MONTH)
+           GROUP BY YEAR(created_at), MONTH(created_at)
+           ORDER BY y, m`;
+      const [rows] = await pool.execute(volumeSql);
       res.json(rows);
     } catch (err) {
       next(err);

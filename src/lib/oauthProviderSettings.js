@@ -2,6 +2,8 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { skipRuntimeSchemaOnPostgres } from '../db/ensureHelpers.js';
+import { dbBool } from '../db/boolean.js';
 import { getPool } from '../db/pool.js';
 import { getPublicSiteOrigin } from './publicUrl.js';
 
@@ -23,6 +25,10 @@ function parseCallbackUrls(value) {
 
 export async function ensureOauthProviderSchema() {
   if (ensured) return;
+  if (skipRuntimeSchemaOnPostgres()) {
+    ensured = true;
+    return;
+  }
   const sql = readFileSync(
     join(__dirname, '../../migrations/016_oauth_provider_settings.sql'),
     'utf8',
@@ -62,7 +68,7 @@ export async function getOAuthGlobalSettings() {
   return {
     apiPublicBaseUrl: row?.api_public_base_url || process.env.API_PUBLIC_URL?.replace(/\/$/, '') || null,
     frontendCallbackUrls: dbCallbacks.length ? dbCallbacks : envCallbacks,
-    requireAppliedCustomerEmail: row?.require_applied_customer_email !== 0,
+    requireAppliedCustomerEmail: dbBool(row?.require_applied_customer_email, true),
     updatedAt: row?.updated_at,
   };
 }
@@ -79,7 +85,7 @@ export async function getOAuthProviderConfigs() {
     const envPrefix = `OAUTH_${provider.toUpperCase()}`;
     return {
       provider,
-      enabled: row?.enabled === 1,
+      enabled: dbBool(row?.enabled),
       clientId: row?.client_id || process.env[`${envPrefix}_CLIENT_ID`] || '',
       clientSecret: row?.client_secret || process.env[`${envPrefix}_CLIENT_SECRET`] || '',
       redirectUri: row?.redirect_uri || null,
