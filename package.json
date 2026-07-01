@@ -10,7 +10,8 @@
     "seed:demo-users": "node scripts/seed-demo-users.js",
     "seed:bank-products": "node scripts/seed-bank-products.js",
     "seed:loan-products": "node scripts/seed-loan-product-catalog.js",
-    "seed:approval-matrix": "node scripts/seed-approval-matrix.js"
+    "seed:approval-matrix": "node scripts/seed-approval-matrix.js",
+    "seed:credit-cards": "node scripts/seed-credit-cards.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1077.0",
