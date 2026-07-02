@@ -66,7 +66,7 @@ export function createPool() {
     ssl: resolveSslOption(),
     max: Number(process.env.DATABASE_POOL_SIZE || 10),
     idleTimeoutMillis: Number(process.env.DATABASE_IDLE_TIMEOUT_MS || 30000),
-    connectionTimeoutMillis: Number(process.env.DATABASE_CONNECT_TIMEOUT_MS || 15000),
+    connectionTimeoutMillis: Number(process.env.DATABASE_CONNECT_TIMEOUT_MS || 60000),
   });
 
   async function run(sql, params) {

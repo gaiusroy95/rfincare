@@ -51,6 +51,10 @@ import { insuranceProductsRouter } from './routes/insuranceProducts.js';
 import { insurancePurchasesRouter } from './routes/insurancePurchases.js';
 import { insuranceWebhooksRouter } from './routes/insuranceWebhooks.js';
 import { mutualFundsRouter } from './routes/mutualFunds.js';
+import { fixedIncomeRouter } from './routes/fixedIncome.js';
+import { postOfficeInvestmentsRouter } from './routes/postOfficeInvestments.js';
+import { governmentSchemesRouter } from './routes/governmentSchemes.js';
+import { investmentProductsRouter } from './routes/investmentProducts.js';
 import { paymentsRouter } from './routes/payments.js';
 import { translateRouter } from './routes/translate.js';
 import { getCorsOptions } from './lib/corsOptions.js';
@@ -124,6 +128,14 @@ export function createApp({ serveStatic = true } = {}) {
   app.use('/webhooks', insuranceWebhooksRouter);
   app.use('/mutual-funds', mutualFundsRouter);
   app.use('/api/mutual-funds', mutualFundsRouter);
+  app.use('/fixed-income', fixedIncomeRouter);
+  app.use('/api/fixed-income', fixedIncomeRouter);
+  app.use('/post-office-investments', postOfficeInvestmentsRouter);
+  app.use('/api/post-office-investments', postOfficeInvestmentsRouter);
+  app.use('/government-schemes', governmentSchemesRouter);
+  app.use('/api/government-schemes', governmentSchemesRouter);
+  app.use('/investment-products', investmentProductsRouter);
+  app.use('/api/investment-products', investmentProductsRouter);
   app.use('/translate', translateRouter);
   app.use('/api/translate', translateRouter);
 

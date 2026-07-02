@@ -11,6 +11,48 @@ const { Pool } = pg;
 const __dirname = dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: join(__dirname, '../.env') });
 
+const CONNECT_TIMEOUT_MS = Number(process.env.DATABASE_CONNECT_TIMEOUT_MS || 60000);
+const CONNECT_RETRIES = Number(process.env.DATABASE_CONNECT_RETRIES || 3);
+
+/** Neon pooler URLs sometimes include channel_binding=require, which can fail on some Node/pg builds. */
+function normalizeConnectionString(connectionString) {
+  try {
+    const url = new URL(connectionString);
+    url.searchParams.delete('channel_binding');
+    return url.toString();
+  } catch {
+    return connectionString;
+  }
+}
+
+function createMigrationPool(connectionString) {
+  const sslDisabled = String(process.env.DATABASE_SSL || '').toLowerCase() === 'false';
+  return new Pool({
+    connectionString: normalizeConnectionString(connectionString),
+    ssl: sslDisabled ? false : { rejectUnauthorized: false },
+    connectionTimeoutMillis: CONNECT_TIMEOUT_MS,
+  });
+}
+
+async function connectWithRetry(pool) {
+  let lastErr;
+  for (let attempt = 1; attempt <= CONNECT_RETRIES; attempt += 1) {
+    try {
+      return await pool.connect();
+    } catch (err) {
+      lastErr = err;
+      const retryable = /timed out|timeout|ECONNRESET|ENOTFOUND|EAI_AGAIN/i.test(String(err.message));
+      if (!retryable || attempt === CONNECT_RETRIES) break;
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[postgres] Connection attempt ${attempt}/${CONNECT_RETRIES} failed (${err.message}). Retrying…`,
+      );
+      await new Promise((r) => setTimeout(r, 2000 * attempt));
+    }
+  }
+  throw lastErr;
+}
+
 /** Legacy collation patches — skipped on PostgreSQL. */
 const POSTGRES_SKIP_FILES = new Set([
   '006_collation_unicode_ci.sql',
@@ -224,13 +266,11 @@ async function main() {
     throw new Error('DATABASE_URL is required. Get it from Neon dashboard → Connection string.');
   }
 
-  const sslDisabled = String(process.env.DATABASE_SSL || '').toLowerCase() === 'false';
-  const pool = new Pool({
-    connectionString,
-    ssl: sslDisabled ? false : { rejectUnauthorized: false },
-  });
+  const pool = createMigrationPool(connectionString);
 
-  const client = await pool.connect();
+  // eslint-disable-next-line no-console
+  console.log(`[postgres] Connecting (timeout ${CONNECT_TIMEOUT_MS}ms, up to ${CONNECT_RETRIES} tries)…`);
+  const client = await connectWithRetry(pool);
   const migrationsDir = resolve(__dirname, '../migrations/postgres');
   const files = readdirSync(migrationsDir)
     .filter((f) => f.endsWith('.sql'))

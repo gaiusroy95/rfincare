@@ -183,6 +183,10 @@ const MarketplaceVisibilitySchema = z.object({
   creditCardMarketplace: z.boolean(),
   insuranceMarketplace: z.boolean(),
   mutualFundMarketplace: z.boolean(),
+  fixedIncomeMarketplace: z.boolean(),
+  postOfficeMarketplace: z.boolean(),
+  governmentSchemesMarketplace: z.boolean(),
+  investmentMarketplace: z.boolean(),
 });
 
 cmsRouter.get('/site-contact', async (req, res, next) => {
