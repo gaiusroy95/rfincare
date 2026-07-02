@@ -227,6 +227,7 @@ function formatApplication(row) {
           logo_url: row.bank_logo_url,
         }
       : null,
+    customer_photo_url: row.customer_photo_url || null,
     data,
   };
 }
@@ -273,13 +274,73 @@ function buildListQuery(role, userId, filters) {
 
   if (filters.search) {
     conditions.push(
-      '(c.full_name LIKE :search OR c.email LIKE :search OR la.application_number LIKE :search)',
+      '(c.full_name ILIKE :search OR c.email ILIKE :search OR la.application_number ILIKE :search)',
     );
     params.search = `%${filters.search}%`;
   }
 
+  if (filters.loanType && filters.loanType !== 'all') {
+    const lt = String(filters.loanType).toLowerCase().replace(/-/g, '_');
+    const needle = lt.replace(/_loan$/, '');
+    conditions.push(`(
+      LOWER(COALESCE(la.data->>'loan_type', la.data->>'loanType', la.data->>'loan_purpose', la.data->>'loanPurpose', '')) LIKE :loanType
+      OR LOWER(COALESCE(la.data->>'loan_type', la.data->>'loanType', la.data->>'loan_purpose', la.data->>'loanPurpose', '')) LIKE :loanTypeLoan
+    )`);
+    params.loanType = `%${needle}%`;
+    params.loanTypeLoan = `%${lt}%`;
+  }
+
+  if (filters.priority && filters.priority !== 'all') {
+    conditions.push(`COALESCE(la.data->>'admin_priority', la.data->>'adminPriority', 'medium') = :priority`);
+    params.priority = filters.priority;
+  }
+
   const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
   return { where, params };
+}
+
+async function attachCustomerPhotoUrls(pool, rows) {
+  if (!rows?.length) return rows;
+  const ids = rows.map((r) => r.id);
+  const params = {};
+  const placeholders = ids.map((id, i) => {
+    params[`id${i}`] = id;
+    return `:id${i}`;
+  }).join(', ');
+
+  const [photoRows] = await pool.execute(
+    `SELECT DISTINCT ON (cd.application_id)
+            cd.application_id,
+            cd.id,
+            cd.document_url,
+            cd.file_path
+     FROM customer_documents cd
+     WHERE cd.application_id IN (${placeholders})
+       AND (
+         cd.document_type IN ('customer_photo', 'aadhaar_card', 'pan_card')
+         OR cd.mime_type LIKE 'image/%'
+       )
+     ORDER BY cd.application_id,
+       CASE cd.document_type
+         WHEN 'customer_photo' THEN 0
+         WHEN 'aadhaar_card' THEN 1
+         WHEN 'pan_card' THEN 2
+         ELSE 3
+       END,
+       cd.uploaded_at DESC`,
+    params,
+  );
+
+  const photoByApp = new Map();
+  for (const row of photoRows || []) {
+    const url = row.document_url || (row.id ? `/documents/${row.id}/download` : null);
+    if (url) photoByApp.set(row.application_id, url);
+  }
+
+  return rows.map((row) => ({
+    ...row,
+    customer_photo_url: photoByApp.get(row.id) || null,
+  }));
 }
 
 loanApplicationsRouter.get(
@@ -316,25 +377,45 @@ loanApplicationsRouter.get(
       const filters = {
         status: req.query.status,
         search: req.query.search,
+        loanType: req.query.loanType,
+        priority: req.query.priority,
       };
       const { where, params } = buildListQuery(req.auth.role, req.auth.userId, filters);
+      const includePhotos = req.query.includePhotos === 'true';
+      const page = Math.max(1, parseInt(req.query.page, 10) || 0);
+      const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 0));
+      const usePagination = page > 0 && pageSize > 0;
+
+      if (usePagination) {
+        const [[{ total }]] = await pool.execute(
+          `SELECT COUNT(*)::int AS total
+           FROM loan_applications la
+           LEFT JOIN user_profiles c ON c.id = la.customer_id
+           ${where}`,
+          params,
+        );
+        const offset = (page - 1) * pageSize;
+        const [rows] = await pool.execute(
+          `${LIST_SELECT} ${where} ORDER BY la.created_at DESC LIMIT :limit OFFSET :offset`,
+          { ...params, limit: pageSize, offset },
+        );
+        const withPhotos = includePhotos ? await attachCustomerPhotoUrls(pool, rows) : rows;
+        const items = withPhotos.map(formatApplication);
+        return res.json({
+          items,
+          total: Number(total || 0),
+          page,
+          pageSize,
+          hasMore: offset + items.length < Number(total || 0),
+        });
+      }
+
       const [rows] = await pool.execute(
         `${LIST_SELECT} ${where} ORDER BY la.created_at DESC`,
         params,
       );
-
-      let apps = rows.map(formatApplication);
-
-      if (req.query.loanType && req.query.loanType !== 'all') {
-        const lt = String(req.query.loanType).toLowerCase();
-        apps = apps.filter((a) => String(a.loan_type || '').toLowerCase().includes(lt.replace('_loan', '')));
-      }
-
-      if (req.query.priority && req.query.priority !== 'all') {
-        apps = apps.filter((a) => a.admin_priority === req.query.priority);
-      }
-
-      res.json(apps);
+      const withPhotos = includePhotos ? await attachCustomerPhotoUrls(pool, rows) : rows;
+      res.json(withPhotos.map(formatApplication));
     } catch (err) {
       next(err);
     }
@@ -362,42 +443,48 @@ loanApplicationsRouter.post(
 
       const input = BulkStatusSchema.parse(req.body);
       const pool = getPool();
-      let updated = 0;
+      const placeholders = input.applicationIds.map((_, i) => `:id${i}`).join(', ');
+      const idParams = Object.fromEntries(
+        input.applicationIds.map((id, i) => [`id${i}`, id]),
+      );
 
-      for (const id of input.applicationIds) {
-        const existing = await fetchApplicationById(pool, id);
-        if (!existing) continue;
+      const [existingRows] = await pool.execute(
+        `SELECT id, status FROM loan_applications WHERE id IN (${placeholders})`,
+        idParams,
+      );
+      if (!existingRows?.length) {
+        return res.json({ updated: 0 });
+      }
 
-        await pool.execute(
-          `UPDATE loan_applications SET
-             status = :status,
-             review_notes = COALESCE(:review_notes, review_notes),
-             rejection_reason = COALESCE(:rejection_reason, rejection_reason),
-             reviewed_by = :reviewed_by,
-             reviewed_at = NOW()
-           WHERE id = :id`,
-          {
-            id,
-            status: input.status,
-            review_notes: input.review_notes || null,
-            rejection_reason: input.rejection_reason || null,
-            reviewed_by: req.auth.userId,
-          },
-        );
+      await pool.execute(
+        `UPDATE loan_applications SET
+           status = :status,
+           review_notes = COALESCE(:review_notes, review_notes),
+           rejection_reason = COALESCE(:rejection_reason, rejection_reason),
+           reviewed_by = :reviewed_by,
+           reviewed_at = NOW()
+         WHERE id IN (${placeholders})`,
+        {
+          ...idParams,
+          status: input.status,
+          review_notes: input.review_notes || null,
+          rejection_reason: input.rejection_reason || null,
+          reviewed_by: req.auth.userId,
+        },
+      );
 
+      for (const row of existingRows) {
         await writeAuditLog({
           userId: req.auth.userId,
           actionType: input.status === 'approved' ? 'APPROVE' : 'REJECT',
           tableName: 'loan_applications',
-          recordId: id,
-          oldValues: { status: existing.status },
+          recordId: row.id,
+          oldValues: { status: row.status },
           newValues: { status: input.status },
         });
-
-        updated += 1;
       }
 
-      res.json({ updated, status: input.status });
+      res.json({ updated: existingRows.length, status: input.status });
     } catch (err) {
       next(err);
     }

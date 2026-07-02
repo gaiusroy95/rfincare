@@ -510,8 +510,13 @@ adminRouter.get(
                  THEN COALESCE(reg.latest_email, lead.latest_email, up.email)
                  ELSE up.email
                END AS display_email,
-               (SELECT COUNT(*) FROM loan_applications la WHERE la.customer_id = up.id) AS application_count
+               COALESCE(app_counts.application_count, 0) AS application_count
         FROM user_profiles up
+        LEFT JOIN (
+          SELECT customer_id, COUNT(*)::int AS application_count
+          FROM loan_applications
+          GROUP BY customer_id
+        ) app_counts ON app_counts.customer_id = up.id
         LEFT JOIN (
           SELECT phone, MAX(email) AS latest_email
           FROM customer_registrations
@@ -526,20 +531,24 @@ adminRouter.get(
       const params = {};
       if (search) {
         sql += ` AND (
-          up.full_name LIKE :search OR up.email LIKE :search
-          OR up.phone LIKE :search OR up.customer_code LIKE :search
+          up.full_name ILIKE :search OR up.email ILIKE :search
+          OR up.phone ILIKE :search OR up.customer_code ILIKE :search
         )`;
         params.search = `%${search}%`;
       }
       sql += ' ORDER BY up.created_at DESC LIMIT 500';
       const [rows] = await pool.execute(sql, params);
-      for (const row of rows) {
-        if (!row.customer_code) {
-          await assignUniqueCustomerCode(pool, row.id);
-        }
+
+      const missingCodes = rows.filter((row) => !row.customer_code);
+      if (missingCodes.length) {
+        await Promise.all(
+          missingCodes.map((row) => assignUniqueCustomerCode(pool, row.id)),
+        );
+        const [refreshed] = await pool.execute(sql, params);
+        return res.json(refreshed.map(mapCustomerRow));
       }
-      const [updated] = await pool.execute(sql, params);
-      res.json(updated.map(mapCustomerRow));
+
+      res.json(rows.map(mapCustomerRow));
     } catch (err) {
       next(err);
     }

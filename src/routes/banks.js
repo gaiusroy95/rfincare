@@ -7,7 +7,7 @@ import { z } from 'zod';
 import { getPool } from '../db/pool.js';
 import { getUploadDir } from '../lib/uploadPaths.js';
 import { ensureBankSchema } from '../db/ensureBankSchema.js';
-import { cacheDeletePrefix } from '../lib/simpleCache.js';
+import { cacheDeletePrefix, cacheGet, cacheSet } from '../lib/simpleCache.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { authorize } from '../middleware/authorize.js';
 import { newId } from '../lib/ids.js';
@@ -18,6 +18,11 @@ import {
 import { listRulesForBank } from './approvalMatrixRules.js';
 
 const BANK_LIST_CACHE_PREFIX = 'banks:list:';
+const BANK_LIST_CACHE_TTL_MS = 120_000;
+
+function bankListCacheKey({ includeInactive, includeProducts, categoryQuery }) {
+  return `${BANK_LIST_CACHE_PREFIX}${includeInactive ? 'all' : 'active'}:${includeProducts ? 'p1' : 'p0'}:${categoryQuery || 'all'}`;
+}
 
 /** Clears any legacy in-memory bank list entries . */
 function invalidateBankListCache() {
@@ -324,11 +329,15 @@ banksRouter.get('/', async (req, res, next) => {
     const includeInactive = req.query.includeInactive === 'true';
     const includeProducts = req.query.includeProducts !== 'false';
     const categoryQuery = req.query.loanType || null;
+    const cacheKey = bankListCacheKey({ includeInactive, includeProducts, categoryQuery });
 
-    const result = await fetchBankList({ includeInactive, includeProducts, categoryQuery });
+    let result = cacheGet(cacheKey);
+    if (!result) {
+      result = await fetchBankList({ includeInactive, includeProducts, categoryQuery });
+      cacheSet(cacheKey, result, BANK_LIST_CACHE_TTL_MS);
+    }
 
-    res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
-    res.set('Pragma', 'no-cache');
+    res.set('Cache-Control', 'public, max-age=60, stale-while-revalidate=120');
     res.json(result);
   } catch (err) {
     next(err);
