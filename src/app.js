@@ -48,7 +48,9 @@ import { portalAgentMilestone4Router } from './routes/portalAgentMilestone4.js';
 import { partnersRouter } from './routes/partners.js';
 import { creditCardsRouter } from './routes/creditCards.js';
 import { insuranceProductsRouter } from './routes/insuranceProducts.js';
+import { insurancePurchasesRouter } from './routes/insurancePurchases.js';
 import { mutualFundsRouter } from './routes/mutualFunds.js';
+import { paymentsRouter } from './routes/payments.js';
 import { translateRouter } from './routes/translate.js';
 import { getCorsOptions } from './lib/corsOptions.js';
 import { getUploadDir } from './lib/uploadPaths.js';
@@ -61,6 +63,7 @@ export function createApp({ serveStatic = true } = {}) {
   const app = express();
 
   app.use(cors(getCorsOptions()));
+  app.use('/payments', paymentsRouter);
   app.use(express.json({ limit: '2mb' }));
   app.use(cookieParser());
 
@@ -115,6 +118,8 @@ export function createApp({ serveStatic = true } = {}) {
   app.use('/api/credit-cards', creditCardsRouter);
   app.use('/insurance-products', insuranceProductsRouter);
   app.use('/api/insurance-products', insuranceProductsRouter);
+  app.use('/insurance-purchases', insurancePurchasesRouter);
+  app.use('/api/insurance-purchases', insurancePurchasesRouter);
   app.use('/mutual-funds', mutualFundsRouter);
   app.use('/api/mutual-funds', mutualFundsRouter);
   app.use('/translate', translateRouter);

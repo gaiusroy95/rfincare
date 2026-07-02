@@ -22,6 +22,32 @@ import { hasPermission } from '../auth/permissions.js';
 
 export const leadsRouter = Router();
 
+function canReadLeads(role) {
+  return (
+    hasPermission(role, 'read:*')
+    || hasPermission(role, 'manage:*')
+    || role === 'admin'
+    || role === 'super_admin'
+    || role === 'employee'
+  );
+}
+
+function formatProductType(value) {
+  if (!value) return '';
+  return String(value)
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function csvEscape(value) {
+  if (value == null) return '';
+  const normalized = String(value).replace(/\r?\n/g, ' ').trim();
+  if (normalized.includes('"') || normalized.includes(',') || normalized.includes(';')) {
+    return `"${normalized.replace(/"/g, '""')}"`;
+  }
+  return normalized;
+}
+
 function formatLead(row) {
   return {
     id: row.id,
@@ -633,16 +659,81 @@ leadsRouter.get('/drafts/:sessionKey', async (req, res, next) => {
   }
 });
 
+leadsRouter.get('/export.csv', authenticate, async (req, res, next) => {
+  try {
+    const role = req.auth.role;
+    if (!canReadLeads(role)) {
+      const e = new Error('Insufficient permissions');
+      e.status = 403;
+      throw e;
+    }
+
+    await ensureOnboardingSchema();
+    const pool = getPool();
+    const [rows] = await pool.execute(
+      `SELECT ml.*,
+              up.full_name AS assignee_name,
+              up.role AS assignee_role,
+              COALESCE(ao.agent_code, eo.employee_code) AS assignee_code
+       FROM marketing_leads ml
+       LEFT JOIN user_profiles up ON up.id = ml.assigned_to
+       LEFT JOIN agent_onboarding ao ON ao.user_id = up.id AND up.role = 'agent'
+       LEFT JOIN employee_onboarding eo ON eo.user_id = up.id AND up.role = 'employee'
+       ORDER BY ml.created_at DESC`,
+    );
+
+    const header = [
+      'Lead ID',
+      'Full Name',
+      'Email',
+      'Phone',
+      'Product Type',
+      'Source',
+      'Status',
+      'Eligibility Score',
+      'Application ID',
+      'Assigned To',
+      'Assigned Code',
+      'Assigned Role',
+      'Consent Accepted',
+      'Consent Verified At',
+      'Created At',
+      'Updated At',
+    ];
+
+    const lines = rows.map((row) => [
+      row.id,
+      row.full_name,
+      row.email,
+      row.phone,
+      formatProductType(row.loan_type),
+      row.source,
+      row.status,
+      row.eligibility_score,
+      row.application_id,
+      row.assignee_name,
+      row.assignee_code,
+      row.assignee_role,
+      row.consent_accepted ? 'Yes' : 'No',
+      row.consent_verified_at,
+      row.created_at,
+      row.updated_at,
+    ].map(csvEscape).join(','));
+
+    const csv = [header.map(csvEscape).join(','), ...lines].join('\n');
+    const stamp = new Date().toISOString().slice(0, 10);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="rfincare-product-leads-${stamp}.csv"`);
+    res.send(csv);
+  } catch (err) {
+    next(err);
+  }
+});
+
 leadsRouter.get('/', authenticate, async (req, res, next) => {
   try {
     const role = req.auth.role;
-    if (
-      !hasPermission(role, 'read:*')
-      && !hasPermission(role, 'manage:*')
-      && role !== 'admin'
-      && role !== 'super_admin'
-      && role !== 'employee'
-    ) {
+    if (!canReadLeads(role)) {
       const e = new Error('Insufficient permissions');
       e.status = 403;
       throw e;

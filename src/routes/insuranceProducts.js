@@ -90,6 +90,18 @@ function formatProductRow(row) {
     newPolicyUrl: row.new_policy_url || null,
     renewalUrl: row.renewal_url || null,
     claimAssistanceUrl: row.claim_assistance_url || null,
+    purchaseEnabled: toBool(row.purchase_enabled),
+    purchaseMode: row.purchase_mode || 'redirect',
+    insurerProviderCode: row.insurer_provider_code || null,
+    insurerProductCode: row.insurer_product_code || null,
+    insurerPlanCode: row.insurer_plan_code || null,
+    paymentAccountCode: row.payment_account_code || null,
+    demographicMapping:
+      typeof row.demographic_mapping === 'object'
+        ? row.demographic_mapping
+        : row.demographic_mapping
+          ? JSON.parse(row.demographic_mapping)
+          : {},
     features: parseJsonList(row.features),
     benefits: parseJsonList(row.benefits),
     highlights: row.highlights || null,
@@ -183,6 +195,13 @@ const ProductSchema = z.object({
   newPolicyUrl: z.preprocess(emptyToNull, z.union([z.string().url(), z.null()]).optional()),
   renewalUrl: z.preprocess(emptyToNull, z.union([z.string().url(), z.null()]).optional()),
   claimAssistanceUrl: z.preprocess(emptyToNull, z.union([z.string().url(), z.null()]).optional()),
+  purchaseEnabled: z.coerce.boolean().optional(),
+  purchaseMode: z.enum(['api', 'redirect', 'manual']).optional(),
+  insurerProviderCode: z.preprocess(emptyToNull, z.union([z.string().min(1), z.null()]).optional()),
+  insurerProductCode: z.preprocess(emptyToNull, z.union([z.string().min(1), z.null()]).optional()),
+  insurerPlanCode: z.preprocess(emptyToNull, z.union([z.string().min(1), z.null()]).optional()),
+  paymentAccountCode: z.preprocess(emptyToNull, z.union([z.string().min(1), z.null()]).optional()),
+  demographicMapping: z.record(z.unknown()).optional(),
   highlights: z.string().optional().nullable(),
   displayPriority: z.coerce.number().optional(),
   status: z.enum(['active', 'inactive']).optional(),
@@ -216,6 +235,13 @@ function normalizeBody(body) {
     new_policy_url: parsed.newPolicyUrl || null,
     renewal_url: parsed.renewalUrl || null,
     claim_assistance_url: parsed.claimAssistanceUrl || null,
+    purchase_enabled: parsed.purchaseEnabled ?? false,
+    purchase_mode: parsed.purchaseMode || 'redirect',
+    insurer_provider_code: parsed.insurerProviderCode || null,
+    insurer_product_code: parsed.insurerProductCode || null,
+    insurer_plan_code: parsed.insurerPlanCode || null,
+    payment_account_code: parsed.paymentAccountCode || null,
+    demographic_mapping: JSON.stringify(parsed.demographicMapping || {}),
     features: JSON.stringify(parseJsonList(parsed.features)),
     benefits: JSON.stringify(parseJsonList(parsed.benefits)),
     highlights: parsed.highlights?.trim() || null,
@@ -324,6 +350,42 @@ insuranceProductsRouter.get('/taxonomy', async (_req, res) => {
   res.json(getInsuranceTaxonomy());
 });
 
+insuranceProductsRouter.get(
+  '/provider-configs',
+  authenticate,
+  authorize({ resource: 'banks', action: 'update' }),
+  async (_req, res, next) => {
+    try {
+      await ensureInsuranceSchema();
+      const pool = getPool();
+      const [rows] = await pool.execute(
+        `SELECT * FROM insurance_provider_configs ORDER BY provider_name ASC, provider_code ASC`,
+      );
+      res.json(rows.map((row) => ({
+        id: row.id,
+        providerCode: row.provider_code,
+        providerName: row.provider_name,
+        integrationMode: row.integration_mode,
+        baseUrl: row.base_url,
+        authType: row.auth_type,
+        apiKey: row.api_key || '',
+        apiSecret: row.api_secret || '',
+        webhookSecret: row.webhook_secret || '',
+        paymentAccountCode: row.payment_account_code || '',
+        requestConfig:
+          typeof row.request_config === 'object'
+            ? row.request_config
+            : row.request_config
+              ? JSON.parse(row.request_config)
+              : {},
+        status: row.status,
+      })));
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
 insuranceProductsRouter.get('/', async (req, res, next) => {
   try {
     await ensureInsuranceSchema();
@@ -374,6 +436,8 @@ insuranceProductsRouter.post(
           tax_benefit_80c, tax_benefit_80d,
           supports_new_policy, supports_renewal, supports_claim_assistance,
           new_policy_url, renewal_url, claim_assistance_url,
+          purchase_enabled, purchase_mode, insurer_provider_code, insurer_product_code,
+          insurer_plan_code, payment_account_code, demographic_mapping,
           features, benefits, highlights, display_priority, status
         ) VALUES (
           :id, :insurer_id, :insurer_name, :name, :slug, :description, :logo_url, :segment, :categories::jsonb,
@@ -382,6 +446,8 @@ insuranceProductsRouter.post(
           :tax_benefit_80c, :tax_benefit_80d,
           :supports_new_policy, :supports_renewal, :supports_claim_assistance,
           :new_policy_url, :renewal_url, :claim_assistance_url,
+          :purchase_enabled, :purchase_mode, :insurer_provider_code, :insurer_product_code,
+          :insurer_plan_code, :payment_account_code, :demographic_mapping::jsonb,
           :features, :benefits, :highlights, :display_priority, :status
         )`,
         { id, ...input },
@@ -436,6 +502,13 @@ insuranceProductsRouter.put(
           new_policy_url = :new_policy_url,
           renewal_url = :renewal_url,
           claim_assistance_url = :claim_assistance_url,
+          purchase_enabled = :purchase_enabled,
+          purchase_mode = :purchase_mode,
+          insurer_provider_code = :insurer_provider_code,
+          insurer_product_code = :insurer_product_code,
+          insurer_plan_code = :insurer_plan_code,
+          payment_account_code = :payment_account_code,
+          demographic_mapping = :demographic_mapping::jsonb,
           features = :features,
           benefits = :benefits,
           highlights = :highlights,
@@ -446,6 +519,133 @@ insuranceProductsRouter.put(
       );
       const [[row]] = await pool.execute(`SELECT * FROM insurance_products WHERE id = :id`, { id: req.params.id });
       res.json(formatProductRow(row));
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+const ProviderConfigSchema = z.object({
+  providerCode: z.string().min(2),
+  providerName: z.string().min(2),
+  integrationMode: z.enum(['demo', 'generic_api']).optional(),
+  baseUrl: z.preprocess(emptyToNull, z.union([z.string().url(), z.null()]).optional()),
+  authType: z.enum(['bearer', 'basic', 'x_api_key']).optional(),
+  apiKey: z.string().optional(),
+  apiSecret: z.string().optional(),
+  webhookSecret: z.string().optional(),
+  paymentAccountCode: z.string().optional(),
+  requestConfig: z.record(z.unknown()).optional(),
+  status: z.enum(['active', 'inactive']).optional(),
+});
+
+insuranceProductsRouter.post(
+  '/provider-configs',
+  authenticate,
+  authorize({ resource: 'banks', action: 'update' }),
+  async (req, res, next) => {
+    try {
+      const input = ProviderConfigSchema.parse(req.body || {});
+      const pool = getPool();
+      const id = newId();
+      await pool.execute(
+        `INSERT INTO insurance_provider_configs (
+           id, provider_code, provider_name, integration_mode, base_url, auth_type,
+           api_key, api_secret, webhook_secret, payment_account_code, request_config, status
+         ) VALUES (
+           :id, :provider_code, :provider_name, :integration_mode, :base_url, :auth_type,
+           :api_key, :api_secret, :webhook_secret, :payment_account_code, :request_config::jsonb, :status
+         )`,
+        {
+          id,
+          provider_code: input.providerCode.trim(),
+          provider_name: input.providerName.trim(),
+          integration_mode: input.integrationMode || 'generic_api',
+          base_url: input.baseUrl || null,
+          auth_type: input.authType || 'bearer',
+          api_key: input.apiKey || null,
+          api_secret: input.apiSecret || null,
+          webhook_secret: input.webhookSecret || null,
+          payment_account_code: input.paymentAccountCode || null,
+          request_config: JSON.stringify(input.requestConfig || {}),
+          status: input.status || 'active',
+        },
+      );
+      const [[row]] = await pool.execute(`SELECT * FROM insurance_provider_configs WHERE id = :id`, { id });
+      res.status(201).json({
+        id: row.id,
+        providerCode: row.provider_code,
+        providerName: row.provider_name,
+        integrationMode: row.integration_mode,
+        baseUrl: row.base_url,
+        authType: row.auth_type,
+        apiKey: row.api_key || '',
+        apiSecret: row.api_secret || '',
+        webhookSecret: row.webhook_secret || '',
+        paymentAccountCode: row.payment_account_code || '',
+        requestConfig: typeof row.request_config === 'object' ? row.request_config : JSON.parse(row.request_config || '{}'),
+        status: row.status,
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+insuranceProductsRouter.put(
+  '/provider-configs/:id',
+  authenticate,
+  authorize({ resource: 'banks', action: 'update' }),
+  async (req, res, next) => {
+    try {
+      const input = ProviderConfigSchema.parse(req.body || {});
+      const pool = getPool();
+      await pool.execute(
+        `UPDATE insurance_provider_configs SET
+           provider_code = :provider_code,
+           provider_name = :provider_name,
+           integration_mode = :integration_mode,
+           base_url = :base_url,
+           auth_type = :auth_type,
+           api_key = :api_key,
+           api_secret = :api_secret,
+           webhook_secret = :webhook_secret,
+           payment_account_code = :payment_account_code,
+           request_config = :request_config::jsonb,
+           status = :status,
+           updated_at = CURRENT_TIMESTAMP
+         WHERE id = :id`,
+        {
+          id: req.params.id,
+          provider_code: input.providerCode.trim(),
+          provider_name: input.providerName.trim(),
+          integration_mode: input.integrationMode || 'generic_api',
+          base_url: input.baseUrl || null,
+          auth_type: input.authType || 'bearer',
+          api_key: input.apiKey || null,
+          api_secret: input.apiSecret || null,
+          webhook_secret: input.webhookSecret || null,
+          payment_account_code: input.paymentAccountCode || null,
+          request_config: JSON.stringify(input.requestConfig || {}),
+          status: input.status || 'active',
+        },
+      );
+      const [[row]] = await pool.execute(`SELECT * FROM insurance_provider_configs WHERE id = :id`, { id: req.params.id });
+      if (!row) return res.status(404).json({ error: 'Provider config not found' });
+      res.json({
+        id: row.id,
+        providerCode: row.provider_code,
+        providerName: row.provider_name,
+        integrationMode: row.integration_mode,
+        baseUrl: row.base_url,
+        authType: row.auth_type,
+        apiKey: row.api_key || '',
+        apiSecret: row.api_secret || '',
+        webhookSecret: row.webhook_secret || '',
+        paymentAccountCode: row.payment_account_code || '',
+        requestConfig: typeof row.request_config === 'object' ? row.request_config : JSON.parse(row.request_config || '{}'),
+        status: row.status,
+      });
     } catch (err) {
       next(err);
     }
