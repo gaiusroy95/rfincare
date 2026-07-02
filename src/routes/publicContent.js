@@ -15,6 +15,7 @@ import {
   getPublicMarketingSettings,
   logMarketingEvent,
 } from '../lib/marketingSettings.js';
+import { getMarketplaceVisibility } from '../lib/marketplaceVisibility.js';
 import { createResumeToken, resolveResumeToken } from '../lib/resumeTokens.js';
 import { resolveFrontendEnvPath } from '../lib/envPaths.js';
 import { entriesToObject, readEnvFile } from '../lib/envFile.js';
@@ -114,6 +115,14 @@ publicContentRouter.get('/oauth-config', async (_req, res, next) => {
 publicContentRouter.get('/about-content', async (_req, res, next) => {
   try {
     res.json(await getAboutPageContent());
+  } catch (err) {
+    next(err);
+  }
+});
+
+publicContentRouter.get('/marketplace-visibility', async (_req, res, next) => {
+  try {
+    res.json(await getMarketplaceVisibility());
   } catch (err) {
     next(err);
   }

@@ -25,6 +25,10 @@ import {
   updateMarketingSettings,
   getMarketingEventStats,
 } from '../lib/marketingSettings.js';
+import {
+  getMarketplaceVisibility,
+  updateMarketplaceVisibility,
+} from '../lib/marketplaceVisibility.js';
 import { normalizeYoutubeWatchUrl } from '../lib/youtube.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { requireRoles } from '../middleware/requireRoles.js';
@@ -174,6 +178,13 @@ const AboutPageContentSchema = z.object({
   storyParagraphs: z.array(z.string().min(1)).min(1),
 });
 
+const MarketplaceVisibilitySchema = z.object({
+  bankMarketplace: z.boolean(),
+  creditCardMarketplace: z.boolean(),
+  insuranceMarketplace: z.boolean(),
+  mutualFundMarketplace: z.boolean(),
+});
+
 cmsRouter.get('/site-contact', async (req, res, next) => {
   try {
     res.json(await getSiteContactSettings());
@@ -213,6 +224,26 @@ cmsRouter.put('/homepage/trust-signals', async (req, res, next) => {
 cmsRouter.get('/about-content', async (_req, res, next) => {
   try {
     res.json(await getAboutPageContent());
+  } catch (err) {
+    next(err);
+  }
+});
+
+cmsRouter.get('/marketplace-visibility', async (_req, res, next) => {
+  try {
+    res.json(await getMarketplaceVisibility());
+  } catch (err) {
+    next(err);
+  }
+});
+
+cmsRouter.put('/marketplace-visibility', async (req, res, next) => {
+  try {
+    if (!['admin', 'super_admin'].includes(req.auth.role)) {
+      return res.status(403).json({ error: 'Only admin can update marketplace visibility' });
+    }
+    const input = MarketplaceVisibilitySchema.parse(req.body);
+    res.json(await updateMarketplaceVisibility(input, req.auth.userId));
   } catch (err) {
     next(err);
   }
