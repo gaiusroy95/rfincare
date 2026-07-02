@@ -49,6 +49,7 @@ import { partnersRouter } from './routes/partners.js';
 import { creditCardsRouter } from './routes/creditCards.js';
 import { insuranceProductsRouter } from './routes/insuranceProducts.js';
 import { insurancePurchasesRouter } from './routes/insurancePurchases.js';
+import { insuranceWebhooksRouter } from './routes/insuranceWebhooks.js';
 import { mutualFundsRouter } from './routes/mutualFunds.js';
 import { paymentsRouter } from './routes/payments.js';
 import { translateRouter } from './routes/translate.js';
@@ -120,6 +121,7 @@ export function createApp({ serveStatic = true } = {}) {
   app.use('/api/insurance-products', insuranceProductsRouter);
   app.use('/insurance-purchases', insurancePurchasesRouter);
   app.use('/api/insurance-purchases', insurancePurchasesRouter);
+  app.use('/webhooks', insuranceWebhooksRouter);
   app.use('/mutual-funds', mutualFundsRouter);
   app.use('/api/mutual-funds', mutualFundsRouter);
   app.use('/translate', translateRouter);

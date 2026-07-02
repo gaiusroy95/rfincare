@@ -90,3 +90,64 @@ export async function pushPurchaseToInsurer({ providerConfig, purchaseOrder, pay
   }
   return adapter({ providerConfig, purchaseOrder, payload });
 }
+
+async function genericApiQuote({ providerConfig, payload }) {
+  const requestConfig = parseRequestConfig(providerConfig);
+  const endpoint = requestConfig.quotePath || '/quote';
+  const url = `${trimSlash(providerConfig.base_url)}${endpoint.startsWith('/') ? endpoint : `/${endpoint}`}`;
+  const res = await axios.post(url, payload, {
+    headers: { 'Content-Type': 'application/json', ...buildAuthHeaders(providerConfig) },
+    timeout: Number(requestConfig.timeoutMs || 30000),
+  });
+  return res.data;
+}
+
+async function genericApiProposal({ providerConfig, payload }) {
+  const requestConfig = parseRequestConfig(providerConfig);
+  const endpoint = requestConfig.proposalPath || '/proposal';
+  const url = `${trimSlash(providerConfig.base_url)}${endpoint.startsWith('/') ? endpoint : `/${endpoint}`}`;
+  const res = await axios.post(url, payload, {
+    headers: { 'Content-Type': 'application/json', ...buildAuthHeaders(providerConfig) },
+    timeout: Number(requestConfig.timeoutMs || 30000),
+  });
+  return res.data;
+}
+
+async function demoQuote({ payload }) {
+  return {
+    quoteId: `Q-${Date.now()}`,
+    plans: [
+      { premium: 899, term: 'yearly', label: 'Standard' },
+      { premium: 1299, term: 'yearly', label: 'Plus' },
+    ],
+    echoed: payload?.customer?.email || null,
+  };
+}
+
+async function demoProposal({ payload }) {
+  return {
+    proposalId: `P-${Date.now()}`,
+    proposalNumber: `PROP-${Math.random().toString(36).slice(2, 8).toUpperCase()}`,
+    paymentMode: 'redirect',
+    paymentUrl: payload?.returnUrl
+      ? `${payload.returnUrl}?status=success&demo=1`
+      : 'https://example.com/payment',
+  };
+}
+
+const quoteRegistry = { demo: demoQuote, generic_api: genericApiQuote };
+const proposalRegistry = { demo: demoProposal, generic_api: genericApiProposal };
+
+export async function fetchQuoteFromProvider({ providerConfig, payload }) {
+  const mode = String(providerConfig?.integration_mode || 'generic_api').toLowerCase();
+  const adapter = quoteRegistry[mode];
+  if (!adapter) throw new Error(`No quote adapter for integration mode: ${mode}`);
+  return adapter({ providerConfig, payload });
+}
+
+export async function createProposalWithProvider({ providerConfig, payload }) {
+  const mode = String(providerConfig?.integration_mode || 'generic_api').toLowerCase();
+  const adapter = proposalRegistry[mode];
+  if (!adapter) throw new Error(`No proposal adapter for integration mode: ${mode}`);
+  return adapter({ providerConfig, payload });
+}

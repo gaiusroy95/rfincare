@@ -6,6 +6,8 @@ import { authorize } from '../middleware/authorize.js';
 import {
   completeInsurancePurchasePush,
   createInsuranceCheckout,
+  createInsuranceProposal,
+  fetchInsuranceQuote,
   getInsurancePurchaseById,
 } from '../lib/insurancePurchaseService.js';
 
@@ -15,6 +17,45 @@ insurancePurchasesRouter.post('/checkout', async (req, res, next) => {
   try {
     const data = await createInsuranceCheckout(req.body || {});
     res.status(201).json(data);
+  } catch (err) {
+    next(err);
+  }
+});
+
+insurancePurchasesRouter.post('/quote', async (req, res, next) => {
+  try {
+    const body = z.object({
+      productId: z.string().min(1),
+      customer: z.record(z.unknown()),
+      demographics: z.record(z.unknown()).optional(),
+      coverage: z.record(z.unknown()).optional(),
+    }).parse(req.body || {});
+    const quote = await fetchInsuranceQuote(body);
+    res.json(quote);
+  } catch (err) {
+    next(err);
+  }
+});
+
+insurancePurchasesRouter.post('/proposal', async (req, res, next) => {
+  try {
+    const body = z.object({
+      purchaseOrderId: z.string().min(1),
+      token: z.string().min(8),
+      quoteId: z.string().optional().nullable(),
+      returnUrl: z.string().url().optional().nullable(),
+      customer: z.record(z.unknown()),
+      demographics: z.record(z.unknown()).optional(),
+    }).parse(req.body || {});
+    const result = await createInsuranceProposal({
+      purchaseOrderId: body.purchaseOrderId,
+      publicToken: body.token,
+      quoteId: body.quoteId || null,
+      returnUrl: body.returnUrl || null,
+      customer: body.customer,
+      demographics: body.demographics || {},
+    });
+    res.json(result);
   } catch (err) {
     next(err);
   }
@@ -36,6 +77,10 @@ insurancePurchasesRouter.get('/:id', async (req, res, next) => {
       paymentCurrency: row.payment_currency,
       paymentStatus: row.payment_status,
       insurerPushStatus: row.insurer_push_status,
+      proposalNumber: row.proposal_number,
+      paymentUrl: row.insurer_payment_url,
+      paymentMode: row.insurer_payment_mode,
+      policyPdfUrl: row.policy_pdf_url,
       insurerReferenceId: row.insurer_reference_id,
       insurerPolicyNumber: row.insurer_policy_number,
       failureReason: row.failure_reason,

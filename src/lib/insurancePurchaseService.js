@@ -3,8 +3,7 @@ import { z } from 'zod';
 
 import { getPool } from '../db/pool.js';
 import { newId } from './ids.js';
-import { createRazorpayOrder } from './razorpayClient.js';
-import { pushPurchaseToInsurer } from './insurerAdapters/index.js';
+import { pushPurchaseToInsurer, fetchQuoteFromProvider, createProposalWithProvider } from './insurerAdapters/index.js';
 
 const CheckoutSchema = z.object({
   productId: z.string().min(1),
@@ -163,29 +162,17 @@ export async function createInsuranceCheckout(rawInput) {
     ...input.customer,
   };
 
-  const razorpayOrder = await createRazorpayOrder({
-    amountPaise: toPaise(input.selectedPremium),
-    currency: 'INR',
-    receipt: `insurance_${orderId.slice(0, 16)}`,
-    notes: {
-      orderId,
-      productId: product.id,
-      providerCode: product.insurer_provider_code || '',
-      customerEmail: input.customer.email,
-    },
-  });
-
   await pool.execute(
     `INSERT INTO insurance_purchase_orders (
        id, public_token, insurance_product_id, insurer_provider_code, insurer_product_code, insurer_plan_code,
        customer_name, customer_email, customer_phone, demographic_data, pricing_snapshot,
        payment_amount, payment_currency, payment_provider, payment_account_code,
-       payment_status, purchase_mode, insurer_push_status, razorpay_order_id
+       payment_status, purchase_mode, insurer_push_status, insurer_payment_mode
      ) VALUES (
        :id, :public_token, :insurance_product_id, :insurer_provider_code, :insurer_product_code, :insurer_plan_code,
        :customer_name, :customer_email, :customer_phone, :demographic_data::jsonb, :pricing_snapshot::jsonb,
        :payment_amount, :payment_currency, :payment_provider, :payment_account_code,
-       'created', :purchase_mode, 'not_started', :razorpay_order_id
+       'created', :purchase_mode, 'not_started', :insurer_payment_mode
      )`,
     {
       id: orderId,
@@ -201,10 +188,10 @@ export async function createInsuranceCheckout(rawInput) {
       pricing_snapshot: JSON.stringify(pricingSnapshot),
       payment_amount: input.selectedPremium,
       payment_currency: 'INR',
-      payment_provider: 'razorpay',
+      payment_provider: 'insurer_gateway',
       payment_account_code: product.payment_account_code || null,
       purchase_mode: product.purchase_mode || 'api',
-      razorpay_order_id: razorpayOrder.id,
+      insurer_payment_mode: 'redirect',
     },
   );
 
@@ -213,8 +200,7 @@ export async function createInsuranceCheckout(rawInput) {
     status: 'info',
     actorType: 'customer',
     requestPayload: { input: rawInput },
-    responsePayload: { razorpayOrderId: razorpayOrder.id },
-    message: 'Checkout created and Razorpay order generated',
+    message: 'Checkout created (awaiting quote/proposal/payment)',
   });
 
   return {
@@ -222,7 +208,6 @@ export async function createInsuranceCheckout(rawInput) {
     publicToken,
     paymentStatus: 'created',
     insurerPushStatus: 'not_started',
-    razorpay: razorpayOrder,
     product: {
       id: product.id,
       name: product.name,
@@ -230,6 +215,99 @@ export async function createInsuranceCheckout(rawInput) {
     },
     providerCode: providerConfig?.provider_code || product.insurer_provider_code || null,
   };
+}
+
+export async function fetchInsuranceQuote({ productId, customer, demographics, coverage }) {
+  const pool = getPool();
+  const [[productRow]] = await pool.execute(`SELECT * FROM insurance_products WHERE id = :id LIMIT 1`, { id: productId });
+  if (!productRow) {
+    const err = new Error('Insurance product not found');
+    err.status = 404;
+    throw err;
+  }
+  const product = normalizeProduct(productRow);
+  if (!product.purchase_enabled) {
+    const err = new Error('This plan is not enabled for on-site purchase');
+    err.status = 400;
+    throw err;
+  }
+  const providerConfig = await getProviderConfigByCode(pool, product.insurer_provider_code);
+  if (!providerConfig) {
+    const err = new Error('Insurer provider config is missing');
+    err.status = 400;
+    throw err;
+  }
+  const payload = { customer, demographics, coverage, product: { insurerProductCode: product.insurer_product_code, insurerPlanCode: product.insurer_plan_code } };
+  const res = await fetchQuoteFromProvider({ providerConfig, payload });
+  return res;
+}
+
+export async function createInsuranceProposal({ purchaseOrderId, publicToken, customer, demographics, quoteId, returnUrl }) {
+  const pool = getPool();
+  const [[order]] = await pool.execute(
+    `SELECT * FROM insurance_purchase_orders WHERE id = :id AND public_token = :t LIMIT 1`,
+    { id: purchaseOrderId, t: publicToken },
+  );
+  if (!order) {
+    const err = new Error('Purchase order not found');
+    err.status = 404;
+    throw err;
+  }
+  const [[product]] = await pool.execute(`SELECT * FROM insurance_products WHERE id = :id LIMIT 1`, { id: order.insurance_product_id });
+  const providerConfig = await getProviderConfigByCode(pool, order.insurer_provider_code);
+  if (!providerConfig) {
+    const err = new Error('Insurer provider config is missing');
+    err.status = 400;
+    throw err;
+  }
+
+  const payload = {
+    quoteId,
+    customer,
+    demographics,
+    returnUrl,
+    product: {
+      insurerProductCode: order.insurer_product_code,
+      insurerPlanCode: order.insurer_plan_code,
+    },
+  };
+
+  const result = await createProposalWithProvider({ providerConfig, payload });
+  const paymentUrl = result.paymentUrl || result.payment_link || null;
+  const paymentMode = result.paymentMode || result.payment_mode || 'redirect';
+  const proposalId = result.proposalId || result.proposal_id || null;
+  const proposalNumber = result.proposalNumber || result.proposal_number || null;
+
+  await pool.execute(
+    `UPDATE insurance_purchase_orders
+     SET quote_id = COALESCE(:quote_id, quote_id),
+         proposal_id = :proposal_id,
+         proposal_number = :proposal_number,
+         insurer_payment_url = :payment_url,
+         insurer_payment_mode = :payment_mode,
+         payment_status = 'pending_payment',
+         updated_at = CURRENT_TIMESTAMP
+     WHERE id = :id`,
+    {
+      id: order.id,
+      quote_id: quoteId || null,
+      proposal_id: proposalId,
+      proposal_number: proposalNumber,
+      payment_url: paymentUrl,
+      payment_mode: paymentMode,
+    },
+  );
+
+  await recordEvent(pool, order.id, {
+    type: 'proposal_created',
+    status: 'info',
+    actorType: 'customer',
+    requestPayload: payload,
+    responsePayload: result,
+    message: 'Proposal created with insurer/aggregator',
+  });
+
+  return { proposalId, proposalNumber, paymentUrl, paymentMode };
 }
 
 export async function getInsurancePurchaseById(id, publicToken) {
