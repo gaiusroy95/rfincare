@@ -57,6 +57,8 @@ import { governmentSchemesRouter } from './routes/governmentSchemes.js';
 import { investmentProductsRouter } from './routes/investmentProducts.js';
 import { paymentsRouter } from './routes/payments.js';
 import { translateRouter } from './routes/translate.js';
+import { calculatorsRouter } from './routes/calculators.js';
+import { portalCustomerRouter } from './routes/portalCustomer.js';
 import { getCorsOptions } from './lib/corsOptions.js';
 import { getUploadDir } from './lib/uploadPaths.js';
 import { isCloudStorage } from './lib/storage/index.js';
@@ -138,6 +140,10 @@ export function createApp({ serveStatic = true } = {}) {
   app.use('/api/investment-products', investmentProductsRouter);
   app.use('/translate', translateRouter);
   app.use('/api/translate', translateRouter);
+  app.use('/calculators', calculatorsRouter);
+  app.use('/api/calculators', calculatorsRouter);
+  app.use('/portal/customer', portalCustomerRouter);
+  app.use('/api/portal/customer', portalCustomerRouter);
 
   if (isCloudStorage()) {
     app.use('/uploads', uploadsRouter);
