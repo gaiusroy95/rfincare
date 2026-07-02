@@ -45,7 +45,11 @@ function monthlyIncomeFromPrincipal(principal, annualRate) {
 export function calculatePostOfficeMaturity(input = {}) {
   const type = String(input.calculatorType || 'time_deposit').toLowerCase();
   const annualRate = Number(input.annualRate ?? 7.1);
-  const tenureYears = Number(input.tenureYears ?? input.tenureMonths ? Number(input.tenureMonths) / 12 : 5);
+  const tenureYears = input.tenureYears != null && input.tenureYears !== ''
+    ? Number(input.tenureYears)
+    : input.tenureMonths != null && input.tenureMonths !== ''
+      ? Number(input.tenureMonths) / 12
+      : 5;
   const tenureMonths = Number(input.tenureMonths ?? Math.round(tenureYears * 12));
   const principal = Number(input.principal ?? input.lumpSum ?? 100000);
   const monthlyDeposit = Number(input.monthlyDeposit ?? input.monthlyContribution ?? 0);

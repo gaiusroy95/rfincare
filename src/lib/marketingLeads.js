@@ -73,7 +73,7 @@ export async function upsertMarketingLead(
          source = ${sqlCoalescePatch('source', 'source')},
          consent_accepted = consent_accepted OR :consent,
          session_key = ${sqlCoalescePatch('session_key', 'session_key')},
-         application_id = ${sqlCoalescePatch('application_id', 'application_id', 'INTEGER')},
+         application_id = ${sqlCoalescePatch('application_id', 'application_id')},
          updated_at = NOW()
        WHERE id = :id`,
       {

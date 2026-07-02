@@ -15,6 +15,7 @@ import {
   normalizeCategoryList,
   MUTUAL_FUND_CATEGORY_SLUGS,
 } from '../lib/mutualFundTaxonomy.js';
+import { calculateMutualFundReturns } from '../lib/mutualFundCalculator.js';
 
 export const mutualFundsRouter = Router();
 
@@ -282,6 +283,26 @@ function buildListQuery(query) {
 
 mutualFundsRouter.get('/taxonomy', async (_req, res) => {
   res.json(getMutualFundTaxonomy());
+});
+
+const MutualFundCalculateSchema = z.object({
+  investmentMode: z.enum(['sip', 'lumpsum']).optional(),
+  monthlyInvestment: z.coerce.number().optional(),
+  lumpsumAmount: z.coerce.number().optional(),
+  principal: z.coerce.number().optional(),
+  expectedReturn: z.coerce.number().optional(),
+  annualReturn: z.coerce.number().optional(),
+  expenseRatio: z.coerce.number().optional(),
+  tenureYears: z.coerce.number().optional(),
+});
+
+mutualFundsRouter.post('/calculate', async (req, res, next) => {
+  try {
+    const input = MutualFundCalculateSchema.parse(req.body);
+    res.json(calculateMutualFundReturns(input));
+  } catch (err) {
+    next(err);
+  }
 });
 
 mutualFundsRouter.get('/', async (req, res, next) => {

@@ -61,6 +61,20 @@ function toBool(value) {
   return value === true || value === 'true' || value === 1 || value === '1';
 }
 
+function formatInsurerRow(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    slug: row.slug,
+    logoUrl: row.logo_url || null,
+    websiteUrl: row.website_url || null,
+    displayPriority: row.display_priority ?? 0,
+    status: row.status,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
 function formatProductRow(row) {
   const categories = parseCategories(row.categories);
   return {
@@ -349,6 +363,120 @@ function buildListQuery(query) {
 insuranceProductsRouter.get('/taxonomy', async (_req, res) => {
   res.json(getInsuranceTaxonomy());
 });
+
+const InsurerSchema = z.object({
+  name: z.string().min(1),
+  slug: z.string().optional().nullable(),
+  logoUrl: z.preprocess(emptyToNull, z.union([z.string().url(), z.string().regex(/^\/uploads\/.+/i), z.null()]).optional()),
+  websiteUrl: z.preprocess(emptyToNull, z.union([z.string().url(), z.null()]).optional()),
+  displayPriority: z.coerce.number().optional(),
+  status: z.enum(['active', 'inactive']).optional(),
+});
+
+function normalizeInsurerBody(body) {
+  const parsed = InsurerSchema.parse(body);
+  return {
+    name: parsed.name.trim(),
+    slug: parsed.slug || slugify(parsed.name),
+    logo_url: parsed.logoUrl || null,
+    website_url: parsed.websiteUrl || null,
+    display_priority: parsed.displayPriority ?? 0,
+    status: parsed.status || 'active',
+  };
+}
+
+insuranceProductsRouter.get('/insurers', async (req, res, next) => {
+  try {
+    await ensureInsuranceSchema();
+    const pool = getPool();
+    const includeInactive = req.query.includeInactive === 'true';
+    const where = includeInactive ? '' : "WHERE status = 'active'";
+    const [rows] = await pool.execute(
+      `SELECT * FROM insurance_insurers ${where}
+       ORDER BY display_priority DESC, name ASC`,
+    );
+    res.json(rows.map(formatInsurerRow));
+  } catch (err) {
+    next(err);
+  }
+});
+
+insuranceProductsRouter.post(
+  '/insurers',
+  authenticate,
+  authorize({ resource: 'banks', action: 'update' }),
+  async (req, res, next) => {
+    try {
+      await ensureInsuranceSchema();
+      const pool = getPool();
+      const input = normalizeInsurerBody(req.body);
+      const id = newId();
+      await pool.execute(
+        `INSERT INTO insurance_insurers (
+          id, name, slug, logo_url, website_url, display_priority, status
+        ) VALUES (
+          :id, :name, :slug, :logo_url, :website_url, :display_priority, :status
+        )`,
+        { id, ...input },
+      );
+      const [[row]] = await pool.execute(`SELECT * FROM insurance_insurers WHERE id = :id`, { id });
+      res.status(201).json(formatInsurerRow(row));
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+insuranceProductsRouter.put(
+  '/insurers/:id',
+  authenticate,
+  authorize({ resource: 'banks', action: 'update' }),
+  async (req, res, next) => {
+    try {
+      await ensureInsuranceSchema();
+      const pool = getPool();
+      const input = normalizeInsurerBody(req.body);
+      const [[existing]] = await pool.execute(
+        `SELECT id FROM insurance_insurers WHERE id = :id LIMIT 1`,
+        { id: req.params.id },
+      );
+      if (!existing) return res.status(404).json({ error: 'Insurance company not found' });
+      await pool.execute(
+        `UPDATE insurance_insurers SET
+          name = :name,
+          slug = :slug,
+          logo_url = :logo_url,
+          website_url = :website_url,
+          display_priority = :display_priority,
+          status = :status,
+          updated_at = CURRENT_TIMESTAMP
+        WHERE id = :id`,
+        { id: req.params.id, ...input },
+      );
+      const [[row]] = await pool.execute(`SELECT * FROM insurance_insurers WHERE id = :id`, { id: req.params.id });
+      res.json(formatInsurerRow(row));
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+insuranceProductsRouter.delete(
+  '/insurers/:id',
+  authenticate,
+  authorize({ resource: 'banks', action: 'update' }),
+  async (req, res, next) => {
+    try {
+      await ensureInsuranceSchema();
+      const pool = getPool();
+      const [result] = await pool.execute(`DELETE FROM insurance_insurers WHERE id = :id`, { id: req.params.id });
+      if (!result.affectedRows) return res.status(404).json({ error: 'Insurance company not found' });
+      res.json({ success: true });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
 
 insuranceProductsRouter.get(
   '/provider-configs',

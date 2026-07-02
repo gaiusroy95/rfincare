@@ -10,6 +10,7 @@ import {
   getInvestmentMarketplaceTaxonomy,
   normalizeCategoryList,
 } from '../lib/investmentMarketplaceTaxonomy.js';
+import { calculateInvestmentReturns } from '../lib/investmentCalculator.js';
 
 export const investmentProductsRouter = Router();
 
@@ -168,6 +169,26 @@ function buildListQuery(query) {
 
 investmentProductsRouter.get('/taxonomy', async (_req, res) => {
   res.json(getInvestmentMarketplaceTaxonomy());
+});
+
+const InvestmentCalculateSchema = z.object({
+  calculatorType: z.string().optional(),
+  investmentAmount: z.coerce.number().optional(),
+  principal: z.coerce.number().optional(),
+  annualReturn: z.coerce.number().optional(),
+  expectedReturn: z.coerce.number().optional(),
+  couponRate: z.coerce.number().optional(),
+  tenureYears: z.coerce.number().optional(),
+  tenureMonths: z.coerce.number().optional(),
+});
+
+investmentProductsRouter.post('/calculate', async (req, res, next) => {
+  try {
+    const input = InvestmentCalculateSchema.parse(req.body);
+    res.json(calculateInvestmentReturns(input));
+  } catch (err) {
+    next(err);
+  }
 });
 
 investmentProductsRouter.get('/', async (req, res, next) => {
