@@ -59,6 +59,8 @@ import { paymentsRouter } from './routes/payments.js';
 import { translateRouter } from './routes/translate.js';
 import { calculatorsRouter } from './routes/calculators.js';
 import { portalCustomerRouter } from './routes/portalCustomer.js';
+import { engagementRouter } from './routes/engagement.js';
+import { mutualFundSipsRouter } from './routes/mutualFundSips.js';
 import { getCorsOptions } from './lib/corsOptions.js';
 import { getUploadDir } from './lib/uploadPaths.js';
 import { isCloudStorage } from './lib/storage/index.js';
@@ -130,6 +132,8 @@ export function createApp({ serveStatic = true } = {}) {
   app.use('/webhooks', insuranceWebhooksRouter);
   app.use('/mutual-funds', mutualFundsRouter);
   app.use('/api/mutual-funds', mutualFundsRouter);
+  app.use('/mutual-fund-sips', mutualFundSipsRouter);
+  app.use('/api/mutual-fund-sips', mutualFundSipsRouter);
   app.use('/fixed-income', fixedIncomeRouter);
   app.use('/api/fixed-income', fixedIncomeRouter);
   app.use('/post-office-investments', postOfficeInvestmentsRouter);
@@ -144,6 +148,8 @@ export function createApp({ serveStatic = true } = {}) {
   app.use('/api/calculators', calculatorsRouter);
   app.use('/portal/customer', portalCustomerRouter);
   app.use('/api/portal/customer', portalCustomerRouter);
+  app.use('/engagement', engagementRouter);
+  app.use('/api/engagement', engagementRouter);
 
   if (isCloudStorage()) {
     app.use('/uploads', uploadsRouter);

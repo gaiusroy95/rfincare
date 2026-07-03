@@ -27,6 +27,7 @@ import {
   resetStaffPassword,
 } from '../lib/adminStaffManage.js';
 import { parseCsvToRows } from '../lib/parseCsv.js';
+import { buildFunnelAnalytics } from '../lib/funnelAnalytics.js';
 import {
   buildAgentCommissionTemplateCsv,
   fetchAgentCommissionCirculars,
@@ -189,6 +190,22 @@ adminRouter.get(
         active_agents: Number(agentStats?.active_agents || 0),
         approval_rate: approvalRate,
       });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+adminRouter.get(
+  '/funnel-analytics',
+  authenticate,
+  authorize({ resource: 'reports', action: 'read' }),
+  async (req, res, next) => {
+    try {
+      const pool = getPool();
+      const days = parseInt(req.query.days, 10) || 30;
+      const data = await buildFunnelAnalytics(pool, { days });
+      res.json(data);
     } catch (err) {
       next(err);
     }

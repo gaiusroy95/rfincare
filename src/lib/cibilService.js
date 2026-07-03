@@ -83,19 +83,20 @@ async function getActiveVendor(pool) {
 }
 
 async function sandboxPull({ vendor, application, customer }) {
-  const data = parseJson(application.data);
+  const data = parseJson(application?.data);
   const score = 680 + Math.floor(Math.random() * 120);
   const reportDir = resolve(getUploadDir(), 'cibil-reports');
   mkdirSync(reportDir, { recursive: true });
-  const fileName = `${application.id}-${Date.now()}.pdf`;
+  const refId = application?.id || customer?.id || newId();
+  const fileName = `${refId}-${Date.now()}.pdf`;
   const reportPath = resolve(reportDir, fileName);
 
   const lines = [
     'Rfincare — Credit Bureau Report (Sandbox)',
     `Vendor: ${vendor.display_name}`,
-    `Application: ${application.application_number || application.id}`,
-    `Customer: ${customer.full_name || '—'}`,
-    `PAN: ${data.pan_number || data.panNumber || '—'}`,
+    `Application: ${application?.application_number || application?.id || 'Customer pull'}`,
+    `Customer: ${customer?.full_name || '—'}`,
+    `PAN: ${data?.pan_number || data?.panNumber || '—'}`,
     `Score: ${score}`,
     `Checked at: ${new Date().toISOString()}`,
     '',
@@ -227,4 +228,105 @@ export async function requireSuccessfulCibilForSubmit(applicationId) {
     return pull;
   }
   return latest;
+}
+
+const CUSTOMER_PULL_COOLDOWN_DAYS = 30;
+
+export async function getLatestCustomerCibilCheck(customerId) {
+  await ensureMilestone4Schema();
+  const pool = getPool();
+  const [[row]] = await pool.execute(
+    `SELECT cc.*, cv.display_name AS vendor_name, cv.sandbox_mode
+     FROM cibil_checks cc
+     LEFT JOIN cibil_vendors cv ON cv.vendor_key = cc.vendor_key
+     WHERE cc.customer_id = :id AND cc.status = 'success'
+     ORDER BY cc.checked_at DESC LIMIT 1`,
+    { id: customerId },
+  );
+  if (!row) return null;
+  return {
+    id: row.id,
+    applicationId: row.application_id,
+    vendorKey: row.vendor_key,
+    vendorName: row.vendor_name,
+    sandboxMode: Boolean(row.sandbox_mode),
+    status: row.status,
+    creditScore: row.credit_score,
+    reportPath: row.report_path,
+    errorMessage: row.error_message,
+    checkedAt: row.checked_at,
+  };
+}
+
+export async function pullCibilForCustomer(customerId, { forceSandbox = false } = {}) {
+  await ensureMilestone4Schema();
+  const pool = getPool();
+  const [[customer]] = await pool.execute(
+    `SELECT id, full_name, email, phone, role FROM user_profiles WHERE id = :id LIMIT 1`,
+    { id: customerId },
+  );
+  if (!customer) {
+    const e = new Error('Customer not found');
+    e.status = 404;
+    throw e;
+  }
+  if (customer.role !== 'customer') {
+    const e = new Error('Customer access only');
+    e.status = 403;
+    throw e;
+  }
+
+  if (!forceSandbox) {
+    const latest = await getLatestCustomerCibilCheck(customerId);
+    if (latest?.checkedAt) {
+      const daysSince =
+        (Date.now() - new Date(latest.checkedAt).getTime()) / (1000 * 60 * 60 * 24);
+      if (daysSince < CUSTOMER_PULL_COOLDOWN_DAYS) {
+        const e = new Error(
+          `Credit score was checked recently. You can request again in ${Math.ceil(CUSTOMER_PULL_COOLDOWN_DAYS - daysSince)} day(s).`,
+        );
+        e.status = 429;
+        e.latestCheck = latest;
+        throw e;
+      }
+    }
+  }
+
+  const vendor = await getActiveVendor(pool);
+  if (!vendor) {
+    const e = new Error('No active CIBIL vendor configured in admin panel');
+    e.status = 400;
+    throw e;
+  }
+
+  const stubApplication = { id: customer.id, data: '{}' };
+  const useSandbox = forceSandbox || Boolean(vendor.sandbox_mode);
+  const result = useSandbox
+    ? await sandboxPull({ vendor, application: stubApplication, customer })
+    : await productionPull({ vendor, application: stubApplication, customer });
+
+  const checkId = newId();
+  await pool.execute(
+    `INSERT INTO cibil_checks
+     (id, application_id, customer_id, vendor_key, status, credit_score, report_path, error_message, response_payload)
+     VALUES (:id, NULL, :cust, :vendor, :status, :score, :path, :err, :resp)`,
+    {
+      id: checkId,
+      cust: customerId,
+      vendor: vendor.vendor_key,
+      status: result.status,
+      score: result.creditScore,
+      path: result.reportPath,
+      err: result.errorMessage || null,
+      resp: JSON.stringify({ ...result.response, source: 'customer_portal' }),
+    },
+  );
+
+  return {
+    checkId,
+    vendorKey: vendor.vendor_key,
+    vendorName: vendor.display_name,
+    sandboxMode: useSandbox,
+    ...result,
+  };
 }

@@ -19,6 +19,10 @@ import {
   requireEmployeeModuleAccess,
   getEffectiveEmployeeAccess,
 } from '../lib/employeeAccessControls.js';
+import {
+  fetchMarketplaceEnquiries,
+  isMarketplaceProductFilter,
+} from '../lib/marketplaceEnquiries.js';
 
 export const loanApplicationsRouter = Router();
 
@@ -182,6 +186,7 @@ function formatApplication(row) {
   const loan = extractLoanFields(data);
   return {
     id: row.id,
+    record_type: row.record_type || 'loan_application',
     application_number: row.application_number,
     customer_id: row.customer_id,
     agent_id: row.agent_id,
@@ -280,14 +285,18 @@ function buildListQuery(role, userId, filters) {
   }
 
   if (filters.loanType && filters.loanType !== 'all') {
-    const lt = String(filters.loanType).toLowerCase().replace(/-/g, '_');
-    const needle = lt.replace(/_loan$/, '');
-    conditions.push(`(
-      LOWER(COALESCE(la.data->>'loan_type', la.data->>'loanType', la.data->>'loan_purpose', la.data->>'loanPurpose', '')) LIKE :loanType
-      OR LOWER(COALESCE(la.data->>'loan_type', la.data->>'loanType', la.data->>'loan_purpose', la.data->>'loanPurpose', '')) LIKE :loanTypeLoan
-    )`);
-    params.loanType = `%${needle}%`;
-    params.loanTypeLoan = `%${lt}%`;
+    if (isMarketplaceProductFilter(filters.loanType)) {
+      conditions.push('1 = 0');
+    } else {
+      const lt = String(filters.loanType).toLowerCase().replace(/-/g, '_');
+      const needle = lt.replace(/_loan$/, '');
+      conditions.push(`(
+        LOWER(COALESCE(la.data->>'loan_type', la.data->>'loanType', la.data->>'loan_purpose', la.data->>'loanPurpose', '')) LIKE :loanType
+        OR LOWER(COALESCE(la.data->>'loan_type', la.data->>'loanType', la.data->>'loan_purpose', la.data->>'loanPurpose', '')) LIKE :loanTypeLoan
+      )`);
+      params.loanType = `%${needle}%`;
+      params.loanTypeLoan = `%${lt}%`;
+    }
   }
 
   if (filters.priority && filters.priority !== 'all') {
@@ -382,40 +391,47 @@ loanApplicationsRouter.get(
       };
       const { where, params } = buildListQuery(req.auth.role, req.auth.userId, filters);
       const includePhotos = req.query.includePhotos === 'true';
+      const includeMarketplaceEnquiries = req.query.includeMarketplaceEnquiries === 'true';
       const page = Math.max(1, parseInt(req.query.page, 10) || 0);
       const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 0));
       const usePagination = page > 0 && pageSize > 0;
 
-      if (usePagination) {
-        const [[{ total }]] = await pool.execute(
-          `SELECT COUNT(*)::int AS total
-           FROM loan_applications la
-           LEFT JOIN user_profiles c ON c.id = la.customer_id
-           ${where}`,
-          params,
-        );
-        const offset = (page - 1) * pageSize;
-        const [rows] = await pool.execute(
-          `${LIST_SELECT} ${where} ORDER BY la.created_at DESC LIMIT :limit OFFSET :offset`,
-          { ...params, limit: pageSize, offset },
-        );
-        const withPhotos = includePhotos ? await attachCustomerPhotoUrls(pool, rows) : rows;
-        const items = withPhotos.map(formatApplication);
-        return res.json({
-          items,
-          total: Number(total || 0),
-          page,
-          pageSize,
-          hasMore: offset + items.length < Number(total || 0),
-        });
-      }
-
-      const [rows] = await pool.execute(
+      const [loanRows] = await pool.execute(
         `${LIST_SELECT} ${where} ORDER BY la.created_at DESC`,
         params,
       );
-      const withPhotos = includePhotos ? await attachCustomerPhotoUrls(pool, rows) : rows;
-      res.json(withPhotos.map(formatApplication));
+      const loanRowsWithPhotos = includePhotos
+        ? await attachCustomerPhotoUrls(pool, loanRows)
+        : loanRows;
+      let items = loanRowsWithPhotos.map((row) =>
+        formatApplication({ ...row, record_type: 'loan_application' }),
+      );
+
+      if (includeMarketplaceEnquiries) {
+        let enquiries = await fetchMarketplaceEnquiries(pool, filters);
+        if (filters.priority && filters.priority !== 'all' && filters.priority !== 'medium') {
+          enquiries = [];
+        }
+        items = [...items, ...enquiries];
+        items.sort(
+          (a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime(),
+        );
+      }
+
+      if (usePagination) {
+        const total = items.length;
+        const offset = (page - 1) * pageSize;
+        const pageItems = items.slice(offset, offset + pageSize);
+        return res.json({
+          items: pageItems,
+          total,
+          page,
+          pageSize,
+          hasMore: offset + pageItems.length < total,
+        });
+      }
+
+      res.json(items);
     } catch (err) {
       next(err);
     }

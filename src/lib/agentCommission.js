@@ -17,6 +17,15 @@ const LOAN_TYPE_ALIASES = {
   business_loan: 'business_loan',
   auto_loan: 'auto_loan',
   education_loan: 'education_loan',
+  insurance: 'insurance',
+  mutual_funds: 'mutual_funds',
+  mutual_fund: 'mutual_funds',
+  mutual_fund_sip: 'mutual_fund_sip',
+  mf_sip: 'mutual_fund_sip',
+  sip: 'mutual_fund_sip',
+  post_office: 'post_office',
+  government_scheme: 'government_scheme',
+  investment: 'investment',
 };
 
 export const AGENT_COMMISSION_CSV_HEADERS = [
@@ -98,7 +107,8 @@ export function normalizeCommissionCsvRow(raw) {
 
   const loanRaw = pickField(raw, 'loan_type') || 'home_loan';
   const loanKey = loanRaw.toLowerCase().replace(/\s+/g, '_');
-  const loanType = LOAN_TYPE_ALIASES[loanKey] || (loanKey.endsWith('_loan') ? loanKey : 'home_loan');
+  const loanType = LOAN_TYPE_ALIASES[loanKey]
+    || (loanKey.endsWith('_loan') ? loanKey : loanKey);
 
   let commissionType = (pickField(raw, 'commission_type') || 'percentage').toLowerCase();
   if (commissionType === '%' || commissionType === 'percent') commissionType = 'percentage';

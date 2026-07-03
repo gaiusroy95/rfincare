@@ -9,6 +9,7 @@ import {
   createInsuranceProposal,
   fetchInsuranceQuote,
   getInsurancePurchaseById,
+  getInsurancePurchaseStatus,
 } from '../lib/insurancePurchaseService.js';
 
 export const insurancePurchasesRouter = Router();
@@ -64,30 +65,9 @@ insurancePurchasesRouter.post('/proposal', async (req, res, next) => {
 insurancePurchasesRouter.get('/:id', async (req, res, next) => {
   try {
     const token = z.string().min(8).parse(req.query.token);
-    const row = await getInsurancePurchaseById(req.params.id, token);
+    const row = await getInsurancePurchaseStatus(req.params.id, token);
     if (!row) return res.status(404).json({ error: 'Purchase order not found' });
-    res.json({
-      id: row.id,
-      customerName: row.customer_name,
-      customerEmail: row.customer_email,
-      customerPhone: row.customer_phone,
-      productName: row.product_name,
-      insurerName: row.insurer_name,
-      paymentAmount: Number(row.payment_amount),
-      paymentCurrency: row.payment_currency,
-      paymentStatus: row.payment_status,
-      insurerPushStatus: row.insurer_push_status,
-      proposalNumber: row.proposal_number,
-      paymentUrl: row.insurer_payment_url,
-      paymentMode: row.insurer_payment_mode,
-      policyPdfUrl: row.policy_pdf_url,
-      insurerReferenceId: row.insurer_reference_id,
-      insurerPolicyNumber: row.insurer_policy_number,
-      failureReason: row.failure_reason,
-      paidAt: row.paid_at,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-    });
+    res.json(row);
   } catch (err) {
     next(err);
   }

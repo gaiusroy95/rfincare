@@ -21,6 +21,10 @@ import {
   buildAgentMetricTrends,
 } from '../lib/agentPerformanceAnalytics.js';
 import { fetchAgentCommissionCirculars } from '../lib/agentCommission.js';
+import {
+  fetchAgentCommissionLedger,
+  mapLedgerEntryToCommission,
+} from '../lib/agentCommissionLedger.js';
 import { buildAgentRecentActivities } from '../lib/agentRecentActivities.js';
 
 export const portalDashboardsRouter = Router();
@@ -102,6 +106,8 @@ portalDashboardsRouter.get('/agent/dashboard', authenticate, async (req, res, ne
         id: row.id,
         clientName: row.customer_full_name || 'Customer',
         loanType: data.loan_type_label || data.loan_type || data.loan_purpose || 'Loan',
+        productType: 'loan',
+        sourceType: 'loan_application',
         amount,
         status: commissionStatusForApplication(row.status),
         applicationStatus: row.status,
@@ -111,16 +117,57 @@ portalDashboardsRouter.get('/agent/dashboard', authenticate, async (req, res, ne
       };
     });
 
-    const commissionEstimate = commissionEntries
+    const ledgerRows = await fetchAgentCommissionLedger(pool, agentId);
+    let insuranceOrders = [];
+    let sipOrders = [];
+    if (ledgerRows.length) {
+      const insuranceIds = ledgerRows
+        .filter((r) => r.source_type === 'insurance_purchase')
+        .map((r) => r.source_id);
+      const sipIds = ledgerRows.filter((r) => r.source_type === 'mf_sip').map((r) => r.source_id);
+      const fetchByIds = async (table, ids) => {
+        if (!ids.length) return [];
+        const params = {};
+        const placeholders = ids.map((id, i) => {
+          params[`id${i}`] = id;
+          return `:id${i}`;
+        });
+        const [rows] = await pool.execute(
+          `SELECT id, customer_name FROM ${table} WHERE id IN (${placeholders.join(',')})`,
+          params,
+        );
+        return rows || [];
+      };
+      insuranceOrders = await fetchByIds('insurance_purchase_orders', insuranceIds);
+      sipOrders = await fetchByIds('mutual_fund_sip_orders', sipIds);
+    }
+    const ledgerEntries = ledgerRows.map((row) =>
+      mapLedgerEntryToCommission(row, { insuranceOrders, sipOrders }),
+    );
+    const allCommissionEntries = [...commissionEntries, ...ledgerEntries].sort(
+      (a, b) => new Date(b.date || 0).getTime() - new Date(a.date || 0).getTime(),
+    );
+
+    const commissionEstimate = allCommissionEntries
       .filter((c) => c.status === 'paid')
       .reduce((sum, c) => sum + c.amount, 0);
-    const pendingCommission = commissionEntries
+    const pendingCommission = allCommissionEntries
       .filter((c) => c.status !== 'paid')
       .reduce((sum, c) => sum + c.amount, 0);
-    const totalEstCommission = commissionEntries.reduce((sum, c) => sum + (c.amount || 0), 0);
+    const totalEstCommission = allCommissionEntries.reduce((sum, c) => sum + (c.amount || 0), 0);
 
-    const trends = buildAgentMetricTrends(apps, commissionEntries);
-    const performanceAnalytics = buildAgentPerformanceAnalytics(apps, commissionEntries);
+    const commissionBreakdown = {
+      loans: commissionEntries.reduce((sum, c) => sum + (c.amount || 0), 0),
+      insurance: ledgerEntries
+        .filter((c) => c.sourceType === 'insurance_purchase')
+        .reduce((sum, c) => sum + (c.amount || 0), 0),
+      sip: ledgerEntries
+        .filter((c) => c.sourceType === 'mf_sip')
+        .reduce((sum, c) => sum + (c.amount || 0), 0),
+    };
+
+    const trends = buildAgentMetricTrends(apps, allCommissionEntries);
+    const performanceAnalytics = buildAgentPerformanceAnalytics(apps, allCommissionEntries);
     const circulars = await fetchAgentCommissionCirculars(pool);
 
     const learningResources = await getAgentLearningFeed(pool, agentId);
@@ -130,6 +177,33 @@ portalDashboardsRouter.get('/agent/dashboard', authenticate, async (req, res, ne
       commissionConfig,
       limit: 15,
     });
+
+    let attributedLeads = 0;
+    let sipOrders = 0;
+    if (agentCode) {
+      try {
+        const [[leadRow]] = await pool.execute(
+          `SELECT COUNT(*)::int AS c FROM marketing_leads
+           WHERE sourced_agent_code = :code`,
+          { code: agentCode },
+        );
+        attributedLeads = Number(leadRow?.c || 0);
+      } catch {
+        /* column optional */
+      }
+      try {
+        const [[sipRow]] = await pool.execute(
+          `SELECT COUNT(*)::int AS c FROM mutual_fund_sip_orders
+           WHERE sourced_agent_code = :code`,
+          { code: agentCode },
+        );
+        sipOrders = Number(sipRow?.c || 0);
+      } catch {
+        /* table optional */
+      }
+    }
+
+    const referralBase = process.env.PUBLIC_APP_URL || process.env.FRONTEND_URL || 'https://rfincare.com';
 
     res.json({
       profile: {
@@ -183,16 +257,30 @@ portalDashboardsRouter.get('/agent/dashboard', authenticate, async (req, res, ne
       ],
       clients: apps.map(mapAppToClient),
       commissions: commissionConfig ? [commissionConfig] : [],
-      commissionEntries,
+      commissionEntries: allCommissionEntries,
       commissionSummary: {
         totalEarned: commissionEstimate,
         pending: pendingCommission,
+        breakdown: commissionBreakdown,
       },
       circulars,
       learningResources,
       recentActivities,
       performanceAnalytics,
       weeklyPerformance: performanceAnalytics.month,
+      attribution: {
+        agentCode,
+        attributedLeads,
+        sipOrders,
+        shareLinks: agentCode
+          ? {
+              homepage: `${referralBase}/?agent=${encodeURIComponent(agentCode)}`,
+              insurance: `${referralBase}/insurance-marketplace?agent=${encodeURIComponent(agentCode)}`,
+              mutualFunds: `${referralBase}/mutual-fund-marketplace?agent=${encodeURIComponent(agentCode)}`,
+              calculators: `${referralBase}/resources/calculators?agent=${encodeURIComponent(agentCode)}`,
+            }
+          : null,
+      },
     });
   } catch (err) {
     next(err);

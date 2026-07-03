@@ -3,6 +3,9 @@ import { z } from 'zod';
 
 import { getPool } from '../db/pool.js';
 import { newId } from './ids.js';
+import { normalizeAgentCode, resolveAgentByCode } from './agentAttribution.js';
+import { recordAgentCommission } from './agentCommissionLedger.js';
+import { upsertMarketingLead } from './marketingLeads.js';
 import { pushPurchaseToInsurer, fetchQuoteFromProvider, createProposalWithProvider } from './insurerAdapters/index.js';
 
 const CheckoutSchema = z.object({
@@ -25,6 +28,8 @@ const CheckoutSchema = z.object({
   }),
   demographicData: z.record(z.unknown()).optional(),
   sourceProfile: z.record(z.unknown()).optional(),
+  sourcedAgentCode: z.string().optional().nullable(),
+  agentCode: z.string().optional().nullable(),
 });
 
 function parseJson(value, fallback) {
@@ -156,23 +161,52 @@ export async function createInsuranceCheckout(rawInput) {
 
   const orderId = newId();
   const publicToken = createPublicToken();
+  const agentCode = normalizeAgentCode(input.sourcedAgentCode || input.agentCode);
+  let resolvedAgent = null;
+  if (agentCode) {
+    resolvedAgent = await resolveAgentByCode(pool, agentCode);
+  }
+
   const demographicData = {
     ...input.demographicData,
     ...input.sourceProfile,
     ...input.customer,
+    sourcedAgentCode: resolvedAgent?.agentCode || agentCode || null,
   };
+
+  try {
+    const { row: lead } = await upsertMarketingLead(pool, {
+      fullName: input.customer.fullName,
+      email: input.customer.email,
+      phone: input.customer.phone,
+      loanType: 'insurance',
+      source: 'insurance_purchase',
+      consentAccepted: true,
+      status: 'profile_complete',
+    });
+    if (agentCode && lead?.id) {
+      await pool.execute(
+        `UPDATE marketing_leads SET sourced_agent_code = :code WHERE id = :id`,
+        { code: resolvedAgent?.agentCode || agentCode, id: lead.id },
+      );
+    }
+  } catch {
+    /* lead attribution is best-effort */
+  }
 
   await pool.execute(
     `INSERT INTO insurance_purchase_orders (
        id, public_token, insurance_product_id, insurer_provider_code, insurer_product_code, insurer_plan_code,
        customer_name, customer_email, customer_phone, demographic_data, pricing_snapshot,
        payment_amount, payment_currency, payment_provider, payment_account_code,
-       payment_status, purchase_mode, insurer_push_status, insurer_payment_mode
+       payment_status, purchase_mode, insurer_push_status, insurer_payment_mode,
+       sourced_agent_code
      ) VALUES (
        :id, :public_token, :insurance_product_id, :insurer_provider_code, :insurer_product_code, :insurer_plan_code,
        :customer_name, :customer_email, :customer_phone, :demographic_data::jsonb, :pricing_snapshot::jsonb,
        :payment_amount, :payment_currency, :payment_provider, :payment_account_code,
-       'created', :purchase_mode, 'not_started', :insurer_payment_mode
+       'created', :purchase_mode, 'not_started', :insurer_payment_mode,
+       :sourced_agent_code
      )`,
     {
       id: orderId,
@@ -192,6 +226,7 @@ export async function createInsuranceCheckout(rawInput) {
       payment_account_code: product.payment_account_code || null,
       purchase_mode: product.purchase_mode || 'api',
       insurer_payment_mode: 'redirect',
+      sourced_agent_code: resolvedAgent?.agentCode || agentCode || null,
     },
   );
 
@@ -214,6 +249,8 @@ export async function createInsuranceCheckout(rawInput) {
       insurerName: product.insurer_name,
     },
     providerCode: providerConfig?.provider_code || product.insurer_provider_code || null,
+    agentCode: resolvedAgent?.agentCode || agentCode || null,
+    ...resolveInsuranceIntegrationMeta(providerConfig),
   };
 }
 
@@ -313,7 +350,7 @@ export async function createInsuranceProposal({ purchaseOrderId, publicToken, cu
 export async function getInsurancePurchaseById(id, publicToken) {
   const pool = getPool();
   const [[row]] = await pool.execute(
-    `SELECT o.*, p.name AS product_name, p.insurer_name
+    `SELECT o.*, p.name AS product_name, p.insurer_name, p.insurer_provider_code
      FROM insurance_purchase_orders o
      JOIN insurance_products p ON p.id = o.insurance_product_id
      WHERE o.id = :id AND o.public_token = :token
@@ -321,6 +358,47 @@ export async function getInsurancePurchaseById(id, publicToken) {
     { id, token: publicToken },
   );
   return row || null;
+}
+
+export function resolveInsuranceIntegrationMeta(providerConfig) {
+  const mode = String(providerConfig?.integration_mode || 'generic_api').toLowerCase();
+  return {
+    integrationMode: mode,
+    isDemo: mode === 'demo',
+  };
+}
+
+export async function getInsurancePurchaseStatus(id, publicToken) {
+  const row = await getInsurancePurchaseById(id, publicToken);
+  if (!row) return null;
+  const pool = getPool();
+  const providerConfig = row.insurer_provider_code
+    ? await getProviderConfigByCode(pool, row.insurer_provider_code)
+    : null;
+  const integration = resolveInsuranceIntegrationMeta(providerConfig);
+  return {
+    id: row.id,
+    customerName: row.customer_name,
+    customerEmail: row.customer_email,
+    customerPhone: row.customer_phone,
+    productName: row.product_name,
+    insurerName: row.insurer_name,
+    paymentAmount: Number(row.payment_amount),
+    paymentCurrency: row.payment_currency,
+    paymentStatus: row.payment_status,
+    insurerPushStatus: row.insurer_push_status,
+    proposalNumber: row.proposal_number,
+    paymentUrl: row.insurer_payment_url,
+    paymentMode: row.insurer_payment_mode,
+    policyPdfUrl: row.policy_pdf_url,
+    insurerReferenceId: row.insurer_reference_id,
+    insurerPolicyNumber: row.insurer_policy_number,
+    failureReason: row.failure_reason,
+    paidAt: row.paid_at,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    ...integration,
+  };
 }
 
 export async function completeInsurancePurchasePush(orderId) {
@@ -461,5 +539,31 @@ export async function markInsuranceOrderPaid({
     message: 'Razorpay payment confirmed',
   });
 
-  return order;
+  const [[paidOrder]] = await pool.execute(
+    `SELECT * FROM insurance_purchase_orders WHERE id = :id LIMIT 1`,
+    { id: order.id },
+  );
+  if (paidOrder) {
+    const agentCode = paidOrder.sourced_agent_code
+      || (() => {
+        try {
+          const demo = typeof paidOrder.demographic_data === 'string'
+            ? JSON.parse(paidOrder.demographic_data || '{}')
+            : paidOrder.demographic_data || {};
+          return demo.sourcedAgentCode || null;
+        } catch {
+          return null;
+        }
+      })();
+    await recordAgentCommission(pool, {
+      agentCode,
+      sourceType: 'insurance_purchase',
+      sourceId: paidOrder.id,
+      productType: 'insurance',
+      baseAmount: Number(paidOrder.payment_amount || 0),
+      status: 'paid',
+    });
+  }
+
+  return paidOrder || order;
 }

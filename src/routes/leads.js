@@ -16,7 +16,7 @@ import {
   normalizeLeadPhone,
   upsertMarketingLead,
 } from '../lib/marketingLeads.js';
-import { sqlCastParam, sqlLiteralEquals, sqlParamEquals } from '../lib/sqlCollation.js';
+import { normalizeAgentCode } from '../lib/agentAttribution.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { hasPermission } from '../auth/permissions.js';
 
@@ -72,6 +72,7 @@ function formatLead(row) {
     assignedToName: row.assignee_name || null,
     assignedToCode: row.assignee_code || null,
     assignedToRole: row.assignee_role || null,
+    sourcedAgentCode: row.sourced_agent_code || null,
     applicationId: row.application_id,
     sessionKey: row.session_key,
     createdAt: row.created_at,
@@ -91,7 +92,25 @@ const CreateLeadSchema = z.object({
   consent_accepted: z.boolean().optional(),
   sessionKey: z.string().optional(),
   session_key: z.string().optional(),
+  sourcedAgentCode: z.string().optional().nullable(),
+  sourced_agent_code: z.string().optional().nullable(),
+  agentCode: z.string().optional().nullable(),
 });
+
+async function applyAgentCodeToLead(pool, leadId, body) {
+  const agentCode = normalizeAgentCode(
+    body.sourcedAgentCode || body.sourced_agent_code || body.agentCode,
+  );
+  if (!agentCode || !leadId) return;
+  try {
+    await pool.execute(
+      `UPDATE marketing_leads SET sourced_agent_code = :code WHERE id = :id`,
+      { code: agentCode, id: leadId },
+    );
+  } catch {
+    /* column may not exist until migration */
+  }
+}
 
 leadsRouter.post('/', async (req, res, next) => {
   try {
@@ -110,6 +129,8 @@ leadsRouter.post('/', async (req, res, next) => {
       sessionKey,
       status: 'new',
     });
+
+    await applyAgentCodeToLead(pool, row?.id, body);
 
     res.status(created ? 201 : 200).json({ ...formatLead(row), created, updated: !created });
   } catch (err) {
@@ -231,6 +252,8 @@ leadsRouter.post('/start-verification', async (req, res, next) => {
       sessionKey,
       status: 'new',
     });
+
+    await applyAgentCodeToLead(pool, row?.id, body);
 
     const settings = await getOtpProviderSettings();
     const otpResult = await sendDualChannelOtp({ phone, email, settings });
@@ -741,6 +764,21 @@ leadsRouter.get('/', authenticate, async (req, res, next) => {
 
     await ensureOnboardingSchema();
     const pool = getPool();
+    const assignedFilter = req.query.assignedTo || req.query.assigned_to;
+    let whereSql = '';
+    const params = {};
+
+    if (assignedFilter === 'me') {
+      if (role === 'employee' || role === 'agent') {
+        whereSql = 'WHERE ml.assigned_to = :userId';
+        params.userId = req.auth.userId;
+      } else if (role !== 'admin' && role !== 'super_admin') {
+        const e = new Error('assignedTo=me is only for employees and agents');
+        e.status = 400;
+        throw e;
+      }
+    }
+
     const [rows] = await pool.execute(
       `SELECT ml.*,
               up.full_name AS assignee_name,
@@ -750,10 +788,59 @@ leadsRouter.get('/', authenticate, async (req, res, next) => {
        LEFT JOIN user_profiles up ON up.id = ml.assigned_to
        LEFT JOIN agent_onboarding ao ON ao.user_id = up.id AND up.role = 'agent'
        LEFT JOIN employee_onboarding eo ON eo.user_id = up.id AND up.role = 'employee'
+       ${whereSql}
        ORDER BY ml.created_at DESC
        LIMIT 200`,
+      params,
     );
     res.json(rows.map(formatLead));
+  } catch (err) {
+    next(err);
+  }
+});
+
+const EMPLOYEE_LEAD_STATUSES = new Set(['contacted', 'converted', 'closed', 'in_progress']);
+
+leadsRouter.patch('/:id/status', authenticate, async (req, res, next) => {
+  try {
+    const role = req.auth.role;
+    const status = String(req.body?.status || '').toLowerCase();
+    if (!status || !EMPLOYEE_LEAD_STATUSES.has(status)) {
+      return res.status(400).json({ error: 'Invalid status' });
+    }
+
+    const pool = getPool();
+    const [[lead]] = await pool.execute(`SELECT * FROM marketing_leads WHERE id = :id`, {
+      id: req.params.id,
+    });
+    if (!lead) return res.status(404).json({ error: 'Lead not found' });
+
+    const isAdmin = role === 'admin' || role === 'super_admin' || hasPermission(role, 'manage:*');
+    const isAssignee = lead.assigned_to === req.auth.userId;
+    if (!isAdmin && !(role === 'employee' && isAssignee)) {
+      const e = new Error('Insufficient permissions');
+      e.status = 403;
+      throw e;
+    }
+
+    await pool.execute(
+      `UPDATE marketing_leads SET status = :status WHERE id = :id`,
+      { id: req.params.id, status },
+    );
+
+    const [[row]] = await pool.execute(
+      `SELECT ml.*,
+              up.full_name AS assignee_name,
+              up.role AS assignee_role,
+              COALESCE(ao.agent_code, eo.employee_code) AS assignee_code
+       FROM marketing_leads ml
+       LEFT JOIN user_profiles up ON up.id = ml.assigned_to
+       LEFT JOIN agent_onboarding ao ON ao.user_id = up.id AND up.role = 'agent'
+       LEFT JOIN employee_onboarding eo ON eo.user_id = up.id AND up.role = 'employee'
+       WHERE ml.id = :id`,
+      { id: req.params.id },
+    );
+    res.json(formatLead(row));
   } catch (err) {
     next(err);
   }

@@ -89,11 +89,16 @@ export function calculateCommissionFromApplication(row, config) {
     || data.loanAmount
     || 0,
   );
+  return calculateCommissionFromAmount({ amount: loanAmount, config });
+}
+
+export function calculateCommissionFromAmount({ amount, config } = {}) {
+  const baseAmount = Number(amount || 0);
   const commissionType = config?.commission_type || 'percentage';
   const commissionValue = Number(config?.commission_value ?? 2.5);
-  if (!loanAmount || loanAmount <= 0) return 0;
+  if (!baseAmount || baseAmount <= 0) return 0;
   if (commissionType === 'fixed') return Math.round(commissionValue);
-  return Math.round((loanAmount * commissionValue) / 100);
+  return Math.round((baseAmount * commissionValue) / 100);
 }
 
 export function commissionStatusForApplication(status) {
