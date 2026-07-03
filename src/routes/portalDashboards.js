@@ -168,18 +168,29 @@ portalDashboardsRouter.get('/agent/dashboard', authenticate, async (req, res, ne
 
     const trends = buildAgentMetricTrends(apps, allCommissionEntries);
     const performanceAnalytics = buildAgentPerformanceAnalytics(apps, allCommissionEntries);
-    const circulars = await fetchAgentCommissionCirculars(pool);
+    const circulars = await fetchAgentCommissionCirculars(pool).catch(() => []);
 
-    const learningResources = await getAgentLearningFeed(pool, agentId);
-    const recentActivities = await buildAgentRecentActivities(pool, {
-      agentId,
-      agentCode,
-      commissionConfig,
-      limit: 15,
-    });
+    let learningResources = [];
+    try {
+      learningResources = await getAgentLearningFeed(pool, agentId);
+    } catch {
+      learningResources = [];
+    }
+
+    let recentActivities = [];
+    try {
+      recentActivities = await buildAgentRecentActivities(pool, {
+        agentId,
+        agentCode,
+        commissionConfig,
+        limit: 15,
+      });
+    } catch {
+      recentActivities = [];
+    }
 
     let attributedLeads = 0;
-    let sipOrders = 0;
+    let attributedSipOrders = 0;
     if (agentCode) {
       try {
         const [[leadRow]] = await pool.execute(
@@ -197,7 +208,7 @@ portalDashboardsRouter.get('/agent/dashboard', authenticate, async (req, res, ne
            WHERE sourced_agent_code = :code`,
           { code: agentCode },
         );
-        sipOrders = Number(sipRow?.c || 0);
+        attributedSipOrders = Number(sipRow?.c || 0);
       } catch {
         /* table optional */
       }
@@ -271,7 +282,7 @@ portalDashboardsRouter.get('/agent/dashboard', authenticate, async (req, res, ne
       attribution: {
         agentCode,
         attributedLeads,
-        sipOrders,
+        sipOrders: attributedSipOrders,
         shareLinks: agentCode
           ? {
               homepage: `${referralBase}/?agent=${encodeURIComponent(agentCode)}`,
