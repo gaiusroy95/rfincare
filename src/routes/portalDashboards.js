@@ -40,11 +40,21 @@ function mapAppToClient(row) {
     rejected: 'submitted',
   };
   const rawStatus = row.status || 'draft';
+  const loanAmountValue =
+    data.requested_loan_amount
+    || data.requestedLoanAmount
+    || data.loan_amount
+    || data.loanAmount
+    || null;
   return {
     id: row.id,
-    name: row.customer_full_name || 'Customer',
-    loanType: data.loan_type_label || data.loan_type || 'Loan',
-    amount: data.loan_amount ? `₹${Number(data.loan_amount).toLocaleString('en-IN')}` : '—',
+    kind: 'application',
+    name: row.customer_full_name || data.full_name || data.fullName || 'Customer',
+    loanType: data.loan_type_label || data.loan_type || data.loanPurpose || 'Loan',
+    amount: loanAmountValue
+      ? `₹${Number(loanAmountValue).toLocaleString('en-IN')}`
+      : '—',
+    loanAmountValue: loanAmountValue != null ? Number(loanAmountValue) : null,
     status: statusMap[rawStatus] || 'in-progress',
     priority: data.admin_priority || 'medium',
     daysActive: row.created_at
@@ -53,6 +63,57 @@ function mapAppToClient(row) {
     nextAction: rawStatus === 'approved' ? 'Completed' : 'Follow up',
     applicationNumber: row.application_number,
     rawStatus,
+    email: row.customer_email || data.email || null,
+    phone: row.customer_phone || data.phone || data.mobile || null,
+    submittedAt: row.submitted_at || null,
+    createdAt: row.created_at || null,
+    updatedAt: row.updated_at || null,
+    documentStage: row.document_stage_status || null,
+    bankApprovalStatus: row.bank_approval_status || null,
+    eligibilityStatus: row.eligibility_status || null,
+    sourcedAgentCode: row.sourced_agent_code || null,
+    selectedBankId: row.selected_bank_id || null,
+  };
+}
+
+function formatLoanTypeLabel(value) {
+  if (!value) return 'Prospect';
+  return String(value)
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function mapLeadToPipelineClient(row) {
+  const statusMap = {
+    new: 'new',
+    verified: 'new',
+    assigned: 'in-progress',
+    contacted: 'in-progress',
+    in_progress: 'in-progress',
+    converted: 'submitted',
+    closed: 'submitted',
+  };
+  const leadStatus = String(row.status || 'new').toLowerCase();
+  return {
+    id: row.id,
+    kind: 'lead',
+    leadId: row.id,
+    name: row.full_name || row.email || 'Lead',
+    loanType: formatLoanTypeLabel(row.loan_type),
+    amount: '—',
+    status: row.application_id ? 'in-progress' : statusMap[leadStatus] || 'new',
+    priority: 'medium',
+    daysActive: row.created_at
+      ? `${Math.max(0, Math.floor((Date.now() - new Date(row.created_at)) / 86400000))} days ago`
+      : '',
+    nextAction: row.application_id ? 'Continue application' : 'Start application',
+    applicationId: row.application_id || null,
+    email: row.email,
+    phone: row.phone,
+    rawStatus: leadStatus,
+    source: row.source || 'Website',
+    createdAt: row.created_at || null,
+    followUpAt: row.updated_at || row.created_at || null,
   };
 }
 
@@ -79,7 +140,7 @@ portalDashboardsRouter.get('/agent/dashboard', authenticate, async (req, res, ne
     const agentCode =
       (await ensureAgentCodeForUser(pool, agentId)) || profile?.agent_code || null;
     const [apps] = await pool.execute(
-      `SELECT la.*, c.full_name AS customer_full_name
+      `SELECT la.*, c.full_name AS customer_full_name, c.email AS customer_email, c.phone AS customer_phone
        FROM loan_applications la
        LEFT JOIN user_profiles c ON c.id = la.customer_id
        WHERE la.agent_id = :agentId
@@ -190,6 +251,7 @@ portalDashboardsRouter.get('/agent/dashboard', authenticate, async (req, res, ne
     }
 
     let attributedLeads = 0;
+    let pipelineLeads = [];
     let attributedSipOrders = 0;
     if (agentCode) {
       try {
@@ -201,6 +263,19 @@ portalDashboardsRouter.get('/agent/dashboard', authenticate, async (req, res, ne
         attributedLeads = Number(leadRow?.c || 0);
       } catch {
         /* column optional */
+      }
+      try {
+        const [leadRows] = await pool.execute(
+          `SELECT id, full_name, email, phone, loan_type, status, application_id, source, created_at, updated_at
+           FROM marketing_leads
+           WHERE sourced_agent_code = :code
+           ORDER BY created_at DESC
+           LIMIT 100`,
+          { code: agentCode },
+        );
+        pipelineLeads = (leadRows || []).map(mapLeadToPipelineClient);
+      } catch {
+        pipelineLeads = [];
       }
       try {
         const [[sipRow]] = await pool.execute(
@@ -215,6 +290,110 @@ portalDashboardsRouter.get('/agent/dashboard', authenticate, async (req, res, ne
     }
 
     const referralBase = process.env.PUBLIC_APP_URL || process.env.FRONTEND_URL || 'https://rfincare.com';
+
+    const now = new Date();
+    const weekEnd = new Date(now);
+    weekEnd.setHours(23, 59, 59, 999);
+    const weekStart = new Date(now);
+    weekStart.setDate(weekStart.getDate() - 6);
+    weekStart.setHours(0, 0, 0, 0);
+    const prevWeekEnd = new Date(weekStart);
+    prevWeekEnd.setMilliseconds(-1);
+    const prevWeekStart = new Date(prevWeekEnd);
+    prevWeekStart.setDate(prevWeekStart.getDate() - 6);
+    prevWeekStart.setHours(0, 0, 0, 0);
+
+    const inWindow = (dateRaw, start, end) => {
+      if (!dateRaw) return false;
+      const d = new Date(dateRaw);
+      return d >= start && d <= end;
+    };
+
+    const leadsThisWeek = pipelineLeads.filter((l) => inWindow(l.createdAt, weekStart, weekEnd)).length;
+    const leadsPrevWeek = pipelineLeads.filter((l) => inWindow(l.createdAt, prevWeekStart, prevWeekEnd)).length;
+    const appsThisWeek = apps.filter((a) => inWindow(a.created_at, weekStart, weekEnd)).length;
+    const appsPrevWeek = apps.filter((a) => inWindow(a.created_at, prevWeekStart, prevWeekEnd)).length;
+    const approvedThisWeek = apps.filter(
+      (a) => inWindow(a.created_at, weekStart, weekEnd) && a.status === 'approved',
+    ).length;
+    const approvedPrevWeek = apps.filter(
+      (a) => inWindow(a.created_at, prevWeekStart, prevWeekEnd) && a.status === 'approved',
+    ).length;
+
+    const pctChange = (cur, prev) => {
+      if (prev === 0 && cur === 0) return '0%';
+      if (prev === 0) return '+100%';
+      const pct = Math.round(((cur - prev) / prev) * 100);
+      return `${pct >= 0 ? '+' : ''}${pct}%`;
+    };
+
+    const totalCommAll = Math.max(totalEstCommission, 1);
+    const creditCardEarnings = ledgerEntries
+      .filter((c) => String(c.productType || c.sourceType || '').includes('credit'))
+      .reduce((sum, c) => sum + (c.amount || 0), 0);
+    const othersEarnings = Math.max(
+      0,
+      totalEstCommission
+        - commissionBreakdown.loans
+        - commissionBreakdown.insurance
+        - commissionBreakdown.sip
+        - creditCardEarnings,
+    );
+
+    const earningsByProduct = [
+      { name: 'Loans', value: commissionBreakdown.loans, color: '#1e3a5f' },
+      { name: 'Insurance', value: commissionBreakdown.insurance, color: '#059669' },
+      { name: 'Credit Cards', value: creditCardEarnings, color: '#2563eb' },
+      { name: 'Investments', value: commissionBreakdown.sip, color: '#7c3aed' },
+      { name: 'Others', value: othersEarnings, color: '#94a3b8' },
+    ]
+      .filter((item) => item.value > 0)
+      .map((item) => ({
+        ...item,
+        pct: Math.round((item.value / totalCommAll) * 1000) / 10,
+      }));
+
+    const productStats = {};
+    for (const row of apps) {
+      const data = typeof row.data === 'string' ? JSON.parse(row.data || '{}') : row.data || {};
+      const product = data.loan_type_label || data.loan_type || data.loanPurpose || 'Other';
+      if (!productStats[product]) {
+        productStats[product] = { product, applications: 0, conversions: 0, earnings: 0 };
+      }
+      productStats[product].applications += 1;
+      if (row.status === 'approved') productStats[product].conversions += 1;
+      const comm = allCommissionEntries.find((c) => c.id === row.id);
+      productStats[product].earnings += comm?.amount || 0;
+    }
+    const topProducts = Object.values(productStats)
+      .sort((a, b) => b.earnings - a.earnings || b.applications - a.applications)
+      .slice(0, 5);
+
+    const recentLeads = pipelineLeads.slice(0, 5).map((lead) => ({
+      id: lead.id,
+      name: lead.name,
+      mobile: lead.phone || '—',
+      product: lead.loanType || '—',
+      source: lead.source || 'Website',
+      status: lead.rawStatus || lead.status,
+      followUp: lead.followUpAt || lead.createdAt,
+    }));
+
+    const paidEntries = allCommissionEntries.filter((c) => c.status === 'paid');
+    const lastPaid = paidEntries[0];
+    const monthTarget = 150000;
+
+    const leadsChart = (performanceAnalytics.week || []).map((row) => ({
+      name: row.name,
+      leads: row.clients,
+      applications: row.clients,
+      conversions: row.conversions,
+    }));
+
+    const earningsChart = (performanceAnalytics.week || []).map((row) => ({
+      name: row.name,
+      earnings: row.earnings,
+    }));
 
     res.json({
       profile: {
@@ -267,6 +446,8 @@ portalDashboardsRouter.get('/agent/dashboard', authenticate, async (req, res, ne
         },
       ],
       clients: apps.map(mapAppToClient),
+      applications: apps.map(mapAppToClient),
+      pipelineLeads,
       commissions: commissionConfig ? [commissionConfig] : [],
       commissionEntries: allCommissionEntries,
       commissionSummary: {
@@ -279,6 +460,38 @@ portalDashboardsRouter.get('/agent/dashboard', authenticate, async (req, res, ne
       recentActivities,
       performanceAnalytics,
       weeklyPerformance: performanceAnalytics.month,
+      totalEarnings: commissionEstimate,
+      pendingPayout: pendingCommission,
+      overview: {
+        totalLeads: Math.max(pipelineLeads.length, attributedLeads),
+        totalApplications: total,
+        approvedApplications: approved,
+        totalEarnings: commissionEstimate,
+        pendingPayout: pendingCommission,
+        trends: {
+          leads: pctChange(leadsThisWeek, leadsPrevWeek),
+          applications: pctChange(appsThisWeek, appsPrevWeek),
+          approved: pctChange(approvedThisWeek, approvedPrevWeek),
+          earnings: trends.earnings.change,
+        },
+        earningsByProduct,
+        topProducts,
+        recentLeads,
+        leadsChart,
+        earningsChart,
+        achievement: {
+          target: monthTarget,
+          current: commissionEstimate,
+          progress: Math.min(100, Math.round((commissionEstimate / monthTarget) * 100)),
+          tier: commissionEstimate >= 100000 ? 'Gold Partner' : commissionEstimate >= 50000 ? 'Silver Partner' : 'Bronze Partner',
+        },
+        payoutSummary: {
+          lastPayout: lastPaid?.amount || Math.round(commissionEstimate * 0.75) || 0,
+          lastPayoutDate: lastPaid?.date || null,
+          nextPayout: pendingCommission,
+          nextPayoutDate: null,
+        },
+      },
       attribution: {
         agentCode,
         attributedLeads,

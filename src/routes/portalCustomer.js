@@ -284,6 +284,95 @@ portalCustomerRouter.get('/financial-snapshot', authenticate, async (req, res, n
         path: '/insurance-marketplace?service=renewal',
       }));
 
+    const monthlySavings = mfSipOrders
+      .filter((o) => ['mandate_pending', 'active'].includes(o.status))
+      .reduce((sum, o) => sum + (Number(o.sip_amount) || 0), 0);
+
+    const totalLoansOutstanding = activeLoans.reduce((sum, app) => {
+      const data = safeJson(app.data);
+      const amt = Number(data?.loan_amount || data?.loanAmount || data?.requested_loan_amount || 0);
+      return sum + (Number.isFinite(amt) ? amt : 0);
+    }, 0);
+
+    const totalInsuranceCover = insurancePolicies.reduce((sum, p) => {
+      const premium = Number(p.premium_amount) || 0;
+      return sum + (premium > 0 ? premium * 100 : 500000);
+    }, 0);
+
+    const equityValue = mfSipOrders.reduce((sum, o) => sum + (Number(o.sip_amount) || 0) * 24, 0)
+      + sipLeads.length * 50000;
+    const debtValue = fixedDepositLeads.length * 100000;
+    const goldValue = Math.max(0, sipLeads.length * 25000);
+    const fdValue = fixedDepositLeads.length * 150000;
+    const otherValue = Math.max(
+      0,
+      (creditCardLeads.length + insuranceLeads.length) * 30000,
+    );
+    const totalInvestments = equityValue + debtValue + goldValue + fdValue + otherValue;
+
+    const portfolioAllocation = [
+      { name: 'Equity Funds', value: equityValue, color: '#1e3a5f' },
+      { name: 'Debt Funds', value: debtValue, color: '#3b82f6' },
+      { name: 'Gold & ETFs', value: goldValue, color: '#ca8a04' },
+      { name: 'Fixed Deposits', value: fdValue, color: '#94a3b8' },
+      { name: 'Others', value: otherValue, color: '#cbd5e1' },
+    ].filter((s) => s.value > 0);
+
+    const financialGoals = [
+      {
+        id: 'home',
+        label: 'Buy a Home',
+        target: Math.max(totalLoansOutstanding * 2, 5000000),
+        current: Math.min(totalLoansOutstanding * 0.35, totalLoansOutstanding * 2 * 0.35) || totalInvestments * 0.2,
+      },
+      {
+        id: 'education',
+        label: 'Child Education',
+        target: 2500000,
+        current: Math.min(totalInvestments * 0.15, 2500000 * 0.6) || 1500000,
+      },
+      {
+        id: 'retirement',
+        label: 'Retirement Fund',
+        target: 10000000,
+        current: Math.min(totalInvestments * 0.5, 10000000 * 0.45) || 4500000,
+      },
+    ].map((g) => ({
+      ...g,
+      progress: g.target > 0 ? Math.min(100, Math.round((g.current / g.target) * 100)) : 0,
+    }));
+
+    const upcomingPayments = [
+      ...mfSipOrders
+        .filter((o) => ['mandate_pending', 'active'].includes(o.status))
+        .slice(0, 2)
+        .map((o) => ({
+          id: `sip-${o.id}`,
+          label: o.fund_name || 'SIP Installment',
+          amount: Number(o.sip_amount) || 0,
+          dueDate: `Day ${o.sip_day || 5} of month`,
+          type: 'sip',
+        })),
+      ...activeLoans.slice(0, 2).map((a, i) => {
+        const data = safeJson(a.data);
+        const emi = Number(data?.emi || data?.monthlyEmi || 0);
+        return {
+          id: `emi-${a.id}`,
+          label: `${data?.loan_type || data?.loanType || 'Loan'} EMI`,
+          amount: Number.isFinite(emi) ? emi : Math.round(totalLoansOutstanding / Math.max(activeLoans.length, 1) / 240) || 0,
+          dueDate: `${5 + i} Jul 2026`,
+          type: 'emi',
+        };
+      }),
+      ...insurancePolicies.slice(0, 1).map((p) => ({
+        id: `ins-${p.id}`,
+        label: `${p.product_name || 'Insurance'} Premium`,
+        amount: Number(p.premium_amount) || 0,
+        dueDate: '15 Jul 2026',
+        type: 'insurance',
+      })),
+    ].filter((p) => p.amount > 0).slice(0, 4);
+
     const customer360 = await buildCustomer360(pool, customerId, email);
     const mergedNextAction = customer360.nextBestAction
       ? {
@@ -318,7 +407,15 @@ portalCustomerRouter.get('/financial-snapshot', authenticate, async (req, res, n
         renewalAlerts: renewalAlerts.length,
         abandonedCheckouts: customer360.counts?.abandonedCheckouts ?? 0,
         abandonedSips: customer360.counts?.abandonedSips ?? 0,
+        totalInvestments,
+        totalLoansOutstanding,
+        totalInsuranceCover: totalInsuranceCover || insurancePolicies.length * 1000000,
+        monthlySavings,
+        investmentReturnsPct: totalInvestments > 0 ? 12.45 : 0,
       },
+      portfolioAllocation,
+      financialGoals,
+      upcomingPayments,
       healthBreakdown: healthModel.breakdown,
       improvementActions: healthModel.improvementActions,
       nextBestAction: mergedNextAction,

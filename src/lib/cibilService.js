@@ -330,3 +330,101 @@ export async function pullCibilForCustomer(customerId, { forceSandbox = false } 
     ...result,
   };
 }
+
+function scoreBand(score) {
+  if (score >= 750) return 'excellent';
+  if (score >= 700) return 'good';
+  if (score >= 650) return 'fair';
+  return 'needs_improvement';
+}
+
+const BAND_LABELS = {
+  excellent: 'Excellent',
+  good: 'Good',
+  fair: 'Fair',
+  needs_improvement: 'Needs improvement',
+};
+
+/**
+ * Guest / homepage CIBIL check — captures demographics, stores lead, returns sandbox or production pull.
+ */
+export async function pullCibilForGuest(demographics, { upsertLead } = {}) {
+  await ensureMilestone4Schema();
+  const pool = getPool();
+  const vendor = await getActiveVendor(pool);
+  if (!vendor) {
+    const e = new Error('CIBIL check is temporarily unavailable. Please try again later.');
+    e.status = 503;
+    throw e;
+  }
+
+  const stubCustomer = {
+    id: newId(),
+    full_name: demographics.fullName,
+    email: demographics.email,
+    phone: demographics.phone,
+  };
+  const stubApplication = {
+    id: stubCustomer.id,
+    data: JSON.stringify({
+      pan_number: demographics.panNumber,
+      panNumber: demographics.panNumber,
+      date_of_birth: demographics.dateOfBirth,
+      dateOfBirth: demographics.dateOfBirth,
+      city: demographics.city,
+      pincode: demographics.pincode,
+      gender: demographics.gender || null,
+    }),
+  };
+
+  const useSandbox = Boolean(vendor.sandbox_mode);
+  const result = useSandbox
+    ? await sandboxPull({ vendor, application: stubApplication, customer: stubCustomer })
+    : await productionPull({ vendor, application: stubApplication, customer: stubCustomer });
+
+  let leadId = null;
+  if (typeof upsertLead === 'function') {
+    const lead = await upsertLead(pool);
+    leadId = lead?.row?.id || null;
+    if (leadId) {
+      await pool.execute(
+        `UPDATE marketing_leads
+         SET eligibility_data = :data, eligibility_score = :score, updated_at = NOW()
+         WHERE id = :id`,
+        {
+          id: leadId,
+          score: result.creditScore ?? null,
+          data: JSON.stringify({
+            source: 'homepage_cibil',
+            demographics,
+            cibil: {
+              status: result.status,
+              creditScore: result.creditScore,
+              vendorKey: vendor.vendor_key,
+              vendorName: vendor.display_name,
+              sandboxMode: useSandbox,
+              checkedAt: new Date().toISOString(),
+            },
+          }),
+        },
+      );
+    }
+  }
+
+  if (result.status !== 'success') {
+    const e = new Error(result.errorMessage || 'Could not fetch CIBIL score');
+    e.status = 422;
+    throw e;
+  }
+
+  const band = scoreBand(result.creditScore);
+  return {
+    leadId,
+    creditScore: result.creditScore,
+    band,
+    bandLabel: BAND_LABELS[band],
+    vendorName: vendor.display_name,
+    sandboxMode: useSandbox,
+    checkedAt: new Date().toISOString(),
+  };
+}

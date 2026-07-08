@@ -633,19 +633,59 @@ documentsRouter.patch(
       });
 
       if (existing.application_id) {
+        const docLabel = existing.document_type || existing.document_name || 'document';
+        let appNo = existing.application_id?.slice?.(0, 8) || '';
+        try {
+          const [[appRow]] = await pool.execute(
+            `SELECT application_number FROM loan_applications WHERE id = :id LIMIT 1`,
+            { id: existing.application_id },
+          );
+          appNo = appRow?.application_number || appNo;
+        } catch {
+          /* ignore */
+        }
+        let notifyTitle = `Document ${input.status}`;
+        let notifyMessage = `Your ${docLabel} was ${input.status} by our team.`;
+
+        if (input.status === 'rejected') {
+          notifyTitle = 'Document rejected — please resubmit';
+          notifyMessage = [
+            `Your ${docLabel} for application ${appNo} was rejected during verification.`,
+            notes ? `Reason: ${notes}` : null,
+            'Please log in to your customer portal, upload a corrected document, and resubmit your application data.',
+            'Need help? Contact support@rfincare.com or use in-app chat.',
+          ]
+            .filter(Boolean)
+            .join('\n\n');
+
+          try {
+            await pool.execute(
+              `UPDATE loan_applications
+               SET status = 'documents_pending', updated_at = NOW()
+               WHERE id = :id AND status NOT IN ('approved', 'disbursed', 'rejected')`,
+              { id: existing.application_id },
+            );
+          } catch {
+            /* ignore */
+          }
+        } else if (input.status === 'approved') {
+          notifyTitle = 'Document approved';
+          notifyMessage = `Your ${docLabel} for application ${appNo} has been verified and approved.`;
+        }
+
         dispatchFileUpdateNotification('employee_document_decision', {
           applicationId: existing.application_id,
           extra: {
-            title: `Document ${input.status}`,
-            message: `Your ${existing.document_type || 'document'} was ${input.status} by our team.`,
+            title: notifyTitle,
+            message: notifyMessage,
           },
         }).catch(() => {});
 
         try {
           await createCustomerNotification(getPool(), {
             customerId: existing.customer_id,
-            title: `Document ${input.status}`,
-            message: `Document "${existing.document_name}" has been ${input.status}.`,
+            title: notifyTitle,
+            message: notifyMessage,
           });
         } catch {
           /* ignore */

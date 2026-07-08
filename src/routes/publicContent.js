@@ -20,6 +20,8 @@ import { createResumeToken, resolveResumeToken } from '../lib/resumeTokens.js';
 import { resolveFrontendEnvPath } from '../lib/envPaths.js';
 import { entriesToObject, readEnvFile } from '../lib/envFile.js';
 import { getPlatformArchitecture } from '../lib/architecture.js';
+import { pullCibilForGuest } from '../lib/cibilService.js';
+import { upsertMarketingLead } from '../lib/marketingLeads.js';
 
 export const publicContentRouter = Router();
 
@@ -198,6 +200,53 @@ publicContentRouter.post('/success-stories', storyPhotoUpload.single('photo'), a
       err.status = 500;
       err.message = 'Database missing photo_url column. Run: npm run db:migrate';
     }
+    next(err);
+  }
+});
+
+publicContentRouter.post('/cibil/check', async (req, res, next) => {
+  try {
+    const CibilGuestSchema = z.object({
+      fullName: z.string().min(2, 'Full name is required'),
+      email: z.string().email('Valid email is required'),
+      phone: z.string().min(10, 'Mobile number is required'),
+      dateOfBirth: z.string().min(8, 'Date of birth is required'),
+      panNumber: z.string().regex(/^[A-Z]{5}[0-9]{4}[A-Z]$/i, 'Enter a valid PAN number'),
+      city: z.string().min(2, 'City is required'),
+      pincode: z.string().regex(/^\d{6}$/, 'Enter a valid 6-digit pincode'),
+      gender: z.enum(['male', 'female', 'other']).optional(),
+      consentAccepted: z.literal(true, { errorMap: () => ({ message: 'Consent is required' }) }),
+    });
+
+    const input = CibilGuestSchema.parse(req.body);
+    const phone = String(input.phone).replace(/\D/g, '').slice(-10);
+
+    const result = await pullCibilForGuest(
+      {
+        fullName: input.fullName.trim(),
+        email: input.email.trim().toLowerCase(),
+        phone,
+        dateOfBirth: input.dateOfBirth,
+        panNumber: input.panNumber.toUpperCase(),
+        city: input.city.trim(),
+        pincode: input.pincode,
+        gender: input.gender || null,
+      },
+      {
+        upsertLead: (pool) =>
+          upsertMarketingLead(pool, {
+            fullName: input.fullName.trim(),
+            email: input.email.trim(),
+            phone,
+            source: 'homepage_cibil',
+            consentAccepted: true,
+            status: 'verified',
+          }),
+      },
+    );
+
+    res.json(result);
+  } catch (err) {
     next(err);
   }
 });
