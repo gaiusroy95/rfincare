@@ -22,6 +22,7 @@ import { entriesToObject, readEnvFile } from '../lib/envFile.js';
 import { getPlatformArchitecture } from '../lib/architecture.js';
 import { pullCibilForGuest } from '../lib/cibilService.js';
 import { upsertMarketingLead } from '../lib/marketingLeads.js';
+import { getMarketOverview } from '../lib/marketQuotes.js';
 
 export const publicContentRouter = Router();
 
@@ -93,6 +94,15 @@ publicContentRouter.get('/homepage/videos', async (req, res, next) => {
        FROM homepage_videos WHERE is_published = TRUE ORDER BY sort_order DESC LIMIT 12`,
     );
     res.json(rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+publicContentRouter.get('/market-overview', async (req, res, next) => {
+  try {
+    const force = String(req.query.force || '') === '1';
+    res.json(await getMarketOverview({ force }));
   } catch (err) {
     next(err);
   }

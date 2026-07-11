@@ -14,3 +14,4 @@ uploads/
 data/frontend.env
 
 coverage/
+.cache/

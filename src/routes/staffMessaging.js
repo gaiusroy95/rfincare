@@ -10,6 +10,11 @@ import { sendEmail, smtpConfigured } from '../lib/email.js';
 import { writeAuditLog } from '../lib/audit.js';
 import { ensureAgentCodeForUser } from '../lib/agentCode.js';
 import { resolveUploadFilePath } from '../lib/uploadPaths.js';
+import {
+  listSupportChatThreads,
+  listCustomerSupportMessages,
+  replyAsSupport,
+} from '../lib/customerSupportChat.js';
 
 export const staffCommunicationRouter = Router();
 export const adminHierarchyRouter = Router();
@@ -869,6 +874,55 @@ staffCommunicationRouter.get('/unread-count', async (req, res, next) => {
       { userId: req.auth.userId },
     );
     res.json({ count: Number(row?.cnt || 0) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+staffCommunicationRouter.get('/support-chats', async (req, res, next) => {
+  try {
+    if (!['admin', 'super_admin', 'employee'].includes(req.auth.role)) {
+      const e = new Error('Employee access only');
+      e.status = 403;
+      throw e;
+    }
+    const threads = await listSupportChatThreads({ limit: Number(req.query.limit) || 40 });
+    res.json({ threads });
+  } catch (err) {
+    next(err);
+  }
+});
+
+staffCommunicationRouter.get('/support-chats/:customerId', async (req, res, next) => {
+  try {
+    if (!['admin', 'super_admin', 'employee'].includes(req.auth.role)) {
+      const e = new Error('Employee access only');
+      e.status = 403;
+      throw e;
+    }
+    const messages = await listCustomerSupportMessages(req.params.customerId, {
+      seedWelcome: false,
+    });
+    res.json({ messages });
+  } catch (err) {
+    next(err);
+  }
+});
+
+staffCommunicationRouter.post('/support-chats/:customerId', async (req, res, next) => {
+  try {
+    if (!['admin', 'super_admin', 'employee'].includes(req.auth.role)) {
+      const e = new Error('Employee access only');
+      e.status = 403;
+      throw e;
+    }
+    const body = String(req.body?.body || req.body?.message || '').trim();
+    const message = await replyAsSupport({
+      customerId: req.params.customerId,
+      senderId: req.auth.userId,
+      body,
+    });
+    res.status(201).json({ message });
   } catch (err) {
     next(err);
   }

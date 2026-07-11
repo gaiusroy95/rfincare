@@ -8,6 +8,16 @@ import { buildCustomer360 } from '../lib/customer360.js';
 import { ensureEngagementNotifications } from '../lib/customerEngagement.js';
 import { getCustomerCreditProfile } from '../lib/customerCreditScore.js';
 import { pullCibilForCustomer } from '../lib/cibilService.js';
+import {
+  listCustomerSupportMessages,
+  sendCustomerSupportMessage,
+} from '../lib/customerSupportChat.js';
+import {
+  listFinancialGoals,
+  createFinancialGoal,
+  updateFinancialGoal,
+  deleteFinancialGoal,
+} from '../lib/customerFinancialGoals.js';
 
 export const portalCustomerRouter = Router();
 
@@ -318,29 +328,11 @@ portalCustomerRouter.get('/financial-snapshot', authenticate, async (req, res, n
       { name: 'Others', value: otherValue, color: '#cbd5e1' },
     ].filter((s) => s.value > 0);
 
-    const financialGoals = [
-      {
-        id: 'home',
-        label: 'Buy a Home',
-        target: Math.max(totalLoansOutstanding * 2, 5000000),
-        current: Math.min(totalLoansOutstanding * 0.35, totalLoansOutstanding * 2 * 0.35) || totalInvestments * 0.2,
-      },
-      {
-        id: 'education',
-        label: 'Child Education',
-        target: 2500000,
-        current: Math.min(totalInvestments * 0.15, 2500000 * 0.6) || 1500000,
-      },
-      {
-        id: 'retirement',
-        label: 'Retirement Fund',
-        target: 10000000,
-        current: Math.min(totalInvestments * 0.5, 10000000 * 0.45) || 4500000,
-      },
-    ].map((g) => ({
-      ...g,
-      progress: g.target > 0 ? Math.min(100, Math.round((g.current / g.target) * 100)) : 0,
-    }));
+    const savedGoals = await listFinancialGoals(customerId).catch(() => []);
+    const financialGoals =
+      savedGoals.length > 0
+        ? savedGoals
+        : [];
 
     const upcomingPayments = [
       ...mfSipOrders
@@ -538,6 +530,85 @@ portalCustomerRouter.get('/financial-snapshot', authenticate, async (req, res, n
       healthGrade: healthModel.grade,
       creditProfile,
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+function requireCustomer(req) {
+  if (req.auth.role !== 'customer') {
+    const e = new Error('Customer access only');
+    e.status = 403;
+    throw e;
+  }
+}
+
+portalCustomerRouter.get('/support-chat', authenticate, async (req, res, next) => {
+  try {
+    requireCustomer(req);
+    const messages = await listCustomerSupportMessages(req.auth.userId);
+    res.json({ messages });
+  } catch (err) {
+    next(err);
+  }
+});
+
+portalCustomerRouter.post('/support-chat', authenticate, async (req, res, next) => {
+  try {
+    requireCustomer(req);
+    const body = String(req.body?.body || req.body?.message || '').trim();
+    const pool = getPool();
+    const [[profile]] = await pool.execute(
+      `SELECT full_name, email, phone FROM user_profiles WHERE id = :id LIMIT 1`,
+      { id: req.auth.userId },
+    );
+    const result = await sendCustomerSupportMessage({
+      customerId: req.auth.userId,
+      senderId: req.auth.userId,
+      body,
+      customerProfile: profile,
+    });
+    res.status(201).json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+portalCustomerRouter.get('/financial-goals', authenticate, async (req, res, next) => {
+  try {
+    requireCustomer(req);
+    const goals = await listFinancialGoals(req.auth.userId);
+    res.json({ goals });
+  } catch (err) {
+    next(err);
+  }
+});
+
+portalCustomerRouter.post('/financial-goals', authenticate, async (req, res, next) => {
+  try {
+    requireCustomer(req);
+    const goal = await createFinancialGoal(req.auth.userId, req.body || {});
+    res.status(201).json({ goal });
+  } catch (err) {
+    next(err);
+  }
+});
+
+portalCustomerRouter.put('/financial-goals/:id', authenticate, async (req, res, next) => {
+  try {
+    requireCustomer(req);
+    const goal = await updateFinancialGoal(req.auth.userId, req.params.id, req.body || {});
+    res.json({ goal });
+  } catch (err) {
+    next(err);
+  }
+});
+
+portalCustomerRouter.delete('/financial-goals/:id', authenticate, async (req, res, next) => {
+  try {
+    requireCustomer(req);
+    const result = await deleteFinancialGoal(req.auth.userId, req.params.id);
+    res.json(result);
   } catch (err) {
     next(err);
   }
