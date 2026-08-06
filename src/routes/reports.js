@@ -8,19 +8,8 @@ import { authenticate } from '../middleware/authenticate.js';
 import { authorize } from '../middleware/authorize.js';
 import { generateReportSection } from '../lib/reportGenerators.js';
 import { buildMasterReport } from '../lib/masterReport.js';
-import {
-  normalizeFormat,
-  runDueReportSchedules,
-  sendScheduledReportEmail,
-} from '../lib/reportScheduleRunner.js';
 
 export const reportsRouter = Router();
-
-function titleCaseFrequency(frequency) {
-  const value = String(frequency || '').trim();
-  if (!value) return 'On demand';
-  return value.charAt(0).toUpperCase() + value.slice(1).toLowerCase();
-}
 
 function formatSqlDateTime(date) {
   return date.toISOString().slice(0, 19).replace('T', ' ');
@@ -331,35 +320,30 @@ reportsRouter.get(
     try {
       await ensureMilestone3Schema();
       const pool = getPool();
-      const [activeSchedules] = await pool.execute(
-        `SELECT DISTINCT ON (report_key)
-            report_key, frequency, last_run_at
-         FROM report_schedules
-         WHERE is_active = TRUE
-         ORDER BY report_key, created_at DESC`,
+      const [schedules] = await pool.execute(
+        `SELECT report_key, MAX(last_run_at) AS last_run_at
+         FROM report_schedules WHERE is_active = TRUE GROUP BY report_key`,
       );
       const scheduleMap = Object.fromEntries(
-        activeSchedules.map((s) => [
-          s.report_key,
-          { frequency: s.frequency, last_run_at: s.last_run_at },
-        ]),
+        schedules.map((s) => [s.report_key, s.last_run_at]),
       );
+      const [activeSchedules] = await pool.execute(
+        `SELECT report_key FROM report_schedules WHERE is_active = TRUE`,
+      );
+      const scheduledKeys = new Set(activeSchedules.map((s) => s.report_key));
 
       res.json(
-        REPORT_META.map((r, idx) => {
-          const schedule = scheduleMap[r.key];
-          return {
-            id: idx + 1,
-            key: r.key,
-            name: r.name,
-            category: r.category,
-            frequency: schedule ? titleCaseFrequency(schedule.frequency) : 'On demand',
-            lastGenerated: schedule?.last_run_at
-              ? new Date(schedule.last_run_at).toISOString()
-              : null,
-            isScheduled: Boolean(schedule),
-          };
-        }),
+        REPORT_META.map((r, idx) => ({
+          id: idx + 1,
+          key: r.key,
+          name: r.name,
+          category: r.category,
+          frequency: 'On demand',
+          lastGenerated: scheduleMap[r.key]
+            ? new Date(scheduleMap[r.key]).toISOString()
+            : null,
+          isScheduled: scheduledKeys.has(r.key),
+        })),
       );
     } catch (err) {
       next(err);
@@ -403,15 +387,10 @@ reportsRouter.get(
 const ScheduleSchema = z.object({
   reportKey: z.string().min(1),
   reportName: z.string().min(1),
-  frequency: z.enum(['daily', 'weekly', 'monthly', 'quarterly']),
-  format: z.enum(['csv', 'pdf', 'xlsx', 'excel']).default('csv'),
+  frequency: z.enum(['daily', 'weekly', 'monthly']),
+  format: z.enum(['csv', 'pdf', 'xlsx']).default('csv'),
   recipients: z.string().min(3),
   filters: z.record(z.unknown()).optional(),
-  dayOfWeek: z.string().optional(),
-  time: z.string().optional(),
-  dayOfMonth: z.coerce.number().int().min(1).max(28).optional(),
-  autoSend: z.boolean().optional(),
-  includeCharts: z.boolean().optional(),
 });
 
 reportsRouter.get(
@@ -442,100 +421,26 @@ reportsRouter.post(
       const input = ScheduleSchema.parse(req.body);
       const pool = getPool();
       const id = newId();
-      const format = normalizeFormat(input.format);
-      const filtersJson = {
-        ...(input.filters || {}),
-        dayOfWeek: input.dayOfWeek || input.filters?.dayOfWeek || 'monday',
-        time: input.time || input.filters?.time || '09:00',
-        dayOfMonth: input.dayOfMonth || input.filters?.dayOfMonth || 1,
-        autoSend: input.autoSend !== false,
-        includeCharts: Boolean(input.includeCharts),
-      };
-
       await pool.execute(
         `INSERT INTO report_schedules (
            id, report_key, report_name, frequency, format, recipients, filters_json, created_by
          ) VALUES (
-           :id, :report_key, :report_name, :frequency, :format, :recipients, :filters_json::jsonb, :created_by
+           :id, :report_key, :report_name, :frequency, :format, :recipients, :filters_json, :created_by
          )`,
         {
           id,
           report_key: input.reportKey,
           report_name: input.reportName,
           frequency: input.frequency,
-          format,
+          format: input.format,
           recipients: input.recipients,
-          filters_json: JSON.stringify(filtersJson),
+          filters_json: input.filters ? JSON.stringify(input.filters) : null,
           created_by: req.auth.userId,
         },
       );
-
-      const schedule = {
-        id,
-        report_key: input.reportKey,
-        report_name: input.reportName,
-        frequency: input.frequency,
-        format,
-        recipients: input.recipients,
-        filters_json: filtersJson,
-        last_run_at: null,
-      };
-
-      let delivery = null;
-      if (filtersJson.autoSend) {
-        delivery = await sendScheduledReportEmail(pool, schedule, { force: true });
-      }
-
-      res.status(201).json({
-        id,
-        ok: true,
-        delivery,
-        warning: delivery && !delivery.ok ? delivery.warning || delivery.reason : undefined,
-      });
+      res.status(201).json({ id, ok: true });
     } catch (err) {
       next(err);
     }
   },
 );
-
-reportsRouter.post(
-  '/schedules/:id/run',
-  authenticate,
-  authorize({ resource: 'reports', action: 'read' }),
-  async (req, res, next) => {
-    try {
-      await ensureMilestone3Schema();
-      const pool = getPool();
-      const [rows] = await pool.execute(
-        `SELECT * FROM report_schedules WHERE id = :id AND is_active = TRUE LIMIT 1`,
-        { id: req.params.id },
-      );
-      const schedule = rows[0];
-      if (!schedule) {
-        return res.status(404).json({ error: 'Schedule not found' });
-      }
-      const delivery = await sendScheduledReportEmail(pool, schedule, { force: true });
-      res.json({ ok: delivery.ok, delivery });
-    } catch (err) {
-      next(err);
-    }
-  },
-);
-
-reportsRouter.get('/cron/run', async (req, res, next) => {
-  try {
-    const secret = process.env.REPORTS_CRON_SECRET || process.env.ENGAGEMENT_CRON_SECRET;
-    const header = req.get('X-Reports-Cron-Secret') || req.get('X-Engagement-Cron-Secret') || req.query.secret;
-    if (!secret || header !== secret) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-    await ensureMilestone3Schema();
-    const pool = getPool();
-    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 50));
-    const forceAll = String(req.query.force || '') === '1';
-    const result = await runDueReportSchedules(pool, { limit, forceAll });
-    res.json({ ok: true, ...result });
-  } catch (err) {
-    next(err);
-  }
-});
