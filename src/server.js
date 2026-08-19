@@ -6,10 +6,13 @@ import dotenv from 'dotenv';
 
 import { createApp } from './app.js';
 import { ensureCibilCoreTables } from './db/ensureMilestone4Schema.js';
+import { syncSurepassVendorFromEnv } from './lib/cibilService.js';
 import { ensurePushNotificationSchema } from './db/ensurePushNotificationSchema.js';
 import { ensurePartnerRegistrationSchema } from './db/ensurePartnerRegistrationSchema.js';
 import { ensureTranslationCacheSchema } from './db/ensureTranslationCacheSchema.js';
 import { ensureMarketingSchema } from './lib/marketingSettings.js';
+import { ensureReferralSchema } from './lib/referralTracking.js';
+import { ensureAgentLearningSchema } from './db/ensureAgentLearningSchema.js';
 import { getPool } from './db/pool.js';
 import { getUploadDir } from './lib/uploadPaths.js';
 import { isCloudStorage } from './lib/storage/index.js';
@@ -36,10 +39,13 @@ const app = createApp();
 async function bootstrap() {
   try {
     await ensureCibilCoreTables(getPool());
+    await syncSurepassVendorFromEnv(getPool());
     await ensurePushNotificationSchema();
     await ensurePartnerRegistrationSchema();
     await ensureTranslationCacheSchema();
     await ensureMarketingSchema();
+    await ensureReferralSchema(getPool());
+    await ensureAgentLearningSchema();
   } catch (err) {
     // eslint-disable-next-line no-console
     console.warn('[api] milestone4 schema bootstrap:', err.message);

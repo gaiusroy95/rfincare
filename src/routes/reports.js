@@ -8,8 +8,15 @@ import { authenticate } from '../middleware/authenticate.js';
 import { authorize } from '../middleware/authorize.js';
 import { generateReportSection } from '../lib/reportGenerators.js';
 import { buildMasterReport } from '../lib/masterReport.js';
+import { assertEmployeeAccess } from '../lib/employeeAccessControls.js';
 
 export const reportsRouter = Router();
+
+async function enforceReportsAccess(req) {
+  if (req.auth?.role === 'employee') {
+    await assertEmployeeAccess(req, 'reports', 'read');
+  }
+}
 
 function formatSqlDateTime(date) {
   return date.toISOString().slice(0, 19).replace('T', ' ');
@@ -99,6 +106,7 @@ reportsRouter.get(
   authorize({ resource: 'reports', action: 'read' }),
   async (req, res, next) => {
     try {
+      await enforceReportsAccess(req);
       const pool = getPool();
       const { start, end } = dateRangeFromQuery(req.query);
       const prevStart = new Date(start);
@@ -229,6 +237,7 @@ reportsRouter.get(
   authorize({ resource: 'reports', action: 'read' }),
   async (req, res, next) => {
     try {
+      await enforceReportsAccess(req);
       const pool = getPool();
       const volumeSql = `SELECT TO_CHAR(created_at, 'Mon') AS month,
                   EXTRACT(MONTH FROM created_at)::int AS m,
@@ -255,6 +264,7 @@ reportsRouter.get(
   authorize({ resource: 'reports', action: 'read' }),
   async (req, res, next) => {
     try {
+      await enforceReportsAccess(req);
       const pool = getPool();
       const [rows] = await pool.execute(
         `SELECT up.full_name AS name,
@@ -291,6 +301,7 @@ reportsRouter.get(
   authorize({ resource: 'reports', action: 'read' }),
   async (req, res, next) => {
     try {
+      await enforceReportsAccess(req);
       const pool = getPool();
       const [rows] = await pool.execute(
         `SELECT COALESCE(data->>'loan_type', 'personal') AS loan_type,
@@ -318,6 +329,7 @@ reportsRouter.get(
   authorize({ resource: 'reports', action: 'read' }),
   async (req, res, next) => {
     try {
+      await enforceReportsAccess(req);
       await ensureMilestone3Schema();
       const pool = getPool();
       const [schedules] = await pool.execute(
@@ -357,6 +369,7 @@ reportsRouter.get(
   authorize({ resource: 'reports', action: 'read' }),
   async (req, res, next) => {
     try {
+      await enforceReportsAccess(req);
       const { reportKey } = req.params;
       const pool = getPool();
       const { start, end } = dateRangeFromQuery(req.query);
@@ -399,6 +412,7 @@ reportsRouter.get(
   authorize({ resource: 'reports', action: 'read' }),
   async (req, res, next) => {
     try {
+      await enforceReportsAccess(req);
       await ensureMilestone3Schema();
       const pool = getPool();
       const [rows] = await pool.execute(
@@ -417,6 +431,7 @@ reportsRouter.post(
   authorize({ resource: 'reports', action: 'read' }),
   async (req, res, next) => {
     try {
+      await enforceReportsAccess(req);
       await ensureMilestone3Schema();
       const input = ScheduleSchema.parse(req.body);
       const pool = getPool();

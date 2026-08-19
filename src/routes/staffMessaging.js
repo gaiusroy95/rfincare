@@ -11,6 +11,7 @@ import { writeAuditLog } from '../lib/audit.js';
 import { ensureAgentCodeForUser } from '../lib/agentCode.js';
 import { resolveUploadFilePath } from '../lib/uploadPaths.js';
 import {
+  canEmployeeAccessCustomerSupportChat,
   listSupportChatThreads,
   listCustomerSupportMessages,
   replyAsSupport,
@@ -886,7 +887,11 @@ staffCommunicationRouter.get('/support-chats', async (req, res, next) => {
       e.status = 403;
       throw e;
     }
-    const threads = await listSupportChatThreads({ limit: Number(req.query.limit) || 40 });
+    const threads = await listSupportChatThreads({
+      limit: Number(req.query.limit) || 40,
+      role: req.auth.role,
+      userId: req.auth.userId,
+    });
     res.json({ threads });
   } catch (err) {
     next(err);
@@ -899,6 +904,15 @@ staffCommunicationRouter.get('/support-chats/:customerId', async (req, res, next
       const e = new Error('Employee access only');
       e.status = 403;
       throw e;
+    }
+    if (req.auth.role === 'employee') {
+      const allowed = await canEmployeeAccessCustomerSupportChat(
+        req.auth.userId,
+        req.params.customerId,
+      );
+      if (!allowed) {
+        return res.status(403).json({ error: 'You can only view chats for your assigned applications.' });
+      }
     }
     const messages = await listCustomerSupportMessages(req.params.customerId, {
       seedWelcome: false,
@@ -915,6 +929,15 @@ staffCommunicationRouter.post('/support-chats/:customerId', async (req, res, nex
       const e = new Error('Employee access only');
       e.status = 403;
       throw e;
+    }
+    if (req.auth.role === 'employee') {
+      const allowed = await canEmployeeAccessCustomerSupportChat(
+        req.auth.userId,
+        req.params.customerId,
+      );
+      if (!allowed) {
+        return res.status(403).json({ error: 'You can only reply to chats for your assigned applications.' });
+      }
     }
     const body = String(req.body?.body || req.body?.message || '').trim();
     const message = await replyAsSupport({

@@ -16,6 +16,7 @@ import {
   notifyAdminsOfPartnerApplication,
   rejectPartnerRegistration,
 } from '../lib/partnerRegistration.js';
+import { ensureReferralSchema, recordReferralConversion } from '../lib/referralTracking.js';
 
 export const partnersRouter = Router();
 
@@ -200,6 +201,21 @@ partnersRouter.post(
       await notifyAdminsOfPartnerApplication(row).catch((err) =>
         console.warn('[partner-admin-email]', err?.message),
       );
+
+      const inboundReferral =
+        bodyField(req.body, 'referralCode', 'referral_code', 'aref', 'agentRef')
+        || bodyField(req.query || {}, 'aref', 'ref');
+      if (inboundReferral) {
+        await ensureReferralSchema(pool);
+        await recordReferralConversion(pool, {
+          referralCode: inboundReferral,
+          program: 'agent',
+          referredName: parsed.fullName,
+          referredEmail: parsed.email,
+          referredPhone: parsed.phone,
+          channel: 'partner_register',
+        }).catch(() => {});
+      }
 
       res.status(201).json({
         id,

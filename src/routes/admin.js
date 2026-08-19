@@ -27,7 +27,7 @@ import {
   resetStaffPassword,
 } from '../lib/adminStaffManage.js';
 import { parseCsvToRows } from '../lib/parseCsv.js';
-import { buildFunnelAnalytics } from '../lib/funnelAnalytics.js';
+import { buildFunnelAnalytics, buildProductConversionRows } from '../lib/funnelAnalytics.js';
 import {
   buildAgentCommissionTemplateCsv,
   fetchAgentCommissionCirculars,
@@ -204,8 +204,88 @@ adminRouter.get(
     try {
       const pool = getPool();
       const days = parseInt(req.query.days, 10) || 30;
-      const data = await buildFunnelAnalytics(pool, { days });
+      const dateFrom = String(req.query.dateFrom || req.query.date_from || '').trim() || null;
+      const dateTo = String(req.query.dateTo || req.query.date_to || '').trim() || null;
+      const data = await buildFunnelAnalytics(pool, { days, dateFrom, dateTo });
       res.json(data);
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+adminRouter.get(
+  '/funnel-analytics/product-export.csv',
+  authenticate,
+  authorize({ resource: 'reports', action: 'read' }),
+  async (req, res, next) => {
+    try {
+      const pool = getPool();
+      const days = parseInt(req.query.days, 10) || 30;
+      const dateFrom = String(req.query.dateFrom || req.query.date_from || '').trim() || null;
+      const dateTo = String(req.query.dateTo || req.query.date_to || '').trim() || null;
+      const productKey = String(req.query.productKey || req.query.product_key || '').trim();
+      if (!productKey) return res.status(400).json({ error: 'productKey is required' });
+
+      const { productLabel, rows } = await buildProductConversionRows(pool, {
+        days,
+        dateFrom,
+        dateTo,
+        productKey,
+      });
+
+      const csvEscape = (value) => {
+        if (value == null) return '';
+        const str = String(value).replace(/\r?\n/g, ' ').trim();
+        if (str.includes('"') || str.includes(',') || str.includes(';')) {
+          return `"${str.replace(/"/g, '""')}"`;
+        }
+        return str;
+      };
+
+      const header = [
+        'Product',
+        'Channel',
+        'Reference ID',
+        'Reference Number',
+        'Sale Status',
+        'Lead Created At',
+        'Converted At',
+        'Lead Created By Role',
+        'Lead Created By',
+        'Converted By Role',
+        'Converted By',
+        'Payout Owner Role',
+        'Payout Owner',
+        'Payout Amount',
+      ];
+      const lines = (rows || []).map((row) =>
+        [
+          productLabel,
+          row.channel,
+          row.referenceId,
+          row.referenceNumber,
+          row.saleStatus,
+          row.createdAt,
+          row.convertedAt,
+          row.createdByRole,
+          row.createdByName,
+          row.convertedByRole,
+          row.convertedByName,
+          row.payoutOwnerRole,
+          row.payoutOwnerName,
+          row.payoutAmount,
+        ]
+          .map(csvEscape)
+          .join(','),
+      );
+
+      const stamp = new Date().toISOString().slice(0, 10);
+      const slug = productLabel.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+      const csv = [header.map(csvEscape).join(','), ...lines].join('\n');
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="funnel-${slug}-${stamp}.csv"`);
+      res.send(csv);
     } catch (err) {
       next(err);
     }
@@ -491,6 +571,78 @@ adminRouter.post(
       });
       res.json({ success: true, message: 'Employee password updated' });
     } catch (err) {
+      next(err);
+    }
+  },
+);
+
+adminRouter.delete(
+  '/employees/:id',
+  authenticate,
+  authorize({ resource: 'employees', action: 'manage' }),
+  async (req, res, next) => {
+    const pool = getPool();
+    try {
+      const employeeId = String(req.params.id || '').trim();
+      if (!employeeId) {
+        return res.status(400).json({ error: 'Employee id is required' });
+      }
+      if (employeeId === req.auth.userId) {
+        return res.status(400).json({ error: 'You cannot delete your own account' });
+      }
+
+      const detail = await fetchEmployeeDetail(employeeId);
+      if (!detail?.id) {
+        return res.status(404).json({ error: 'Employee not found' });
+      }
+
+      const [[assigned]] = await pool.execute(
+        `SELECT COUNT(*)::int AS c
+         FROM loan_applications
+         WHERE assigned_employee_id = :id
+           AND status NOT IN ('approved', 'rejected')`,
+        { id: employeeId },
+      );
+      if (Number(assigned?.c || 0) > 0) {
+        return res.status(409).json({
+          error:
+            'Cannot delete employee with active assigned applications. Reassign those applications first.',
+        });
+      }
+
+      await pool.execute('BEGIN');
+      await pool.execute(`DELETE FROM employee_access_controls WHERE employee_user_id = :id`, { id: employeeId });
+      await pool.execute(`DELETE FROM employee_onboarding WHERE user_id = :id`, { id: employeeId });
+      await pool.execute(`DELETE FROM agent_employee_hierarchy WHERE employee_user_id = :id`, { id: employeeId });
+      await pool.execute(`UPDATE loan_applications SET assigned_employee_id = NULL WHERE assigned_employee_id = :id`, {
+        id: employeeId,
+      });
+      await pool.execute(`UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = :id AND revoked_at IS NULL`, {
+        id: employeeId,
+      });
+      await pool.execute(`DELETE FROM auth_users WHERE id = :id`, { id: employeeId });
+      await pool.execute(`DELETE FROM user_profiles WHERE id = :id AND role = 'employee'`, { id: employeeId });
+      await pool.execute('COMMIT');
+
+      await writeAuditLog({
+        userId: req.auth.userId,
+        actionType: 'delete',
+        tableName: 'user_profiles',
+        recordId: employeeId,
+        oldValues: {
+          employeeName: detail.employeeName,
+          email: detail.email,
+        },
+        newValues: { scope: 'admin_employee_delete' },
+      });
+
+      res.json({ success: true, message: 'Employee profile deleted successfully' });
+    } catch (err) {
+      try {
+        await pool.execute('ROLLBACK');
+      } catch {
+        /* ignore rollback error */
+      }
       next(err);
     }
   },
@@ -872,7 +1024,7 @@ adminRouter.get(
 async function upsertEmployeeModuleAccess(pool, employeeUserId, entry, { isActive, expiresAt, updatedBy }) {
   const moduleName = entry.moduleName || entry.module_name;
   const permissions = entry.permissions || [];
-  const rowActive = isActive && permissions.length > 0;
+  const rowActive = Boolean(isActive);
 
   await pool.execute(
     `INSERT INTO employee_access_controls (
@@ -915,6 +1067,12 @@ adminRouter.put(
               permissions: input.permissions || [],
             },
           ];
+
+      // Replace previous access rows to avoid stale permissions leaking.
+      await pool.execute(
+        `DELETE FROM employee_access_controls WHERE employee_user_id = :id`,
+        { id: req.params.id },
+      );
 
       for (const entry of modules) {
         if (!entry?.moduleName && !entry?.module_name) continue;

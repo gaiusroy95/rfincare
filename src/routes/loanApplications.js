@@ -253,7 +253,7 @@ async function fetchApplicationById(pool, id) {
   return row;
 }
 
-function buildListQuery(role, userId, filters) {
+async function buildListQuery(pool, role, userId, filters) {
   const conditions = [];
   const params = {};
 
@@ -262,8 +262,19 @@ function buildListQuery(role, userId, filters) {
       conditions.push('la.customer_id = :userId');
       params.userId = userId;
     } else if (role === 'agent') {
-      conditions.push('la.agent_id = :userId');
+      const agentCode = await resolveAgentCode(pool, userId);
+      conditions.push(`(
+        la.agent_id = :userId
+        OR CAST(COALESCE(la.data->>'agent_id', '') AS TEXT) = CAST(:userId AS TEXT)
+        OR CAST(COALESCE(la.data->>'agentId', '') AS TEXT) = CAST(:userId AS TEXT)
+        OR LOWER(TRIM(CAST(COALESCE(la.sourced_agent_code, '') AS TEXT))) = LOWER(TRIM(CAST(COALESCE(:agentCode, '') AS TEXT)))
+        OR LOWER(TRIM(CAST(COALESCE(la.data->>'sourced_agent_code', '') AS TEXT))) = LOWER(TRIM(CAST(COALESCE(:agentCode, '') AS TEXT)))
+        OR LOWER(TRIM(CAST(COALESCE(la.data->>'sourcedAgentCode', '') AS TEXT))) = LOWER(TRIM(CAST(COALESCE(:agentCode, '') AS TEXT)))
+        OR LOWER(TRIM(CAST(COALESCE(la.data->>'agent_code', '') AS TEXT))) = LOWER(TRIM(CAST(COALESCE(:agentCode, '') AS TEXT)))
+        OR LOWER(TRIM(CAST(COALESCE(la.data->>'agentCode', '') AS TEXT))) = LOWER(TRIM(CAST(COALESCE(:agentCode, '') AS TEXT)))
+      )`);
       params.userId = userId;
+      params.agentCode = agentCode || '';
     } else if (role === 'employee') {
       conditions.push('la.assigned_employee_id = :userId');
       params.userId = userId;
@@ -359,7 +370,7 @@ loanApplicationsRouter.get(
     try {
       await assertEmployeeAccess(req, 'applications', 'read');
       const pool = getPool();
-      const { where, params } = buildListQuery(req.auth.role, req.auth.userId, {});
+      const { where, params } = await buildListQuery(pool, req.auth.role, req.auth.userId, {});
       const [rows] = await pool.execute(
         `${LIST_SELECT} ${where} ORDER BY la.created_at DESC`,
         params,
@@ -389,7 +400,7 @@ loanApplicationsRouter.get(
         loanType: req.query.loanType,
         priority: req.query.priority,
       };
-      const { where, params } = buildListQuery(req.auth.role, req.auth.userId, filters);
+      const { where, params } = await buildListQuery(pool, req.auth.role, req.auth.userId, filters);
       const includePhotos = req.query.includePhotos === 'true';
       const includeMarketplaceEnquiries = req.query.includeMarketplaceEnquiries === 'true';
       const page = Math.max(1, parseInt(req.query.page, 10) || 0);

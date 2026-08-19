@@ -6,6 +6,11 @@ import { newId } from './ids.js';
 import { buildSimpleTextPdf } from './simplePdf.js';
 import { getUploadDir } from './uploadPaths.js';
 import { ensureMilestone4Schema } from '../db/ensureMilestone4Schema.js';
+import {
+  requestSurepassCibilPdf,
+  saveCibilPdfBuffer,
+  surepassConfigured,
+} from './surepassCibil.js';
 
 const VENDOR_KEYS = ['transunion_cibil', 'experian', 'equifax', 'crif_high_mark'];
 
@@ -17,6 +22,35 @@ function parseJson(value) {
   } catch {
     return {};
   }
+}
+
+function firstValue(obj, keys) {
+  for (const key of keys) {
+    const value = obj?.[key];
+    if (value != null && String(value).trim()) return String(value).trim();
+  }
+  return '';
+}
+
+export function extractCibilDemographics({ application, customer, extra = {} } = {}) {
+  const data = parseJson(application?.data);
+  const personal = parseJson(data.personal) || {};
+  const merged = { ...data, ...personal, ...extra };
+  const name =
+    extra.fullName
+    || customer?.full_name
+    || [merged.firstName || merged.first_name, merged.lastName || merged.last_name]
+      .filter(Boolean)
+      .join(' ')
+    || firstValue(merged, ['fullName', 'full_name', 'name', 'applicant_name']);
+  return {
+    name,
+    pan: firstValue(merged, ['panNumber', 'pan_number', 'pan', 'id_number']).toUpperCase(),
+    mobile: firstValue(merged, ['phone', 'mobile', 'mobile_number', 'mobileNo']) || customer?.phone,
+    dob: firstValue(merged, ['dateOfBirth', 'date_of_birth', 'dob']),
+    gender: firstValue(merged, ['gender']),
+    consent: extra.consent !== false,
+  };
 }
 
 export async function listCibilVendors() {
@@ -33,7 +67,7 @@ export async function listCibilVendors() {
     displayName: r.display_name,
     sandboxMode: Boolean(r.sandbox_mode),
     isActive: Boolean(r.is_active),
-    hasCredentials: Boolean(r.has_key),
+    hasCredentials: Boolean(r.has_key) || (r.vendor_key === 'transunion_cibil' && surepassConfigured(r)),
     updatedAt: r.updated_at,
   }));
 }
@@ -82,17 +116,15 @@ async function getActiveVendor(pool) {
   return row;
 }
 
-async function sandboxPull({ vendor, application, customer }) {
+function writeLocalSandboxPdf({ vendor, application, customer, score }) {
   const data = parseJson(application?.data);
-  const score = 680 + Math.floor(Math.random() * 120);
   const reportDir = resolve(getUploadDir(), 'cibil-reports');
   mkdirSync(reportDir, { recursive: true });
   const refId = application?.id || customer?.id || newId();
   const fileName = `${refId}-${Date.now()}.pdf`;
   const reportPath = resolve(reportDir, fileName);
-
   const lines = [
-    'Rfincare — Credit Bureau Report (Sandbox)',
+    'Rfincare — Credit Bureau Report (Local sandbox fallback)',
     `Vendor: ${vendor.display_name}`,
     `Application: ${application?.application_number || application?.id || 'Customer pull'}`,
     `Customer: ${customer?.full_name || '—'}`,
@@ -100,30 +132,98 @@ async function sandboxPull({ vendor, application, customer }) {
     `Score: ${score}`,
     `Checked at: ${new Date().toISOString()}`,
     '',
-    'This is a sandbox report for QC and manual review.',
+    'Surepass credentials were not set, so this PDF is a local sandbox stub.',
+    'Set SUREPASS_TOKEN or SUREPASS_ID_NUMBER + SUREPASS_PASSWORD to pull a real CIBIL PDF.',
   ];
   writeFileSync(reportPath, buildSimpleTextPdf(lines));
+  return `/uploads/cibil-reports/${fileName}`;
+}
 
+async function sandboxPull({ vendor, application, customer, extra }) {
+  const demographics = extractCibilDemographics({ application, customer, extra });
+  if (surepassConfigured(vendor)) {
+    const live = await surepassPull({ vendor, application, customer, extra, allowMissingScore: true });
+    if (live.status === 'success') return live;
+  }
+
+  const score = 680 + Math.floor(Math.random() * 120);
   return {
     status: 'success',
     creditScore: score,
-    reportPath: `/uploads/cibil-reports/${fileName}`,
-    response: { sandbox: true, vendor: vendor.vendor_key, score },
+    reportPath: writeLocalSandboxPdf({ vendor, application, customer, score }),
+    response: {
+      sandbox: true,
+      localFallback: true,
+      vendor: vendor.vendor_key,
+      score,
+      demographics: { pan: demographics.pan, mobile: demographics.mobile },
+    },
   };
 }
 
-async function productionPull({ vendor, application, customer }) {
-  if (!vendor.api_key || !vendor.api_secret) {
+async function surepassPull({ vendor, application, customer, extra, allowMissingScore = false }) {
+  const demographics = extractCibilDemographics({ application, customer, extra });
+  const result = await requestSurepassCibilPdf(demographics, vendor);
+  if (!result.ok) {
     return {
       status: 'failed',
       creditScore: null,
       reportPath: null,
-      errorMessage: 'API key and secret required for production pull',
+      errorMessage: result.errorMessage,
+      response: result.response || { reason: result.reason },
+    };
+  }
+
+  let reportPath = null;
+  if (result.pdfBuffer) {
+    const stem = application?.id || customer?.id || newId();
+    reportPath = saveCibilPdfBuffer(result.pdfBuffer, stem);
+  } else if (result.creditScore != null || allowMissingScore) {
+    reportPath = writeLocalSandboxPdf({
+      vendor,
+      application,
+      customer,
+      score: result.creditScore || '—',
+    });
+  }
+
+  if (result.creditScore == null && !allowMissingScore) {
+    return {
+      status: result.pdfBuffer ? 'success' : 'failed',
+      creditScore: null,
+      reportPath,
+      errorMessage: result.pdfBuffer ? null : 'Surepass returned no credit score or PDF',
+      response: result.response,
+    };
+  }
+
+  return {
+    status: 'success',
+    creditScore: result.creditScore,
+    reportPath,
+    response: {
+      vendor: 'surepass',
+      path: result.path,
+      clientId: result.clientId,
+      pdfUrl: result.pdfUrl,
+      sandbox: result.sandbox,
+      payload: result.response,
+    },
+  };
+}
+
+async function productionPull({ vendor, application, customer, extra }) {
+  if (!surepassConfigured(vendor)) {
+    return {
+      status: 'failed',
+      creditScore: null,
+      reportPath: null,
+      errorMessage:
+        'Surepass credentials missing. Set SUREPASS_TOKEN or SUREPASS_ID_NUMBER + SUREPASS_PASSWORD (or save API key on the TransUnion CIBIL vendor).',
       response: { error: 'missing_credentials' },
     };
   }
-  // Production adapter placeholder — wire vendor SDK/REST when credentials are live.
-  return sandboxPull({ vendor, application, customer });
+  return surepassPull({ vendor, application, customer, extra });
 }
 
 export async function pullCibilForApplication(applicationId, { forceSandbox = false } = {}) {
@@ -158,7 +258,7 @@ export async function pullCibilForApplication(applicationId, { forceSandbox = fa
   await pool.execute(
     `INSERT INTO cibil_checks
      (id, application_id, customer_id, vendor_key, status, credit_score, report_path, error_message, response_payload)
-     VALUES (:id, :app, :cust, :vendor, :status, :score, :path, :err, :resp)`,
+     VALUES (:id, :app, :cust, :vendor, :status, :score, :path, :err, :resp::jsonb)`,
     {
       id: checkId,
       app: applicationId,
@@ -299,7 +399,11 @@ export async function pullCibilForCustomer(customerId, { forceSandbox = false } 
     throw e;
   }
 
-  const stubApplication = { id: customer.id, data: '{}' };
+  const [[latestApp]] = await pool.execute(
+    `SELECT id, data FROM loan_applications WHERE customer_id = :id ORDER BY updated_at DESC LIMIT 1`,
+    { id: customerId },
+  );
+  const stubApplication = latestApp || { id: customer.id, data: '{}' };
   const useSandbox = forceSandbox || Boolean(vendor.sandbox_mode);
   const result = useSandbox
     ? await sandboxPull({ vendor, application: stubApplication, customer })
@@ -309,7 +413,7 @@ export async function pullCibilForCustomer(customerId, { forceSandbox = false } 
   await pool.execute(
     `INSERT INTO cibil_checks
      (id, application_id, customer_id, vendor_key, status, credit_score, report_path, error_message, response_payload)
-     VALUES (:id, NULL, :cust, :vendor, :status, :score, :path, :err, :resp)`,
+     VALUES (:id, NULL, :cust, :vendor, :status, :score, :path, :err, :resp::jsonb)`,
     {
       id: checkId,
       cust: customerId,
@@ -346,7 +450,7 @@ const BAND_LABELS = {
 };
 
 /**
- * Guest / homepage CIBIL check — captures demographics, stores lead, returns sandbox or production pull.
+ * Guest / homepage CIBIL check — captures demographics, stores lead, returns Surepass or sandbox pull.
  */
 export async function pullCibilForGuest(demographics, { upsertLead } = {}) {
   await ensureMilestone4Schema();
@@ -376,11 +480,15 @@ export async function pullCibilForGuest(demographics, { upsertLead } = {}) {
       gender: demographics.gender || null,
     }),
   };
+  const extra = {
+    fullName: demographics.fullName,
+    consent: true,
+  };
 
   const useSandbox = Boolean(vendor.sandbox_mode);
   const result = useSandbox
-    ? await sandboxPull({ vendor, application: stubApplication, customer: stubCustomer })
-    : await productionPull({ vendor, application: stubApplication, customer: stubCustomer });
+    ? await sandboxPull({ vendor, application: stubApplication, customer: stubCustomer, extra })
+    : await productionPull({ vendor, application: stubApplication, customer: stubCustomer, extra });
 
   let leadId = null;
   if (typeof upsertLead === 'function') {
@@ -417,14 +525,36 @@ export async function pullCibilForGuest(demographics, { upsertLead } = {}) {
     throw e;
   }
 
-  const band = scoreBand(result.creditScore);
+  const band = scoreBand(result.creditScore || 0);
   return {
     leadId,
     creditScore: result.creditScore,
-    band,
-    bandLabel: BAND_LABELS[band],
+    band: result.creditScore ? band : 'unknown',
+    bandLabel: result.creditScore ? BAND_LABELS[band] : 'Report generated',
     vendorName: vendor.display_name,
     sandboxMode: useSandbox,
     checkedAt: new Date().toISOString(),
   };
+}
+
+export async function syncSurepassVendorFromEnv(pool = getPool()) {
+  const token = String(process.env.SUREPASS_TOKEN || '').trim();
+  const sandbox = String(process.env.SUREPASS_SANDBOX || 'true') !== 'false';
+  await pool.execute(
+    `INSERT INTO cibil_vendors (vendor_key, display_name, api_key, sandbox_mode, is_active, updated_at)
+     VALUES ('transunion_cibil', 'TransUnion CIBIL (Surepass)', :api_key, :sandbox, TRUE, NOW())
+     ON CONFLICT (vendor_key) DO UPDATE SET
+       display_name = EXCLUDED.display_name,
+       api_key = COALESCE(NULLIF(EXCLUDED.api_key, ''), cibil_vendors.api_key),
+       sandbox_mode = EXCLUDED.sandbox_mode,
+       is_active = TRUE,
+       updated_at = NOW()`,
+    {
+      api_key: token || null,
+      sandbox: sandbox ? 1 : 0,
+    },
+  );
+  await pool.execute(
+    `UPDATE cibil_vendors SET is_active = FALSE WHERE vendor_key != 'transunion_cibil'`,
+  );
 }

@@ -89,15 +89,33 @@ function formatContentRow(row, progress = null) {
 
 async function fetchLearningForAgent(pool, agentUserId) {
   await ensureAgentLearningSchema();
-  const [rows] = await pool.execute(
-    `SELECT c.*, p.progress_percent, p.completed_at
-     FROM agent_learning_content c
-     LEFT JOIN agent_learning_progress p
-       ON p.content_id = c.id AND p.agent_user_id = :agentId
-     WHERE c.is_active = TRUE AND c.audience IN ('agent', 'all')
-     ORDER BY c.is_new DESC, c.sort_order ASC, c.created_at DESC`,
-    { agentId: agentUserId },
-  );
+  const audienceSql = `(
+    c.audience IS NULL
+    OR LOWER(TRIM(CAST(c.audience AS TEXT))) IN ('agent', 'all')
+  )`;
+  const activeSql = `COALESCE(c.is_active, TRUE) = TRUE`;
+
+  let rows = [];
+  try {
+    const [joined] = await pool.execute(
+      `SELECT c.*, p.progress_percent, p.completed_at
+       FROM agent_learning_content c
+       LEFT JOIN agent_learning_progress p
+         ON p.content_id = c.id AND p.agent_user_id = :agentId
+       WHERE ${activeSql} AND ${audienceSql}
+       ORDER BY c.is_new DESC, c.sort_order ASC, c.created_at DESC`,
+      { agentId: agentUserId },
+    );
+    rows = joined;
+  } catch {
+    const [plain] = await pool.execute(
+      `SELECT * FROM agent_learning_content c
+       WHERE ${activeSql} AND ${audienceSql}
+       ORDER BY c.is_new DESC, c.sort_order ASC, c.created_at DESC`,
+    );
+    rows = plain;
+  }
+
   return rows.map((r) =>
     formatContentRow(r, {
       progress_percent: r.progress_percent,
@@ -154,7 +172,7 @@ adminAgentLearningRouter.get(
       const pool = getPool();
       const [rows] = await pool.execute(
         `SELECT * FROM agent_learning_content
-         WHERE audience IN ('agent', 'all')
+         WHERE audience IS NULL OR LOWER(TRIM(CAST(audience AS TEXT))) IN ('agent', 'all')
          ORDER BY sort_order ASC, created_at DESC`,
       );
       res.json(rows.map((r) => formatContentRow(r)));
@@ -405,7 +423,8 @@ portalAgentLearningRouter.get('/content/:id/file', async (req, res, next) => {
     const [[row]] = await pool.execute(
       `SELECT id, title, file_name, file_path, file_url, mime_type, content_type
        FROM agent_learning_content
-       WHERE id = :id AND is_active = TRUE AND audience IN ('agent', 'all')
+       WHERE id = :id AND COALESCE(is_active, TRUE) = TRUE
+         AND (audience IS NULL OR LOWER(TRIM(CAST(audience AS TEXT))) IN ('agent', 'all'))
        LIMIT 1`,
       { id: req.params.id },
     );
@@ -450,7 +469,9 @@ portalAgentLearningRouter.post('/:id/progress', async (req, res, next) => {
     const contentId = req.params.id;
 
     const [[content]] = await pool.execute(
-      `SELECT id FROM agent_learning_content WHERE id = :id AND is_active = TRUE AND audience IN ('agent', 'all') LIMIT 1`,
+      `SELECT id FROM agent_learning_content WHERE id = :id AND COALESCE(is_active, TRUE) = TRUE AND (
+         audience IS NULL OR LOWER(TRIM(CAST(audience AS TEXT))) IN ('agent', 'all')
+       ) LIMIT 1`,
       { id: contentId },
     );
     if (!content) return res.status(404).json({ error: 'Content not found' });

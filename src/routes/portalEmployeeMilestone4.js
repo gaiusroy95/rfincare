@@ -5,10 +5,12 @@ import bcrypt from 'bcryptjs';
 import { authenticate } from '../middleware/authenticate.js';
 import { getPool } from '../db/pool.js';
 import { ensureMilestone4Schema } from '../db/ensureMilestone4Schema.js';
+import { ensureStaffMessagingSchema } from '../db/ensureStaffMessagingSchema.js';
 import { dispatchFileUpdateNotification } from '../lib/fileNotificationService.js';
 import { ensureAgentCodeForUser } from '../lib/agentCode.js';
 import { sendStaffWelcomeEmail } from '../lib/email.js';
 import { sqlCastParam, sqlCoalescePatch } from '../lib/sqlCollation.js';
+import { newId } from '../lib/ids.js';
 import {
   assertEmployeeAccess,
   getEffectiveEmployeeAccess,
@@ -22,6 +24,86 @@ function requireEmployee(req) {
     const e = new Error('Employee access only');
     e.status = 403;
     throw e;
+  }
+}
+
+async function autoAssignPendingAgentsToEmployees(pool) {
+  const [pendingAgents] = await pool.execute(
+    `SELECT ao.user_id
+     FROM agent_onboarding ao
+     JOIN user_profiles up ON up.id = ao.user_id
+     WHERE CAST(ao.qc_status AS TEXT) IN ('pending_qc', 'qc_review')
+       AND up.role = 'agent'`,
+  );
+  if (!pendingAgents.length) return;
+
+  const pendingIds = pendingAgents.map((r) => r.user_id);
+  const params = {};
+  const pendingPlaceholders = pendingIds.map((id, i) => {
+    params[`aid${i}`] = id;
+    return `:aid${i}`;
+  });
+
+  const [existingMappings] = await pool.execute(
+    `SELECT agent_user_id, employee_user_id, is_primary
+     FROM agent_employee_hierarchy
+     WHERE agent_user_id IN (${pendingPlaceholders.join(', ')})`,
+    params,
+  );
+
+  const alreadyMappedAgents = new Set((existingMappings || []).map((r) => r.agent_user_id));
+  const unmappedAgentIds = pendingIds.filter((id) => !alreadyMappedAgents.has(id));
+  if (!unmappedAgentIds.length) return;
+
+  const [employees] = await pool.execute(
+    `SELECT id, email
+     FROM user_profiles
+     WHERE role = 'employee' AND is_active = TRUE
+     ORDER BY created_at ASC`,
+  );
+  if (!employees.length) return;
+
+  const [counts] = await pool.execute(
+    `SELECT employee_user_id, COUNT(*)::int AS c
+     FROM agent_employee_hierarchy
+     GROUP BY employee_user_id`,
+  );
+  const countMap = new Map((counts || []).map((r) => [r.employee_user_id, Number(r.c || 0)]));
+
+  const candidates = employees
+    .map((e) => ({ id: e.id, email: e.email || '', count: countMap.get(e.id) || 0 }))
+    .sort((a, b) => a.count - b.count || String(a.id).localeCompare(String(b.id)));
+
+  for (const agentUserId of unmappedAgentIds) {
+    candidates.sort((a, b) => a.count - b.count || String(a.id).localeCompare(String(b.id)));
+    const pick = candidates[0];
+    if (!pick) break;
+
+    // Extra safety against race conditions.
+    const [[exists]] = await pool.execute(
+      `SELECT id
+       FROM agent_employee_hierarchy
+       WHERE agent_user_id = :agent_user_id
+       LIMIT 1`,
+      { agent_user_id: agentUserId },
+    );
+    if (exists?.id) continue;
+
+    await pool.execute(
+      `INSERT INTO agent_employee_hierarchy
+       (id, agent_user_id, employee_user_id, communication_email, hierarchy_level, is_primary, notes, created_by)
+       VALUES
+       (:id, :agent_user_id, :employee_user_id, :communication_email, 1, 1, :notes, :created_by)`,
+      {
+        id: newId(),
+        agent_user_id: agentUserId,
+        employee_user_id: pick.id,
+        communication_email: pick.email,
+        notes: 'Auto-assigned for QC verification',
+        created_by: 'system:auto-assign',
+      },
+    );
+    pick.count += 1;
   }
 }
 
@@ -69,14 +151,28 @@ portalEmployeeMilestone4Router.get('/agent-onboarding/pending', async (req, res,
       requireEmployeeModuleAccess(access, 'agents', 'read');
     }
     await ensureMilestone4Schema();
+    await ensureStaffMessagingSchema();
     const pool = getPool();
+    await autoAssignPendingAgentsToEmployees(pool);
+
+    const isEmployee = req.auth.role === 'employee';
+    const employeeJoin = isEmployee
+      ? `JOIN agent_employee_hierarchy aeh
+         ON aeh.agent_user_id = ao.user_id
+        AND aeh.employee_user_id = :employee_id`
+      : '';
+    const employeeWhere = isEmployee ? 'AND aeh.employee_user_id = :employee_id' : '';
+
     const [rows] = await pool.execute(
       `SELECT ao.*, up.full_name, up.email, up.phone
        FROM agent_onboarding ao
        JOIN user_profiles up ON up.id = ao.user_id
+       ${employeeJoin}
        WHERE CAST(ao.qc_status AS TEXT)
          IN ('pending_qc', 'qc_review')
+         ${employeeWhere}
        ORDER BY ao.created_at ASC`,
+      isEmployee ? { employee_id: req.auth.userId } : {},
     );
     res.json(
       rows.map((r) => ({
@@ -111,6 +207,8 @@ portalEmployeeMilestone4Router.post('/agent-onboarding/:userId/qc', async (req, 
   try {
     requireEmployee(req);
     await ensureMilestone4Schema();
+    await ensureStaffMessagingSchema();
+    const pool = getPool();
     const input = QcDecisionSchema.parse(req.body);
     const tempPassword = input.temporaryPassword || input.password || null;
     if (req.auth.role === 'employee') {
@@ -120,8 +218,19 @@ portalEmployeeMilestone4Router.post('/agent-onboarding/:userId/qc', async (req, 
         'agents',
         input.decision === 'approved' ? 'approve' : 'reject',
       );
+      const [[mapping]] = await pool.execute(
+        `SELECT id
+         FROM agent_employee_hierarchy
+         WHERE agent_user_id = :agent_id AND employee_user_id = :employee_id
+         LIMIT 1`,
+        { agent_id: req.params.userId, employee_id: req.auth.userId },
+      );
+      if (!mapping?.id) {
+        return res.status(403).json({
+          error: 'This agent is not assigned to you for verification. Please refresh your queue.',
+        });
+      }
     }
-    const pool = getPool();
 
     const [[agent]] = await pool.execute(
       `SELECT * FROM agent_onboarding WHERE user_id = :id LIMIT 1`,

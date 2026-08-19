@@ -17,8 +17,10 @@ import {
   upsertMarketingLead,
 } from '../lib/marketingLeads.js';
 import { normalizeAgentCode } from '../lib/agentAttribution.js';
+import { applyReferralToLead } from '../lib/referralTracking.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { hasPermission } from '../auth/permissions.js';
+import { sqlCastParam, sqlParamEquals, sqlLiteralEquals } from '../lib/sqlCollation.js';
 
 export const leadsRouter = Router();
 
@@ -30,6 +32,10 @@ function canReadLeads(role) {
     || role === 'super_admin'
     || role === 'employee'
   );
+}
+
+function canManageLeads(role) {
+  return hasPermission(role, 'manage:*') || role === 'admin' || role === 'super_admin';
 }
 
 function formatProductType(value) {
@@ -73,6 +79,9 @@ function formatLead(row) {
     assignedToCode: row.assignee_code || null,
     assignedToRole: row.assignee_role || null,
     sourcedAgentCode: row.sourced_agent_code || null,
+    referralCode: row.referral_code || null,
+    referralProgram: row.referral_program || null,
+    referredByUserId: row.referred_by_user_id || null,
     applicationId: row.application_id,
     sessionKey: row.session_key,
     createdAt: row.created_at,
@@ -95,9 +104,15 @@ const CreateLeadSchema = z.object({
   sourcedAgentCode: z.string().optional().nullable(),
   sourced_agent_code: z.string().optional().nullable(),
   agentCode: z.string().optional().nullable(),
+  referralCode: z.string().optional().nullable(),
+  referral_code: z.string().optional().nullable(),
+  referralProgram: z.string().optional().nullable(),
+  referral_program: z.string().optional().nullable(),
 });
 
 async function applyAgentCodeToLead(pool, leadId, body) {
+  const applied = await applyReferralToLead(pool, leadId, body);
+  if (applied) return applied;
   const agentCode = normalizeAgentCode(
     body.sourcedAgentCode || body.sourced_agent_code || body.agentCode,
   );
@@ -765,12 +780,15 @@ leadsRouter.get('/', authenticate, async (req, res, next) => {
     await ensureOnboardingSchema();
     const pool = getPool();
     const assignedFilter = req.query.assignedTo || req.query.assigned_to;
-    let whereSql = '';
+    const monthFilter = String(req.query.month || '').trim();
+    const dateFrom = String(req.query.dateFrom || req.query.date_from || '').trim();
+    const dateTo = String(req.query.dateTo || req.query.date_to || '').trim();
+    const where = [];
     const params = {};
 
     if (assignedFilter === 'me') {
       if (role === 'employee' || role === 'agent') {
-        whereSql = 'WHERE ml.assigned_to = :userId';
+        where.push('ml.assigned_to = :userId');
         params.userId = req.auth.userId;
       } else if (role !== 'admin' && role !== 'super_admin') {
         const e = new Error('assignedTo=me is only for employees and agents');
@@ -778,6 +796,39 @@ leadsRouter.get('/', authenticate, async (req, res, next) => {
         throw e;
       }
     }
+
+    if (monthFilter) {
+      if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(monthFilter)) {
+        return res.status(400).json({ error: 'month must be in YYYY-MM format' });
+      }
+      const monthStart = new Date(`${monthFilter}-01T00:00:00.000Z`);
+      const monthEnd = new Date(monthStart);
+      monthEnd.setUTCMonth(monthEnd.getUTCMonth() + 1);
+      where.push('ml.created_at >= :monthStart AND ml.created_at < :monthEnd');
+      params.monthStart = monthStart.toISOString();
+      params.monthEnd = monthEnd.toISOString();
+    }
+
+    if (dateFrom) {
+      const parsed = new Date(`${dateFrom}T00:00:00.000Z`);
+      if (Number.isNaN(parsed.getTime())) {
+        return res.status(400).json({ error: 'dateFrom must be in YYYY-MM-DD format' });
+      }
+      where.push('ml.created_at >= :dateFrom');
+      params.dateFrom = parsed.toISOString();
+    }
+
+    if (dateTo) {
+      const parsed = new Date(`${dateTo}T00:00:00.000Z`);
+      if (Number.isNaN(parsed.getTime())) {
+        return res.status(400).json({ error: 'dateTo must be in YYYY-MM-DD format' });
+      }
+      parsed.setUTCDate(parsed.getUTCDate() + 1);
+      where.push('ml.created_at < :dateToPlusOne');
+      params.dateToPlusOne = parsed.toISOString();
+    }
+    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    const limitSql = canManageLeads(role) ? 'LIMIT 5000' : 'LIMIT 200';
 
     const [rows] = await pool.execute(
       `SELECT ml.*,
@@ -790,7 +841,7 @@ leadsRouter.get('/', authenticate, async (req, res, next) => {
        LEFT JOIN employee_onboarding eo ON eo.user_id = up.id AND up.role = 'employee'
        ${whereSql}
        ORDER BY ml.created_at DESC
-       LIMIT 200`,
+       ${limitSql}`,
       params,
     );
     res.json(rows.map(formatLead));
@@ -849,7 +900,7 @@ leadsRouter.patch('/:id/status', authenticate, async (req, res, next) => {
 leadsRouter.patch('/:id/assign', authenticate, async (req, res, next) => {
   try {
     const role = req.auth.role;
-    if (!hasPermission(role, 'manage:*') && role !== 'admin' && role !== 'super_admin') {
+    if (!canManageLeads(role)) {
       const e = new Error('Insufficient permissions');
       e.status = 403;
       throw e;
@@ -864,6 +915,54 @@ leadsRouter.patch('/:id/assign', authenticate, async (req, res, next) => {
       id: req.params.id,
     });
     res.json(formatLead(row));
+  } catch (err) {
+    next(err);
+  }
+});
+
+leadsRouter.delete('/:id', authenticate, async (req, res, next) => {
+  try {
+    if (!canManageLeads(req.auth.role)) {
+      const e = new Error('Only admin can delete leads');
+      e.status = 403;
+      throw e;
+    }
+    const pool = getPool();
+    const [result] = await pool.execute(`DELETE FROM marketing_leads WHERE id = :id`, {
+      id: req.params.id,
+    });
+    if (!result?.affectedRows) {
+      return res.status(404).json({ error: 'Lead not found' });
+    }
+    res.json({ success: true, deletedCount: 1 });
+  } catch (err) {
+    next(err);
+  }
+});
+
+leadsRouter.post('/bulk-delete', authenticate, async (req, res, next) => {
+  try {
+    if (!canManageLeads(req.auth.role)) {
+      const e = new Error('Only admin can delete leads');
+      e.status = 403;
+      throw e;
+    }
+    const ids = Array.isArray(req.body?.leadIds) ? req.body.leadIds.map((v) => String(v || '').trim()).filter(Boolean) : [];
+    if (!ids.length) {
+      return res.status(400).json({ error: 'leadIds is required' });
+    }
+    const pool = getPool();
+    const params = {};
+    const placeholders = ids.map((id, idx) => {
+      const key = `id_${idx}`;
+      params[key] = id;
+      return `:${key}`;
+    });
+    const [result] = await pool.execute(
+      `DELETE FROM marketing_leads WHERE id IN (${placeholders.join(', ')})`,
+      params,
+    );
+    res.json({ success: true, deletedCount: Number(result?.affectedRows || 0) });
   } catch (err) {
     next(err);
   }

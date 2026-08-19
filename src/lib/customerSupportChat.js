@@ -16,6 +16,55 @@ function supportInboxEmail() {
   );
 }
 
+export async function resolveAssignedEmployeeSupportContact(customerId) {
+  const pool = getPool();
+  const [[row]] = await pool.execute(
+    `SELECT
+        la.id AS application_id,
+        la.application_number,
+        la.assigned_employee_id,
+        up.full_name AS employee_name,
+        up.email AS employee_email,
+        COALESCE(NULLIF(TRIM(CAST(eo.mobile_number AS TEXT)), ''), NULLIF(TRIM(CAST(up.phone AS TEXT)), '')) AS employee_phone,
+        la.status,
+        la.updated_at,
+        la.created_at
+     FROM loan_applications la
+     LEFT JOIN user_profiles up ON up.id = la.assigned_employee_id
+     LEFT JOIN employee_onboarding eo ON eo.user_id = la.assigned_employee_id
+     WHERE la.customer_id = :customer_id
+       AND la.assigned_employee_id IS NOT NULL
+     ORDER BY
+       CASE WHEN la.status IN ('approved', 'rejected') THEN 1 ELSE 0 END ASC,
+       COALESCE(la.updated_at, la.created_at) DESC
+     LIMIT 1`,
+    { customer_id: customerId },
+  );
+  if (!row?.assigned_employee_id) return null;
+  return {
+    employeeUserId: row.assigned_employee_id,
+    employeeName: row.employee_name || '',
+    employeeEmail: row.employee_email || '',
+    employeePhone: row.employee_phone || '',
+    applicationId: row.application_id || null,
+    applicationNumber: row.application_number || '',
+    applicationStatus: row.status || '',
+  };
+}
+
+export async function canEmployeeAccessCustomerSupportChat(employeeUserId, customerId) {
+  const pool = getPool();
+  const [[row]] = await pool.execute(
+    `SELECT id
+     FROM loan_applications
+     WHERE customer_id = :customer_id
+       AND assigned_employee_id = :employee_id
+     LIMIT 1`,
+    { customer_id: customerId, employee_id: employeeUserId },
+  );
+  return Boolean(row?.id);
+}
+
 export async function ensureSupportChatSchema(pool = getPool()) {
   try {
     await pool.execute(`SELECT 1 FROM customer_support_messages LIMIT 1`);
@@ -101,7 +150,13 @@ export async function insertSupportMessage({ customerId, senderRole, senderId, b
   };
 }
 
-export async function sendCustomerSupportMessage({ customerId, senderId, body, customerProfile }) {
+export async function sendCustomerSupportMessage({
+  customerId,
+  senderId,
+  body,
+  customerProfile,
+  supportContact = null,
+}) {
   const trimmed = String(body || '').trim();
   if (!trimmed) {
     const err = new Error('Message cannot be empty');
@@ -122,7 +177,11 @@ export async function sendCustomerSupportMessage({ customerId, senderId, body, c
   });
 
   const contact = await getSiteContactSettings().catch(() => null);
-  const to = supportInboxEmail() || contact?.email || 'support@rfincare.com';
+  const to =
+    supportContact?.employeeEmail ||
+    supportInboxEmail() ||
+    contact?.email ||
+    'support@rfincare.com';
   const name = customerProfile?.full_name || customerProfile?.fullName || 'Customer';
   const email = customerProfile?.email || '';
   const phone = customerProfile?.phone || '';
@@ -138,6 +197,12 @@ export async function sendCustomerSupportMessage({ customerId, senderId, body, c
         email ? `Email: ${email}` : null,
         phone ? `Phone: ${phone}` : null,
         `Customer ID: ${customerId}`,
+        supportContact?.applicationNumber
+          ? `Application: ${supportContact.applicationNumber}`
+          : null,
+        supportContact?.employeeName
+          ? `Assigned employee: ${supportContact.employeeName}`
+          : null,
         '',
         trimmed,
         '',
@@ -150,7 +215,10 @@ export async function sendCustomerSupportMessage({ customerId, senderId, body, c
         <p>Customer: ${name}<br/>
         ${email ? `Email: ${email}<br/>` : ''}
         ${phone ? `Phone: ${phone}<br/>` : ''}
-        Customer ID: ${customerId}</p>
+        Customer ID: ${customerId}<br/>
+        ${supportContact?.applicationNumber ? `Application: ${supportContact.applicationNumber}<br/>` : ''}
+        ${supportContact?.employeeName ? `Assigned employee: ${supportContact.employeeName}<br/>` : ''}
+        </p>
         <p style="white-space:pre-wrap;border-left:3px solid #059669;padding-left:12px;">${trimmed
           .replace(/&/g, '&amp;')
           .replace(/</g, '&lt;')}</p>
@@ -180,21 +248,36 @@ export async function sendCustomerSupportMessage({ customerId, senderId, body, c
   return { message, ack };
 }
 
-export async function listSupportChatThreads({ limit = 40 } = {}) {
+export async function listSupportChatThreads({ limit = 40, role = '', userId = null } = {}) {
   const pool = getPool();
   await ensureSupportChatSchema(pool);
   const safeLimit = Math.min(Math.max(Number(limit) || 40, 1), 100);
+  const isEmployee = role === 'employee' && userId;
   const [threadRows] = await pool.execute(
-    `SELECT customer_id AS customer_id, MAX(created_at) AS last_at
-     FROM customer_support_messages
-     GROUP BY customer_id
-     ORDER BY MAX(created_at) DESC
-     LIMIT ${safeLimit}`,
+    isEmployee
+      ? `SELECT csm.customer_id AS customer_id, MAX(csm.created_at) AS last_at
+         FROM customer_support_messages csm
+         WHERE EXISTS (
+           SELECT 1
+           FROM loan_applications la
+           WHERE la.customer_id = csm.customer_id
+             AND la.assigned_employee_id = :employee_id
+         )
+         GROUP BY csm.customer_id
+         ORDER BY MAX(csm.created_at) DESC
+         LIMIT ${safeLimit}`
+      : `SELECT customer_id AS customer_id, MAX(created_at) AS last_at
+         FROM customer_support_messages
+         GROUP BY customer_id
+         ORDER BY MAX(created_at) DESC
+         LIMIT ${safeLimit}`,
+    isEmployee ? { employee_id: userId } : {},
   );
 
   const threads = [];
   for (const row of threadRows) {
     const customerId = row.customer_id;
+    const assigned = await resolveAssignedEmployeeSupportContact(customerId);
     const [[profile]] = await pool.execute(
       `SELECT full_name, email, phone FROM user_profiles WHERE id = :id LIMIT 1`,
       { id: customerId },
@@ -215,6 +298,11 @@ export async function listSupportChatThreads({ limit = 40 } = {}) {
       lastAt: last?.created_at || row.last_at,
       lastBody: last?.body || '',
       lastSenderRole: last?.sender_role || '',
+      assignedEmployeeId: assigned?.employeeUserId || null,
+      assignedEmployeeName: assigned?.employeeName || '',
+      assignedEmployeeEmail: assigned?.employeeEmail || '',
+      assignedEmployeePhone: assigned?.employeePhone || '',
+      applicationNumber: assigned?.applicationNumber || '',
     });
   }
   return threads;

@@ -168,7 +168,13 @@ async function sendSmsOtp({ phone, otp, settings }) {
       { phone: maskPhone(phone), provider },
       process.env.LOG_OTP === 'true' ? otp : '(hidden)',
     );
-    return { sent: true, provider: 'console' };
+    return {
+      sent: false,
+      provider: 'console',
+      delivered: false,
+      warning:
+        'SMS operator is set to Console, so no SMS was actually sent. Set SMS operator to MSG91 or Twilio in Admin → OTP settings (and configure server env vars) to deliver OTP SMS.',
+    };
   }
 
   if (provider === 'twilio') {
@@ -428,6 +434,10 @@ export async function sendDualChannelOtp({ email, phone, settings: settingsOverr
   const emailDelivered = outcomes.email?.delivered !== false && outcomes.email?.sent !== false;
   const smsDelivered = outcomes.sms?.sent !== false;
 
+  if (settings.requireMobileOtp !== false && !smsDelivered && outcomes.sms?.warning) {
+    warnings.push(outcomes.sms.warning);
+  }
+
   if (settings.requireWhatsappOtp && phone) {
     try {
       outcomes.whatsapp = await channelTimeout(
@@ -440,7 +450,7 @@ export async function sendDualChannelOtp({ email, phone, settings: settingsOverr
   }
 
   return {
-    mobileOtp: settings.requireMobileOtp !== false ? mobileOtp : null,
+    mobileOtp: settings.requireMobileOtp !== false && smsDelivered ? mobileOtp : null,
     emailOtp: settings.requireEmailOtp !== false && emailDelivered ? emailOtp : null,
     smsProvider: settings.smsProvider,
     emailProvider: settings.emailProvider,
@@ -448,7 +458,7 @@ export async function sendDualChannelOtp({ email, phone, settings: settingsOverr
     msg91Configured: isMsg91Configured(),
     emailDelivered,
     smsDelivered,
-    requireMobileOtp: settings.requireMobileOtp !== false,
+    requireMobileOtp: settings.requireMobileOtp !== false && smsDelivered,
     requireEmailOtp: settings.requireEmailOtp !== false && emailDelivered,
     warnings,
     delivery: outcomes,

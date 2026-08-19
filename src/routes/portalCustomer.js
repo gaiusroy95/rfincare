@@ -10,6 +10,7 @@ import { getCustomerCreditProfile } from '../lib/customerCreditScore.js';
 import { pullCibilForCustomer } from '../lib/cibilService.js';
 import {
   listCustomerSupportMessages,
+  resolveAssignedEmployeeSupportContact,
   sendCustomerSupportMessage,
 } from '../lib/customerSupportChat.js';
 import {
@@ -553,6 +554,16 @@ portalCustomerRouter.get('/support-chat', authenticate, async (req, res, next) =
   }
 });
 
+portalCustomerRouter.get('/support-contact', authenticate, async (req, res, next) => {
+  try {
+    requireCustomer(req);
+    const contact = await resolveAssignedEmployeeSupportContact(req.auth.userId);
+    res.json({ contact });
+  } catch (err) {
+    next(err);
+  }
+});
+
 portalCustomerRouter.post('/support-chat', authenticate, async (req, res, next) => {
   try {
     requireCustomer(req);
@@ -562,11 +573,13 @@ portalCustomerRouter.post('/support-chat', authenticate, async (req, res, next) 
       `SELECT full_name, email, phone FROM user_profiles WHERE id = :id LIMIT 1`,
       { id: req.auth.userId },
     );
+    const supportContact = await resolveAssignedEmployeeSupportContact(req.auth.userId);
     const result = await sendCustomerSupportMessage({
       customerId: req.auth.userId,
       senderId: req.auth.userId,
       body,
       customerProfile: profile,
+      supportContact,
     });
     res.status(201).json(result);
   } catch (err) {

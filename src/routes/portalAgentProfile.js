@@ -184,16 +184,18 @@ portalAgentProfileRouter.post('/photo', avatarUpload.single('photo'), async (req
   }
 });
 
-const BankOtpSchema = z.object({
-  accountNumber: z.string().min(4),
-  bankName: z.string().min(2),
-  ifscCode: z.string().min(8).max(16),
-});
+const BankOtpRequestSchema = z
+  .object({
+    accountNumber: z.string().optional(),
+    bankName: z.string().optional(),
+    ifscCode: z.string().optional(),
+  })
+  .passthrough();
 
 portalAgentProfileRouter.post('/bank/request-otp', async (req, res, next) => {
   try {
     requireAgent(req);
-    const input = BankOtpSchema.parse(req.body);
+    const input = BankOtpRequestSchema.parse(req.body || {});
     await ensureAgentProfileSchema();
     const pool = getPool();
     const row = await loadAgentContext(pool, req.auth.userId);
@@ -206,7 +208,11 @@ portalAgentProfileRouter.post('/bank/request-otp', async (req, res, next) => {
       channel: 'sms',
       phone,
       email: row.email,
-      payload: input,
+      payload: {
+        accountNumber: String(input.accountNumber || '').trim(),
+        bankName: String(input.bankName || '').trim(),
+        ifscCode: String(input.ifscCode || '').trim().toUpperCase(),
+      },
     });
 
     await sendOtpNotification({ phone, email: row.email, otp, channel: 'sms' });
