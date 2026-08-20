@@ -1,0 +1,211 @@
+import { getPool } from "../db/pool.js";
+import { newId } from "./ids.js";
+import { sendEmail } from "./email.js";
+import { getOtpProviderSettings } from "./otpProviderSettings.js";
+import { createCustomerNotification, createStaffNotification } from "../routes/notifications.js";
+import { getUserNotificationPreferences } from "./expoPushService.js";
+import { ensureMilestone4Schema } from "../db/ensureMilestone4Schema.js";
+const DEFAULT_SETTINGS = {
+  channels: { sms: true, email: true, whatsapp: true, push: true },
+  agentNotificationsEnabled: true,
+  events: {
+    customer_document_upload: { customer: false, employee: true, agent: "optional" },
+    employee_document_decision: { customer: true, employee: false, agent: "optional" },
+    application_stage_after_bank: { customer: true, employee: true, agent: "if_sourced" }
+  }
+};
+function parseSettings(row) {
+  if (!row?.settings_json) return { ...DEFAULT_SETTINGS };
+  const raw = typeof row.settings_json === "string" ? JSON.parse(row.settings_json) : row.settings_json;
+  return {
+    ...DEFAULT_SETTINGS,
+    ...raw,
+    channels: { ...DEFAULT_SETTINGS.channels, ...raw.channels || {} },
+    events: { ...DEFAULT_SETTINGS.events, ...raw.events || {} }
+  };
+}
+async function getFileNotificationSettings() {
+  await ensureMilestone4Schema();
+  const pool = getPool();
+  const [[row]] = await pool.execute(
+    `SELECT settings_json FROM file_notification_settings WHERE id = 'default' LIMIT 1`
+  );
+  return parseSettings(row);
+}
+async function saveFileNotificationSettings(settings, updatedBy) {
+  await ensureMilestone4Schema();
+  const pool = getPool();
+  await pool.execute(
+    `INSERT INTO file_notification_settings (id, settings_json, updated_by, updated_at)
+     VALUES ('default', :json, :by, NOW()) ON CONFLICT (id) DO UPDATE SET settings_json = EXCLUDED.settings_json, updated_by = EXCLUDED.updated_by, updated_at = EXCLUDED.updated_at`,
+    { json: JSON.stringify(settings), by: updatedBy || null }
+  );
+  return getFileNotificationSettings();
+}
+async function createStaffNotificationLocal(pool, payload) {
+  return createStaffNotification(pool, payload);
+}
+async function deliverChannels({ phone, email, title, message, settings, userId }) {
+  const channels = [];
+  const body = `${title}
+
+${message}`;
+  const otpSettings = await getOtpProviderSettings();
+  let allowSms = !!settings.channels?.sms;
+  let allowWhatsapp = !!settings.channels?.whatsapp;
+  if (userId) {
+    const prefs = await getUserNotificationPreferences(userId);
+    if (prefs.sms === false) {
+      allowSms = false;
+      allowWhatsapp = false;
+    }
+  }
+  if (settings.channels?.email && email) {
+    await sendEmail({ to: email, subject: title, text: body });
+    channels.push("email");
+  }
+  if (allowSms && phone) {
+    const { sendOtpNotification } = await import("./otp.js");
+    await sendOtpNotification({ phone, otp: message.slice(0, 160), channel: "sms", settings: otpSettings });
+    channels.push("sms");
+  }
+  if (allowWhatsapp && phone) {
+    const { sendOtpNotification } = await import("./otp.js");
+    await sendOtpNotification({
+      phone,
+      otp: message.slice(0, 160),
+      channel: "whatsapp",
+      settings: otpSettings
+    });
+    channels.push("whatsapp");
+  }
+  return channels;
+}
+function shouldNotify(rule, roleKey) {
+  const val = rule?.[roleKey];
+  if (val === true) return true;
+  if (val === false) return false;
+  return val === "optional" || val === "if_sourced";
+}
+async function loadApplicationContext(pool, applicationId) {
+  const [[app]] = await pool.execute(
+    `SELECT la.*, c.full_name AS customer_name, c.email AS customer_email, c.phone AS customer_phone,
+            e.id AS assigned_employee_id, up_agent.email AS agent_email, up_agent.phone AS agent_phone,
+            ao.agent_name
+     FROM loan_applications la
+     JOIN user_profiles c ON c.id = la.customer_id
+     LEFT JOIN user_profiles e ON e.id = la.assigned_employee_id
+     LEFT JOIN user_profiles up_agent ON up_agent.id = la.agent_id
+     LEFT JOIN agent_onboarding ao ON ao.user_id = la.agent_id
+     WHERE la.id = :id LIMIT 1`,
+    { id: applicationId }
+  );
+  return app || null;
+}
+async function dispatchFileUpdateNotification(eventKey, { applicationId, extra = {} }) {
+  await ensureMilestone4Schema();
+  const settings = await getFileNotificationSettings();
+  const rule = settings.events?.[eventKey];
+  if (!rule) return { skipped: true };
+  const pool = getPool();
+  const app = await loadApplicationContext(pool, applicationId);
+  if (!app) return { skipped: true, reason: "no_application" };
+  const appNo = app.application_number || applicationId.slice(0, 8);
+  const title = extra.title || "Application update";
+  const message = extra.message || `Update on application ${appNo} for ${app.customer_name || "customer"}.`;
+  const results = { inApp: [], channels: [] };
+  if (shouldNotify(rule, "customer")) {
+    try {
+      await createCustomerNotification(pool, {
+        customerId: app.customer_id,
+        title,
+        message
+      });
+      results.inApp.push("customer");
+      const ch = await deliverChannels({
+        phone: app.customer_phone,
+        email: app.customer_email,
+        title,
+        message,
+        settings,
+        userId: app.customer_id
+      });
+      results.channels.push(...ch);
+    } catch {
+    }
+  }
+  if (shouldNotify(rule, "employee") && app.assigned_employee_id) {
+    await createStaffNotificationLocal(pool, {
+      userId: app.assigned_employee_id,
+      role: "employee",
+      applicationId,
+      eventType: eventKey,
+      title,
+      message
+    });
+    results.inApp.push("employee");
+    const [[emp]] = await pool.execute(
+      `SELECT email, phone FROM user_profiles WHERE id = :id LIMIT 1`,
+      { id: app.assigned_employee_id }
+    );
+    const ch = await deliverChannels({
+      phone: emp?.phone,
+      email: emp?.email,
+      title,
+      message,
+      settings,
+      userId: app.assigned_employee_id
+    });
+    results.channels.push(...ch);
+  } else if (shouldNotify(rule, "employee")) {
+    const [employees] = await pool.execute(
+      `SELECT id, email, phone FROM user_profiles WHERE role = 'employee' AND is_active = TRUE LIMIT 20`
+    );
+    for (const emp of employees) {
+      await createStaffNotificationLocal(pool, {
+        userId: emp.id,
+        role: "employee",
+        applicationId,
+        eventType: eventKey,
+        title,
+        message
+      });
+      await deliverChannels({
+        phone: emp.phone,
+        email: emp.email,
+        title,
+        message,
+        settings,
+        userId: emp.id
+      });
+    }
+    results.inApp.push("employees_broadcast");
+  }
+  const notifyAgent = settings.agentNotificationsEnabled && app.agent_id && (shouldNotify(rule, "agent") || rule.agent === "if_sourced");
+  if (notifyAgent) {
+    await createStaffNotificationLocal(pool, {
+      userId: app.agent_id,
+      role: "agent",
+      applicationId,
+      eventType: eventKey,
+      title,
+      message
+    });
+    results.inApp.push("agent");
+    const ch = await deliverChannels({
+      phone: app.agent_phone,
+      email: app.agent_email,
+      title,
+      message,
+      settings,
+      userId: app.agent_id
+    });
+    results.channels.push(...ch);
+  }
+  return results;
+}
+export {
+  dispatchFileUpdateNotification,
+  getFileNotificationSettings,
+  saveFileNotificationSettings
+};

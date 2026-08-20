@@ -1,0 +1,276 @@
+import bcrypt from "bcryptjs";
+import { getPool } from "../db/pool.js";
+import { ensureOnboardingSchema } from "../db/ensureOnboardingSchema.js";
+import { sendStaffWelcomeEmail } from "./email.js";
+import { ensureAgentCodeForUser } from "./agentCode.js";
+import { sqlCastParam, sqlCoalescePatch, sqlLiteralEquals, sqlParamEqualsLower } from "./sqlCollation.js";
+function pick(body, ...keys) {
+  for (const key of keys) {
+    if (body[key] !== void 0 && body[key] !== null && body[key] !== "") {
+      return body[key];
+    }
+  }
+  return void 0;
+}
+function resolveActiveFlag(accountStatus) {
+  if (accountStatus === "active") return true;
+  if (accountStatus === "inactive" || accountStatus === "suspended") return false;
+  return null;
+}
+async function fetchAgentDetail(userId) {
+  await ensureOnboardingSchema();
+  const pool = getPool();
+  const [[row]] = await pool.execute(
+    `SELECT up.*, ao.username, ao.agent_name, ao.agent_code, ao.email AS ao_email,
+            ao.mobile_number, ao.account_number, ao.bank_name, ao.ifsc_code,
+            ao.onboarding_status AS ao_status
+     FROM user_profiles up
+     LEFT JOIN agent_onboarding ao ON ao.user_id = up.id
+     WHERE up.id = :id AND ${sqlLiteralEquals("up.role", "agent")} LIMIT 1`,
+    { id: userId }
+  );
+  if (!row) {
+    const e = new Error("Agent not found");
+    e.status = 404;
+    throw e;
+  }
+  const agentCode = await ensureAgentCodeForUser(pool, userId) || row.agent_code;
+  return {
+    id: row.id,
+    email: row.email,
+    fullName: row.full_name || row.agent_name,
+    phone: row.phone || row.mobile_number,
+    username: row.username,
+    agentCode,
+    agentName: row.agent_name || row.full_name,
+    mobileNumber: row.mobile_number,
+    accountNumber: row.account_number,
+    bankName: row.bank_name,
+    ifscCode: row.ifsc_code,
+    accountStatus: row.account_status,
+    onboardingStatus: row.ao_status || row.onboarding_status,
+    isActive: Boolean(row.is_active),
+    createdAt: row.created_at
+  };
+}
+async function fetchEmployeeDetail(userId) {
+  await ensureOnboardingSchema();
+  const pool = getPool();
+  const [[row]] = await pool.execute(
+    `SELECT up.*, eo.username, eo.employee_name, eo.employee_code, eo.email AS eo_email,
+            eo.mobile_number, eo.account_number, eo.bank_name, eo.ifsc_code,
+            eo.onboarding_status AS eo_status
+     FROM user_profiles up
+     LEFT JOIN employee_onboarding eo ON eo.user_id = up.id
+     WHERE up.id = :id AND ${sqlLiteralEquals("up.role", "employee")} LIMIT 1`,
+    { id: userId }
+  );
+  if (!row) {
+    const e = new Error("Employee not found");
+    e.status = 404;
+    throw e;
+  }
+  return {
+    id: row.id,
+    email: row.email,
+    fullName: row.full_name || row.employee_name,
+    phone: row.phone || row.mobile_number,
+    username: row.username,
+    employeeCode: row.employee_code,
+    employeeName: row.employee_name || row.full_name,
+    mobileNumber: row.mobile_number,
+    accountNumber: row.account_number,
+    bankName: row.bank_name,
+    ifscCode: row.ifsc_code,
+    accountStatus: row.account_status,
+    onboardingStatus: row.eo_status || row.onboarding_status,
+    isActive: Boolean(row.is_active),
+    createdAt: row.created_at
+  };
+}
+async function updateAgentDetails(userId, body) {
+  await ensureOnboardingSchema();
+  const pool = getPool();
+  const fullName = pick(body, "agentName", "agent_name", "fullName", "full_name");
+  const email = pick(body, "email");
+  const phone = pick(body, "mobileNumber", "mobile_number", "phone");
+  const username = pick(body, "username");
+  const accountNumber = pick(body, "accountNumber", "account_number");
+  const bankName = pick(body, "bankName", "bank_name");
+  const ifscCode = pick(body, "ifscCode", "ifsc_code");
+  const accountStatus = pick(body, "accountStatus", "account_status");
+  const onboardingStatus = pick(body, "onboardingStatus", "onboarding_status");
+  const isActive = resolveActiveFlag(accountStatus);
+  if (email) {
+    const normalizedEmail = String(email).trim().toLowerCase();
+    const [[dup]] = await pool.execute(
+      `SELECT id FROM auth_users
+       WHERE ${sqlParamEqualsLower("email", "email")} AND id != :id LIMIT 1`,
+      { email: normalizedEmail, id: userId }
+    );
+    if (dup) {
+      const e = new Error("Email already in use");
+      e.status = 409;
+      throw e;
+    }
+    await pool.execute(`UPDATE auth_users SET email = ${sqlCastParam("email")} WHERE id = :id`, {
+      email: normalizedEmail,
+      id: userId
+    });
+  }
+  await pool.execute(
+    `UPDATE user_profiles SET
+       ${sqlCoalescePatch("full_name", "full_name")},
+       ${email ? `${sqlCoalescePatch("email", "email")},` : ""}
+       ${sqlCoalescePatch("phone", "phone")},
+       ${sqlCoalescePatch("account_status", "account_status")},
+       ${sqlCoalescePatch("onboarding_status", "onboarding_status")},
+       ${sqlCoalescePatch("is_active", "is_active", "BOOLEAN")}
+     WHERE id = :id AND ${sqlLiteralEquals("role", "agent")}`,
+    {
+      id: userId,
+      full_name: fullName || null,
+      email: email ? String(email).trim().toLowerCase() : null,
+      phone: phone || null,
+      account_status: accountStatus || null,
+      onboarding_status: onboardingStatus || null,
+      is_active: isActive
+    }
+  );
+  await pool.execute(
+    `UPDATE agent_onboarding SET
+       ${sqlCoalescePatch("agent_name", "agent_name")},
+       ${email ? `${sqlCoalescePatch("email", "email")},` : ""}
+       ${sqlCoalescePatch("mobile_number", "mobile_number")},
+       ${sqlCoalescePatch("username", "username")},
+       ${sqlCoalescePatch("account_number", "account_number")},
+       ${sqlCoalescePatch("bank_name", "bank_name")},
+       ${sqlCoalescePatch("ifsc_code", "ifsc_code")},
+       ${sqlCoalescePatch("onboarding_status", "onboarding_status")}
+     WHERE user_id = :id`,
+    {
+      id: userId,
+      agent_name: fullName || null,
+      email: email ? String(email).trim().toLowerCase() : null,
+      mobile_number: phone || null,
+      username: username || null,
+      account_number: accountNumber || null,
+      bank_name: bankName || null,
+      ifsc_code: ifscCode ? String(ifscCode).toUpperCase() : null,
+      onboarding_status: onboardingStatus || null
+    }
+  );
+  return fetchAgentDetail(userId);
+}
+async function updateEmployeeDetails(userId, body) {
+  await ensureOnboardingSchema();
+  const pool = getPool();
+  const fullName = pick(body, "employeeName", "employee_name", "fullName", "full_name");
+  const email = pick(body, "email");
+  const phone = pick(body, "mobileNumber", "mobile_number", "phone");
+  const username = pick(body, "username");
+  const employeeCode = pick(body, "employeeCode", "employee_code");
+  const accountNumber = pick(body, "accountNumber", "account_number");
+  const bankName = pick(body, "bankName", "bank_name");
+  const ifscCode = pick(body, "ifscCode", "ifsc_code");
+  const accountStatus = pick(body, "accountStatus", "account_status");
+  const onboardingStatus = pick(body, "onboardingStatus", "onboarding_status");
+  const isActive = resolveActiveFlag(accountStatus);
+  if (email) {
+    const normalizedEmail = String(email).trim().toLowerCase();
+    const [[dup]] = await pool.execute(
+      `SELECT id FROM auth_users
+       WHERE ${sqlParamEqualsLower("email", "email")} AND id != :id LIMIT 1`,
+      { email: normalizedEmail, id: userId }
+    );
+    if (dup) {
+      const e = new Error("Email already in use");
+      e.status = 409;
+      throw e;
+    }
+    await pool.execute(`UPDATE auth_users SET email = ${sqlCastParam("email")} WHERE id = :id`, {
+      email: normalizedEmail,
+      id: userId
+    });
+  }
+  await pool.execute(
+    `UPDATE user_profiles SET
+       ${sqlCoalescePatch("full_name", "full_name")},
+       ${email ? `${sqlCoalescePatch("email", "email")},` : ""}
+       ${sqlCoalescePatch("phone", "phone")},
+       ${sqlCoalescePatch("account_status", "account_status")},
+       ${sqlCoalescePatch("onboarding_status", "onboarding_status")},
+       ${sqlCoalescePatch("is_active", "is_active", "BOOLEAN")}
+     WHERE id = :id AND ${sqlLiteralEquals("role", "employee")}`,
+    {
+      id: userId,
+      full_name: fullName || null,
+      email: email ? String(email).trim().toLowerCase() : null,
+      phone: phone || null,
+      account_status: accountStatus || null,
+      onboarding_status: onboardingStatus || null,
+      is_active: isActive
+    }
+  );
+  await pool.execute(
+    `UPDATE employee_onboarding SET
+       ${sqlCoalescePatch("employee_name", "employee_name")},
+       ${email ? `${sqlCoalescePatch("email", "email")},` : ""}
+       ${sqlCoalescePatch("mobile_number", "mobile_number")},
+       ${sqlCoalescePatch("username", "username")},
+       ${sqlCoalescePatch("employee_code", "employee_code")},
+       ${sqlCoalescePatch("account_number", "account_number")},
+       ${sqlCoalescePatch("bank_name", "bank_name")},
+       ${sqlCoalescePatch("ifsc_code", "ifsc_code")},
+       ${sqlCoalescePatch("onboarding_status", "onboarding_status")}
+     WHERE user_id = :id`,
+    {
+      id: userId,
+      employee_name: fullName || null,
+      email: email ? String(email).trim().toLowerCase() : null,
+      mobile_number: phone || null,
+      username: username || null,
+      employee_code: employeeCode || null,
+      account_number: accountNumber || null,
+      bank_name: bankName || null,
+      ifsc_code: ifscCode ? String(ifscCode).toUpperCase() : null,
+      onboarding_status: onboardingStatus || null
+    }
+  );
+  return fetchEmployeeDetail(userId);
+}
+async function resetStaffPassword({ userId, password, role, fullName, email, notifyEmail }) {
+  if (!password || String(password).length < 8) {
+    const e = new Error("Password must be at least 8 characters");
+    e.status = 400;
+    throw e;
+  }
+  const pool = getPool();
+  const hashed = await bcrypt.hash(password, 12);
+  await pool.execute(`UPDATE auth_users SET password_hash = :ph WHERE id = :id`, {
+    ph: hashed,
+    id: userId
+  });
+  await pool.execute(
+    `UPDATE user_profiles SET password_change_required = FALSE WHERE id = :id`,
+    { id: userId }
+  );
+  if (notifyEmail && email) {
+    const loginPath = role === "agent" ? "/agent-login" : "/employee-login";
+    await sendStaffWelcomeEmail({
+      email,
+      fullName: fullName || email,
+      role,
+      password,
+      loginPath
+    }).catch((err) => console.warn("[staff-password-reset-email]", err.message));
+  }
+  return { success: true };
+}
+export {
+  fetchAgentDetail,
+  fetchEmployeeDetail,
+  resetStaffPassword,
+  updateAgentDetails,
+  updateEmployeeDetails
+};

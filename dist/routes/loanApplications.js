@@ -1,0 +1,1037 @@
+import { Router } from "express";
+import { z } from "zod";
+import { unlink } from "node:fs/promises";
+import { getPool, isNoSuchTableError } from "../db/pool.js";
+import { newId } from "../lib/ids.js";
+import { generateOtp, hashOtp, sendOtpNotification } from "../lib/otp.js";
+import { authenticate } from "../middleware/authenticate.js";
+import { authorize } from "../middleware/authorize.js";
+import { hasPermission } from "../auth/permissions.js";
+import { createCustomerNotification } from "./notifications.js";
+import { writeAuditLog } from "../lib/audit.js";
+import { requireSuccessfulCibilForSubmit } from "../lib/cibilService.js";
+import { dispatchFileUpdateNotification } from "../lib/fileNotificationService.js";
+import { buildSimpleTextPdf } from "../lib/simplePdf.js";
+import { finalizeApplicationSubmission } from "../lib/applicationSubmissionService.js";
+import {
+  assertEmployeeAccess,
+  requireEmployeeModuleAccess,
+  getEffectiveEmployeeAccess
+} from "../lib/employeeAccessControls.js";
+import {
+  fetchMarketplaceEnquiries,
+  isMarketplaceProductFilter
+} from "../lib/marketplaceEnquiries.js";
+const loanApplicationsRouter = Router();
+const STAFF_ROLES = /* @__PURE__ */ new Set(["admin", "super_admin", "employee"]);
+const ADMIN_DELETE_ROLES = /* @__PURE__ */ new Set(["admin", "super_admin"]);
+const ADMIN_DELETE_OTP_PURPOSE = "admin_delete_apps";
+const DOCUMENT_STAGE_OPTIONS = /* @__PURE__ */ new Set([
+  "documents_pending",
+  "documents_received",
+  "submitted_to_bank",
+  "under_process",
+  "pending_at_qc",
+  "at_kyc_stage",
+  "at_bgv_stage",
+  "at_credit_stage",
+  "at_property_valuation_stage",
+  "at_property_technical_stage",
+  "at_disbursement_stage",
+  "documents_verified"
+]);
+const BANK_APPROVAL_STAGE_OPTIONS = /* @__PURE__ */ new Set([
+  "submitted_to_bank",
+  "under_process",
+  "pending_at_qc",
+  "at_kyc_stage",
+  "at_bgv_stage",
+  "at_credit_stage",
+  "at_property_valuation_stage",
+  "at_property_technical_stage",
+  "at_disbursement_stage",
+  "bank_rejected"
+]);
+function canDeleteApplications(role) {
+  return ADMIN_DELETE_ROLES.has(role) || hasPermission(role, "delete:loan_applications");
+}
+async function hardDeleteApplications(pool, applicationIds) {
+  if (!applicationIds.length) return { deleted: 0 };
+  const params = {};
+  const placeholders = applicationIds.map((id, i) => {
+    const key = `id${i}`;
+    params[key] = id;
+    return `:${key}`;
+  });
+  const inClause = placeholders.join(", ");
+  const [docs] = await pool.execute(
+    `SELECT id, file_path FROM customer_documents WHERE application_id IN (${inClause})`,
+    params
+  );
+  for (const doc of docs) {
+    if (doc.file_path) {
+      try {
+        await unlink(doc.file_path);
+      } catch {
+      }
+    }
+  }
+  await pool.execute(`DELETE FROM customer_documents WHERE application_id IN (${inClause})`, params);
+  await pool.execute(`DELETE FROM application_consents WHERE application_id IN (${inClause})`, params);
+  await pool.execute(`DELETE FROM otp_verifications WHERE application_id IN (${inClause})`, params);
+  await pool.execute(
+    `UPDATE marketing_leads SET application_id = NULL WHERE application_id IN (${inClause})`,
+    params
+  );
+  await pool.execute(
+    `UPDATE application_form_drafts SET application_id = NULL WHERE application_id IN (${inClause})`,
+    params
+  );
+  const [result] = await pool.execute(
+    `DELETE FROM loan_applications WHERE id IN (${inClause})`,
+    params
+  );
+  return { deleted: result.affectedRows ?? applicationIds.length };
+}
+function parseJson(value) {
+  if (!value) return {};
+  if (typeof value === "object") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return {};
+  }
+}
+async function resolveAgentCode(pool, agentId) {
+  if (!agentId) return null;
+  const [[agent]] = await pool.execute(
+    `SELECT agent_code FROM agent_onboarding WHERE user_id = :id LIMIT 1`,
+    { id: agentId }
+  );
+  return agent?.agent_code || null;
+}
+function canReadAllApplications(role) {
+  return hasPermission(role, "read:all_loan_applications") || hasPermission(role, "read:*");
+}
+const LOAN_TYPE_LABELS = {
+  personal_loan: "Personal Loan",
+  home_loan: "Home Loan",
+  business_loan: "Business Loan",
+  auto_loan: "Auto Loan",
+  education_loan: "Education Loan"
+};
+function humanizeLoanType(value) {
+  if (value == null || value === "") return null;
+  const key = String(value).toLowerCase().replace(/-/g, "_");
+  if (LOAN_TYPE_LABELS[key]) return LOAN_TYPE_LABELS[key];
+  if (key.endsWith("_loan") && LOAN_TYPE_LABELS[key]) return LOAN_TYPE_LABELS[key];
+  const slug = key.replace(/_loan$/, "");
+  if (LOAN_TYPE_LABELS[`${slug}_loan`]) return LOAN_TYPE_LABELS[`${slug}_loan`];
+  return String(value).replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+}
+function extractLoanFields(data) {
+  const d = data && typeof data === "object" ? data : {};
+  const loanAmount = d.loan_amount ?? d.loanAmount ?? d.requested_loan_amount ?? d.requestedLoanAmount ?? null;
+  const loanTypeRaw = d.loan_type ?? d.loanType ?? d.loan_purpose ?? d.loanPurpose ?? null;
+  return {
+    loan_amount: loanAmount != null && loanAmount !== "" ? Number(loanAmount) : null,
+    loan_type: loanTypeRaw,
+    loan_type_label: humanizeLoanType(loanTypeRaw),
+    admin_priority: d.admin_priority || d.adminPriority || "medium"
+  };
+}
+function normalizeApplicationPayload(body) {
+  const base = { ...body || {} };
+  const extracted = extractLoanFields(base);
+  return {
+    ...base,
+    loan_amount: extracted.loan_amount ?? base.loan_amount,
+    loan_type: extracted.loan_type ?? base.loan_type,
+    requested_loan_amount: base.requested_loan_amount ?? base.requestedLoanAmount ?? extracted.loan_amount,
+    loan_purpose: base.loan_purpose ?? base.loanPurpose ?? extracted.loan_type
+  };
+}
+function formatApplication(row) {
+  const data = parseJson(row.data);
+  const loan = extractLoanFields(data);
+  return {
+    id: row.id,
+    record_type: row.record_type || "loan_application",
+    application_number: row.application_number,
+    customer_id: row.customer_id,
+    agent_id: row.agent_id,
+    sourced_agent_code: row.sourced_agent_code || null,
+    assigned_employee_id: row.assigned_employee_id,
+    qc_employee_id: row.qc_employee_id || null,
+    qc_admin_id: row.qc_admin_id || null,
+    selected_bank_id: row.selected_bank_id,
+    status: row.status,
+    document_stage_status: row.document_stage_status || "documents_pending",
+    bank_approval_status: row.bank_approval_status || "submitted_to_bank",
+    status_notes: row.status_notes,
+    review_notes: row.review_notes,
+    eligibility_status: row.eligibility_status,
+    rejection_reason: row.rejection_reason,
+    submitted_at: row.submitted_at,
+    journey_mode: row.journey_mode || "assessment",
+    cibil_status: row.cibil_status || null,
+    cibil_checked_at: row.cibil_checked_at || null,
+    disbursed_amount: row.disbursed_amount,
+    disbursed_at: row.disbursed_at,
+    commission_status: row.commission_status,
+    reviewed_by: row.reviewed_by,
+    reviewed_at: row.reviewed_at,
+    qc_updated_at: row.qc_updated_at || null,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    loan_type: loan.loan_type,
+    loan_type_label: loan.loan_type_label,
+    loan_amount: loan.loan_amount,
+    admin_priority: loan.admin_priority,
+    customer: row.customer_id ? {
+      id: row.customer_id,
+      full_name: row.customer_full_name,
+      email: row.customer_email
+    } : null,
+    bank: row.selected_bank_id ? {
+      id: row.selected_bank_id,
+      name: row.bank_name,
+      logo_url: row.bank_logo_url
+    } : null,
+    customer_photo_url: row.customer_photo_url || null,
+    data
+  };
+}
+const LIST_SELECT = `
+  SELECT la.*,
+         c.full_name AS customer_full_name,
+         c.email AS customer_email,
+         b.name AS bank_name,
+         b.logo_url AS bank_logo_url
+  FROM loan_applications la
+  LEFT JOIN user_profiles c ON c.id = la.customer_id
+  LEFT JOIN banks b ON b.id = la.selected_bank_id
+`;
+async function fetchApplicationById(pool, id) {
+  const [[row]] = await pool.execute(`${LIST_SELECT} WHERE la.id = :id LIMIT 1`, { id });
+  return row;
+}
+async function buildListQuery(pool, role, userId, filters) {
+  const conditions = [];
+  const params = {};
+  if (!canReadAllApplications(role)) {
+    if (role === "customer") {
+      conditions.push("la.customer_id = :userId");
+      params.userId = userId;
+    } else if (role === "agent") {
+      const agentCode = await resolveAgentCode(pool, userId);
+      conditions.push(`(
+        la.agent_id = :userId
+        OR CAST(COALESCE(la.data->>'agent_id', '') AS TEXT) = CAST(:userId AS TEXT)
+        OR CAST(COALESCE(la.data->>'agentId', '') AS TEXT) = CAST(:userId AS TEXT)
+        OR LOWER(TRIM(CAST(COALESCE(la.sourced_agent_code, '') AS TEXT))) = LOWER(TRIM(CAST(COALESCE(:agentCode, '') AS TEXT)))
+        OR LOWER(TRIM(CAST(COALESCE(la.data->>'sourced_agent_code', '') AS TEXT))) = LOWER(TRIM(CAST(COALESCE(:agentCode, '') AS TEXT)))
+        OR LOWER(TRIM(CAST(COALESCE(la.data->>'sourcedAgentCode', '') AS TEXT))) = LOWER(TRIM(CAST(COALESCE(:agentCode, '') AS TEXT)))
+        OR LOWER(TRIM(CAST(COALESCE(la.data->>'agent_code', '') AS TEXT))) = LOWER(TRIM(CAST(COALESCE(:agentCode, '') AS TEXT)))
+        OR LOWER(TRIM(CAST(COALESCE(la.data->>'agentCode', '') AS TEXT))) = LOWER(TRIM(CAST(COALESCE(:agentCode, '') AS TEXT)))
+      )`);
+      params.userId = userId;
+      params.agentCode = agentCode || "";
+    } else if (role === "employee") {
+      conditions.push("la.assigned_employee_id = :userId");
+      params.userId = userId;
+    } else {
+      conditions.push("1 = 0");
+    }
+  }
+  if (filters.status && filters.status !== "all") {
+    conditions.push("la.status = :status");
+    params.status = filters.status;
+  }
+  if (filters.search) {
+    conditions.push(
+      "(c.full_name ILIKE :search OR c.email ILIKE :search OR la.application_number ILIKE :search)"
+    );
+    params.search = `%${filters.search}%`;
+  }
+  if (filters.loanType && filters.loanType !== "all") {
+    if (isMarketplaceProductFilter(filters.loanType)) {
+      conditions.push("1 = 0");
+    } else {
+      const lt = String(filters.loanType).toLowerCase().replace(/-/g, "_");
+      const needle = lt.replace(/_loan$/, "");
+      conditions.push(`(
+        LOWER(COALESCE(la.data->>'loan_type', la.data->>'loanType', la.data->>'loan_purpose', la.data->>'loanPurpose', '')) LIKE :loanType
+        OR LOWER(COALESCE(la.data->>'loan_type', la.data->>'loanType', la.data->>'loan_purpose', la.data->>'loanPurpose', '')) LIKE :loanTypeLoan
+      )`);
+      params.loanType = `%${needle}%`;
+      params.loanTypeLoan = `%${lt}%`;
+    }
+  }
+  if (filters.priority && filters.priority !== "all") {
+    conditions.push(`COALESCE(la.data->>'admin_priority', la.data->>'adminPriority', 'medium') = :priority`);
+    params.priority = filters.priority;
+  }
+  const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+  return { where, params };
+}
+async function attachCustomerPhotoUrls(pool, rows) {
+  if (!rows?.length) return rows;
+  const ids = rows.map((r) => r.id);
+  const params = {};
+  const placeholders = ids.map((id, i) => {
+    params[`id${i}`] = id;
+    return `:id${i}`;
+  }).join(", ");
+  const [photoRows] = await pool.execute(
+    `SELECT DISTINCT ON (cd.application_id)
+            cd.application_id,
+            cd.id,
+            cd.document_url,
+            cd.file_path
+     FROM customer_documents cd
+     WHERE cd.application_id IN (${placeholders})
+       AND (
+         cd.document_type IN ('customer_photo', 'aadhaar_card', 'pan_card')
+         OR cd.mime_type LIKE 'image/%'
+       )
+     ORDER BY cd.application_id,
+       CASE cd.document_type
+         WHEN 'customer_photo' THEN 0
+         WHEN 'aadhaar_card' THEN 1
+         WHEN 'pan_card' THEN 2
+         ELSE 3
+       END,
+       cd.uploaded_at DESC`,
+    params
+  );
+  const photoByApp = /* @__PURE__ */ new Map();
+  for (const row of photoRows || []) {
+    const url = row.document_url || (row.id ? `/documents/${row.id}/download` : null);
+    if (url) photoByApp.set(row.application_id, url);
+  }
+  return rows.map((row) => ({
+    ...row,
+    customer_photo_url: photoByApp.get(row.id) || null
+  }));
+}
+loanApplicationsRouter.get(
+  "/me",
+  authenticate,
+  async (req, res, next) => {
+    try {
+      await assertEmployeeAccess(req, "applications", "read");
+      const pool = getPool();
+      const { where, params } = await buildListQuery(pool, req.auth.role, req.auth.userId, {});
+      const [rows] = await pool.execute(
+        `${LIST_SELECT} ${where} ORDER BY la.created_at DESC`,
+        params
+      );
+      res.json(rows.map(formatApplication));
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+loanApplicationsRouter.get(
+  "/",
+  authenticate,
+  async (req, res, next) => {
+    try {
+      if (!canReadAllApplications(req.auth.role)) {
+        const e = new Error("Insufficient permissions");
+        e.status = 403;
+        throw e;
+      }
+      const pool = getPool();
+      const filters = {
+        status: req.query.status,
+        search: req.query.search,
+        loanType: req.query.loanType,
+        priority: req.query.priority
+      };
+      const { where, params } = await buildListQuery(pool, req.auth.role, req.auth.userId, filters);
+      const includePhotos = req.query.includePhotos === "true";
+      const includeMarketplaceEnquiries = req.query.includeMarketplaceEnquiries === "true";
+      const page = Math.max(1, parseInt(req.query.page, 10) || 0);
+      const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 0));
+      const usePagination = page > 0 && pageSize > 0;
+      const [loanRows] = await pool.execute(
+        `${LIST_SELECT} ${where} ORDER BY la.created_at DESC`,
+        params
+      );
+      const loanRowsWithPhotos = includePhotos ? await attachCustomerPhotoUrls(pool, loanRows) : loanRows;
+      let items = loanRowsWithPhotos.map(
+        (row) => formatApplication({ ...row, record_type: "loan_application" })
+      );
+      if (includeMarketplaceEnquiries) {
+        let enquiries = await fetchMarketplaceEnquiries(pool, filters);
+        if (filters.priority && filters.priority !== "all" && filters.priority !== "medium") {
+          enquiries = [];
+        }
+        items = [...items, ...enquiries];
+        items.sort(
+          (a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime()
+        );
+      }
+      if (usePagination) {
+        const total = items.length;
+        const offset = (page - 1) * pageSize;
+        const pageItems = items.slice(offset, offset + pageSize);
+        return res.json({
+          items: pageItems,
+          total,
+          page,
+          pageSize,
+          hasMore: offset + pageItems.length < total
+        });
+      }
+      res.json(items);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+const BulkStatusSchema = z.object({
+  applicationIds: z.array(z.string().min(1)).min(1),
+  status: z.enum(["approved", "rejected"]),
+  review_notes: z.string().optional(),
+  rejection_reason: z.string().optional()
+});
+loanApplicationsRouter.post(
+  "/bulk-status",
+  authenticate,
+  authorize({ resource: "loan_applications", action: "update" }),
+  async (req, res, next) => {
+    try {
+      if (!STAFF_ROLES.has(req.auth.role) && !hasPermission(req.auth.role, "update:*")) {
+        const e = new Error("Insufficient permissions");
+        e.status = 403;
+        throw e;
+      }
+      const input = BulkStatusSchema.parse(req.body);
+      const pool = getPool();
+      const placeholders = input.applicationIds.map((_, i) => `:id${i}`).join(", ");
+      const idParams = Object.fromEntries(
+        input.applicationIds.map((id, i) => [`id${i}`, id])
+      );
+      const [existingRows] = await pool.execute(
+        `SELECT id, status FROM loan_applications WHERE id IN (${placeholders})`,
+        idParams
+      );
+      if (!existingRows?.length) {
+        return res.json({ updated: 0 });
+      }
+      await pool.execute(
+        `UPDATE loan_applications SET
+           status = :status,
+           review_notes = COALESCE(:review_notes, review_notes),
+           rejection_reason = COALESCE(:rejection_reason, rejection_reason),
+           reviewed_by = :reviewed_by,
+           reviewed_at = NOW()
+         WHERE id IN (${placeholders})`,
+        {
+          ...idParams,
+          status: input.status,
+          review_notes: input.review_notes || null,
+          rejection_reason: input.rejection_reason || null,
+          reviewed_by: req.auth.userId
+        }
+      );
+      for (const row of existingRows) {
+        await writeAuditLog({
+          userId: req.auth.userId,
+          actionType: input.status === "approved" ? "APPROVE" : "REJECT",
+          tableName: "loan_applications",
+          recordId: row.id,
+          oldValues: { status: row.status },
+          newValues: { status: input.status }
+        });
+      }
+      res.json({ updated: existingRows.length, status: input.status });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+loanApplicationsRouter.post(
+  "/bulk-delete/request-otp",
+  authenticate,
+  authorize({ resource: "loan_applications", action: "delete" }),
+  async (req, res, next) => {
+    try {
+      if (!canDeleteApplications(req.auth.role)) {
+        const e = new Error("Insufficient permissions");
+        e.status = 403;
+        throw e;
+      }
+      const pool = getPool();
+      const [[profile]] = await pool.execute(
+        `SELECT email, full_name FROM user_profiles WHERE id = :id LIMIT 1`,
+        { id: req.auth.userId }
+      );
+      if (!profile?.email) {
+        return res.status(400).json({ error: "Admin email not found on your profile" });
+      }
+      const otp = generateOtp();
+      const otpId = newId();
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1e3);
+      await pool.execute(
+        `INSERT INTO lead_otps (id, lead_id, email, phone, otp_hash, purpose, channel, expires_at)
+         VALUES (:id, NULL, :email, NULL, :hash, :purpose, 'email', :exp)`,
+        {
+          id: otpId,
+          email: profile.email,
+          hash: hashOtp(otp),
+          purpose: ADMIN_DELETE_OTP_PURPOSE,
+          exp: expiresAt
+        }
+      );
+      let delivery = null;
+      let deliveryError = null;
+      try {
+        delivery = await sendOtpNotification({
+          email: profile.email,
+          otp,
+          channel: "email"
+        });
+      } catch (sendErr) {
+        deliveryError = sendErr;
+      }
+      const emailResult = delivery?.email;
+      const emailDelivered = !deliveryError && emailResult?.sent !== false && emailResult?.delivered !== false;
+      const logOtp = process.env.LOG_OTP === "true";
+      if (!emailDelivered) {
+        const reason = deliveryError?.message || emailResult?.warning || "Email could not be delivered. Configure an email operator (SMTP or MSG91) in Admin → OTP settings.";
+        if (logOtp) {
+          return res.json({
+            success: true,
+            email: profile.email,
+            otpId,
+            expiresInSeconds: 600,
+            emailDelivered: false,
+            message: `Email delivery is not configured, so the OTP was not emailed. ${reason}`,
+            warning: reason,
+            devOtp: otp
+          });
+        }
+        return res.status(502).json({
+          error: `OTP generated but could not be emailed to ${profile.email}. ${reason}`,
+          email: profile.email,
+          emailDelivered: false
+        });
+      }
+      res.json({
+        success: true,
+        email: profile.email,
+        otpId,
+        expiresInSeconds: 600,
+        emailDelivered: true,
+        message: `OTP sent to ${profile.email}`,
+        ...logOtp ? { devOtp: otp } : {}
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+const BulkDeleteConfirmSchema = z.object({
+  applicationIds: z.array(z.string().min(1)).min(1).max(100),
+  otp: z.string().length(6)
+});
+loanApplicationsRouter.post(
+  "/bulk-delete/confirm",
+  authenticate,
+  authorize({ resource: "loan_applications", action: "delete" }),
+  async (req, res, next) => {
+    try {
+      if (!canDeleteApplications(req.auth.role)) {
+        const e = new Error("Insufficient permissions");
+        e.status = 403;
+        throw e;
+      }
+      const input = BulkDeleteConfirmSchema.parse(req.body);
+      const pool = getPool();
+      const [[profile]] = await pool.execute(
+        `SELECT email FROM user_profiles WHERE id = :id LIMIT 1`,
+        { id: req.auth.userId }
+      );
+      if (!profile?.email) {
+        return res.status(400).json({ error: "Admin email not found" });
+      }
+      const [[otpRow]] = await pool.execute(
+        `SELECT id FROM lead_otps
+         WHERE email = :email AND otp_hash = :hash AND purpose = :purpose
+           AND verified_at IS NULL AND expires_at > NOW()
+         ORDER BY created_at DESC LIMIT 1`,
+        {
+          email: profile.email,
+          hash: hashOtp(input.otp),
+          purpose: ADMIN_DELETE_OTP_PURPOSE
+        }
+      );
+      if (!otpRow) {
+        return res.status(401).json({ error: "Invalid or expired OTP" });
+      }
+      await pool.execute(`UPDATE lead_otps SET verified_at = NOW() WHERE id = :id`, {
+        id: otpRow.id
+      });
+      const uniqueIds = [...new Set(input.applicationIds)];
+      const { deleted } = await hardDeleteApplications(pool, uniqueIds);
+      res.json({
+        success: true,
+        deleted,
+        message: `${deleted} application(s) permanently deleted`
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+loanApplicationsRouter.get(
+  "/:id",
+  authenticate,
+  async (req, res, next) => {
+    try {
+      const pool = getPool();
+      const row = await fetchApplicationById(pool, req.params.id);
+      if (!row) {
+        const e = new Error("Application not found");
+        e.status = 404;
+        throw e;
+      }
+      const app = formatApplication(row);
+      const isOwner = app.customer_id === req.auth.userId;
+      const isAgent = app.agent_id === req.auth.userId;
+      const isAssignee = app.assigned_employee_id === req.auth.userId;
+      if (!canReadAllApplications(req.auth.role) && !isOwner && !isAgent && !isAssignee) {
+        const e = new Error("Insufficient permissions");
+        e.status = 403;
+        throw e;
+      }
+      if (req.auth.role === "employee" && isAssignee) {
+        await assertEmployeeAccess(req, "applications", "read");
+      }
+      res.json(app);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+loanApplicationsRouter.get(
+  "/:id/timeline",
+  authenticate,
+  async (req, res, next) => {
+    try {
+      const pool = getPool();
+      const row = await fetchApplicationById(pool, req.params.id);
+      if (!row) {
+        const e = new Error("Application not found");
+        e.status = 404;
+        throw e;
+      }
+      const [events] = await pool.execute(
+        `SELECT id, status, message, created_at
+         FROM application_timeline
+         WHERE application_id = :id
+         ORDER BY created_at ASC`,
+        { id: req.params.id }
+      );
+      res.json(events);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+loanApplicationsRouter.post(
+  "/",
+  authenticate,
+  authorize({ resource: "loan_application", action: "create" }),
+  async (req, res, next) => {
+    try {
+      const pool = getPool();
+      const body = req.body || {};
+      const id = newId();
+      const customerId = body.customer_id || req.auth.userId;
+      const payload = normalizeApplicationPayload({
+        ...body,
+        customer_id: customerId
+      });
+      await pool.execute(
+        `INSERT INTO loan_applications (
+          id, application_number, customer_id, agent_id, sourced_agent_code, assigned_employee_id,
+          qc_employee_id, qc_admin_id, selected_bank_id, status, document_stage_status,
+          bank_approval_status, eligibility_status, data
+      ) VALUES (
+          :id, :application_number, :customer_id, :agent_id, :sourced_agent_code, :assigned_employee_id,
+          :qc_employee_id, :qc_admin_id, :selected_bank_id, :status, :document_stage_status,
+          :bank_approval_status, :eligibility_status, :data
+        )`,
+        {
+          agent_id: body.agent_id || null,
+          sourced_agent_code: body.sourced_agent_code || body.agent_code || (body.agent_id ? await resolveAgentCode(pool, body.agent_id) : null),
+          qc_employee_id: body.qc_employee_id || null,
+          qc_admin_id: body.qc_admin_id || null,
+          document_stage_status: body.document_stage_status || "documents_pending",
+          bank_approval_status: body.bank_approval_status || "submitted_to_bank",
+          id,
+          application_number: body.application_number || `RFC${Date.now()}`,
+          customer_id: customerId,
+          assigned_employee_id: body.assigned_employee_id || null,
+          selected_bank_id: body.selected_bank_id || null,
+          status: body.status || "draft",
+          eligibility_status: body.eligibility_status || null,
+          data: JSON.stringify(payload)
+        }
+      );
+      const row = await fetchApplicationById(pool, id);
+      res.status(201).json(formatApplication(row));
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+const PatchSchema = z.object({
+  status: z.string().optional(),
+  status_notes: z.string().optional(),
+  review_notes: z.string().optional(),
+  rejection_reason: z.string().optional(),
+  selected_bank_id: z.string().optional(),
+  sourced_agent_code: z.string().optional(),
+  assigned_employee_id: z.string().optional(),
+  qc_employee_id: z.string().optional(),
+  qc_admin_id: z.string().optional(),
+  eligibility_status: z.string().optional(),
+  document_stage_status: z.string().optional(),
+  bank_approval_status: z.string().optional()
+}).passthrough();
+loanApplicationsRouter.patch(
+  "/:id",
+  authenticate,
+  async (req, res, next) => {
+    try {
+      const pool = getPool();
+      const existing = await fetchApplicationById(pool, req.params.id);
+      if (!existing) {
+        const e = new Error("Application not found");
+        e.status = 404;
+        throw e;
+      }
+      const canUpdateAll = STAFF_ROLES.has(req.auth.role) || hasPermission(req.auth.role, "update:*");
+      const isOwner = existing.customer_id === req.auth.userId;
+      if (!canUpdateAll && !isOwner) {
+        const e = new Error("Insufficient permissions");
+        e.status = 403;
+        throw e;
+      }
+      if (req.auth.role === "employee") {
+        if (existing.assigned_employee_id !== req.auth.userId) {
+          const e = new Error("Insufficient permissions");
+          e.status = 403;
+          throw e;
+        }
+        const access = await getEffectiveEmployeeAccess(req.auth.userId);
+        const statusValue2 = req.body?.status ?? null;
+        if (statusValue2 === "approved") {
+          requireEmployeeModuleAccess(access, "applications", "approve");
+        } else if (statusValue2 === "rejected") {
+          requireEmployeeModuleAccess(access, "applications", "reject");
+        } else {
+          requireEmployeeModuleAccess(access, "applications", "write");
+        }
+      }
+      const input = PatchSchema.parse(req.body);
+      if (!canUpdateAll) {
+        delete input.document_stage_status;
+        delete input.bank_approval_status;
+        delete input.qc_employee_id;
+        delete input.qc_admin_id;
+        delete input.sourced_agent_code;
+      }
+      const mergedData = { ...parseJson(existing.data), ...input };
+      const {
+        status,
+        status_notes,
+        review_notes,
+        rejection_reason,
+        selected_bank_id,
+        sourced_agent_code,
+        assigned_employee_id,
+        qc_employee_id,
+        qc_admin_id,
+        eligibility_status,
+        document_stage_status,
+        bank_approval_status,
+        ...rest
+      } = input;
+      if (document_stage_status && !DOCUMENT_STAGE_OPTIONS.has(document_stage_status)) {
+        return res.status(400).json({ error: "Invalid document stage status" });
+      }
+      if (bank_approval_status && !BANK_APPROVAL_STAGE_OPTIONS.has(bank_approval_status)) {
+        return res.status(400).json({ error: "Invalid bank approval status" });
+      }
+      const statusValue = status ?? null;
+      const markReviewed = statusValue === "approved" || statusValue === "rejected";
+      const employeeQcUpdater = req.auth.role === "employee" && (document_stage_status || bank_approval_status);
+      const adminQcUpdater = (req.auth.role === "admin" || req.auth.role === "super_admin") && (document_stage_status || bank_approval_status);
+      const canEditQcIdentity = req.auth.role === "admin" || req.auth.role === "super_admin";
+      await pool.execute(
+        `UPDATE loan_applications SET
+          status = COALESCE(:status, status),
+          status_notes = COALESCE(:status_notes, status_notes),
+          review_notes = COALESCE(:review_notes, review_notes),
+          rejection_reason = COALESCE(:rejection_reason, rejection_reason),
+          selected_bank_id = COALESCE(:selected_bank_id, selected_bank_id),
+          sourced_agent_code = COALESCE(:sourced_agent_code, sourced_agent_code),
+          assigned_employee_id = COALESCE(:assigned_employee_id, assigned_employee_id),
+          qc_employee_id = CASE
+            WHEN :set_qc_employee_auto = 1 THEN :reviewed_by
+            WHEN :can_edit_qc_identity = 1 THEN COALESCE(:qc_employee_id, qc_employee_id)
+            ELSE qc_employee_id
+          END,
+          qc_admin_id = CASE
+            WHEN :set_qc_admin_auto = 1 THEN :reviewed_by
+            WHEN :can_edit_qc_identity = 1 THEN COALESCE(:qc_admin_id, qc_admin_id)
+            ELSE qc_admin_id
+          END,
+          qc_updated_at = CASE
+            WHEN :set_qc_updated = 1 THEN NOW()
+            ELSE qc_updated_at
+          END,
+          document_stage_status = COALESCE(:document_stage_status, document_stage_status),
+          bank_approval_status = COALESCE(:bank_approval_status, bank_approval_status),
+          eligibility_status = COALESCE(:eligibility_status, eligibility_status),
+          reviewed_by = CASE WHEN :mark_reviewed = 1 THEN :reviewed_by ELSE reviewed_by END,
+          reviewed_at = CASE WHEN :mark_reviewed = 1 THEN NOW() ELSE reviewed_at END,
+          data = :data
+         WHERE id = :id`,
+        {
+          id: req.params.id,
+          status: statusValue,
+          status_notes: status_notes || null,
+          review_notes: review_notes || null,
+          rejection_reason: rejection_reason || null,
+          selected_bank_id: selected_bank_id || null,
+          sourced_agent_code: sourced_agent_code || null,
+          assigned_employee_id: assigned_employee_id || null,
+          qc_employee_id: qc_employee_id || null,
+          qc_admin_id: qc_admin_id || null,
+          can_edit_qc_identity: canEditQcIdentity ? 1 : 0,
+          set_qc_employee_auto: employeeQcUpdater ? 1 : 0,
+          set_qc_admin_auto: adminQcUpdater ? 1 : 0,
+          set_qc_updated: document_stage_status || bank_approval_status ? 1 : 0,
+          document_stage_status: document_stage_status || null,
+          bank_approval_status: bank_approval_status || null,
+          eligibility_status: eligibility_status || null,
+          mark_reviewed: markReviewed ? 1 : 0,
+          reviewed_by: req.auth.userId,
+          data: JSON.stringify({ ...mergedData, ...rest })
+        }
+      );
+      if (status) {
+        await pool.execute(
+          `INSERT INTO application_timeline (id, application_id, status, message)
+           VALUES (:id, :application_id, :status, :message)`,
+          {
+            id: newId(),
+            application_id: req.params.id,
+            status,
+            message: review_notes || status_notes || `Status updated to ${status}`
+          }
+        );
+      }
+      if (document_stage_status || bank_approval_status) {
+        await pool.execute(
+          `INSERT INTO application_timeline (id, application_id, status, message)
+           VALUES (:id, :application_id, :status, :message)`,
+          {
+            id: newId(),
+            application_id: req.params.id,
+            status: bank_approval_status || document_stage_status || "qc_update",
+            message: `QC stage update: document=${document_stage_status || existing.document_stage_status}, bank=${bank_approval_status || existing.bank_approval_status}`
+          }
+        );
+      }
+      const row = await fetchApplicationById(pool, req.params.id);
+      if ((document_stage_status || bank_approval_status) && existing.status === "submitted" && existing.submitted_at) {
+        dispatchFileUpdateNotification("application_stage_after_bank", {
+          applicationId: req.params.id,
+          extra: {
+            title: "Application stage updated",
+            message: `Bank processing stage is now ${bank_approval_status || document_stage_status}.`
+          }
+        }).catch(() => {
+        });
+      }
+      res.json(formatApplication(row));
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+loanApplicationsRouter.get("/:id/summary-pdf", authenticate, async (req, res, next) => {
+  try {
+    const pool = getPool();
+    const row = await fetchApplicationById(pool, req.params.id);
+    if (!row) return res.status(404).json({ error: "Not found" });
+    const isOwner = row.customer_id === req.auth.userId;
+    const isStaff = STAFF_ROLES.has(req.auth.role);
+    if (!isOwner && !isStaff) return res.status(403).json({ error: "Forbidden" });
+    const data = parseJson(row.data);
+    if (data.application_package_pdf) {
+      const { resolveUploadFilePath } = await import("../lib/uploadPaths.js");
+      const { createReadStream, existsSync } = await import("node:fs");
+      const filePath = resolveUploadFilePath(data.application_package_pdf.replace(/^\/uploads\//, ""));
+      if (existsSync(filePath)) {
+        res.setHeader("Content-Type", "application/pdf");
+        res.setHeader(
+          "Content-Disposition",
+          `inline; filename="application-${row.application_number || row.id}.pdf"`
+        );
+        const stream = createReadStream(filePath);
+        stream.on("error", (streamErr) => {
+          console.warn("[summary-pdf] stored package read failed, will not retry:", streamErr.message);
+          if (!res.headersSent) {
+            next(streamErr);
+          } else {
+            res.destroy(streamErr);
+          }
+        });
+        return stream.pipe(res);
+      }
+      console.warn(
+        `[summary-pdf] stored package missing for application ${row.id}; falling back to generated summary`
+      );
+    }
+    const lines = [
+      "Rfincare — Loan Application Summary (Read-only)",
+      `Application: ${row.application_number || row.id}`,
+      `Status: ${row.status}`,
+      `Submitted: ${row.submitted_at || "—"}`,
+      "",
+      "NON-EDITABLE FINAL SUBMITTED DETAILS",
+      "For changes contact our helpline or write to support@rfincare.com",
+      "",
+      `Name: ${data.firstName || ""} ${data.lastName || ""}`.trim(),
+      `Email: ${data.email || row.customer_email || "—"}`,
+      `Phone: ${data.phone || data.mobile || "—"}`,
+      `Loan type: ${data.loan_type || data.loan_purpose || "—"}`,
+      `Amount: ${data.loan_amount || data.requested_loan_amount || "—"}`
+    ];
+    const pdf = buildSimpleTextPdf(lines);
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `inline; filename="application-${row.application_number || row.id}.pdf"`
+    );
+    res.send(pdf);
+  } catch (err) {
+    next(err);
+  }
+});
+loanApplicationsRouter.post(
+  "/:id/submit",
+  authenticate,
+  async (req, res, next) => {
+    try {
+      const pool = getPool();
+      const existing = await fetchApplicationById(pool, req.params.id);
+      if (!existing) {
+        const e = new Error("Application not found");
+        e.status = 404;
+        throw e;
+      }
+      if (existing.customer_id !== req.auth.userId && !STAFF_ROLES.has(req.auth.role)) {
+        const e = new Error("Insufficient permissions");
+        e.status = 403;
+        throw e;
+      }
+      const selectedBankId = req.body?.selected_bank_id || req.body?.selectedBankId || null;
+      try {
+        await requireSuccessfulCibilForSubmit(req.params.id);
+      } catch (cibilErr) {
+        if (cibilErr.status === 422) {
+          return res.status(422).json({
+            error: cibilErr.message,
+            cibilStatus: cibilErr.cibilStatus || "failed",
+            manualReview: true
+          });
+        }
+        const skipCibil = isNoSuchTableError(cibilErr) || cibilErr.status === 400 || /cibil_vendors/i.test(String(cibilErr.message || ""));
+        if (!skipCibil) throw cibilErr;
+        console.warn("[submit] CIBIL check skipped:", cibilErr.message);
+      }
+      await pool.execute(
+        `UPDATE loan_applications
+         SET status = 'submitted',
+             journey_mode = 'document_only',
+             document_stage_status = COALESCE(document_stage_status, 'documents_pending'),
+             bank_approval_status = 'submitted_to_bank',
+             submitted_at = NOW(),
+             selected_bank_id = COALESCE(:selected_bank_id, selected_bank_id)
+         WHERE id = :id`,
+        { id: req.params.id, selected_bank_id: selectedBankId }
+      );
+      await pool.execute(
+        `INSERT INTO application_timeline (id, application_id, status, message)
+         VALUES (:id, :application_id, 'submitted', 'Application submitted')`,
+        { id: newId(), application_id: req.params.id }
+      );
+      const clientIp = req.headers["x-forwarded-for"]?.toString()?.split(",")?.[0]?.trim() || req.socket?.remoteAddress || null;
+      const confirmation = await finalizeApplicationSubmission({
+        applicationId: req.params.id,
+        submittedByUserId: req.auth.userId,
+        submittedByRole: req.auth.role,
+        clientIp
+      });
+      const row = await fetchApplicationById(pool, req.params.id);
+      res.json({
+        ...formatApplication(row),
+        confirmation
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+loanApplicationsRouter.post(
+  "/:id/consents",
+  authenticate,
+  async (req, res, next) => {
+    try {
+      const pool = getPool();
+      const existing = await fetchApplicationById(pool, req.params.id);
+      if (!existing) {
+        const e = new Error("Application not found");
+        e.status = 404;
+        throw e;
+      }
+      const raw = req.body?.consents;
+      const consentEntries = Array.isArray(raw) ? raw : raw && typeof raw === "object" ? Object.entries(raw).map(([type, granted]) => ({ type, granted: Boolean(granted) })) : [];
+      for (const consent of consentEntries) {
+        const granted = consent.granted ?? consent.isGranted ?? false;
+        await pool.execute(
+          `INSERT INTO application_consents (
+            id, application_id, customer_id, consent_type, is_granted, granted_at
+          ) VALUES (
+            :id, :application_id, :customer_id, :consent_type, :is_granted, :granted_at
+          )`,
+          {
+            id: newId(),
+            application_id: req.params.id,
+            customer_id: existing.customer_id,
+            consent_type: consent.type || consent.consentType || "general",
+            is_granted: granted ? 1 : 0,
+            granted_at: granted ? /* @__PURE__ */ new Date() : null
+          }
+        );
+      }
+      res.status(201).json({ success: true });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+export {
+  loanApplicationsRouter
+};

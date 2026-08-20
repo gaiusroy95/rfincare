@@ -1,0 +1,1008 @@
+import { Router } from "express";
+import multer from "multer";
+import { getPool } from "../db/pool.js";
+import { ensureOnboardingSchema } from "../db/ensureOnboardingSchema.js";
+import { createAgentAccount, createEmployeeAccount } from "../lib/staffOnboarding.js";
+import { backfillMissingAgentCodes, ensureAgentCodeForUser } from "../lib/agentCode.js";
+import { ensureMilestone3Schema } from "../db/ensureMilestone3Schema.js";
+import { assignUniqueCustomerCode } from "../lib/customerCode.js";
+import { writeAuditLog } from "../lib/audit.js";
+import { newId } from "../lib/ids.js";
+import { ensureStaffExtrasSchema } from "../db/ensureStaffExtrasSchema.js";
+import {
+  buildEffectiveEmployeeAccess,
+  fetchEmployeeAccessControlsMap
+} from "../lib/employeeAccessControls.js";
+import { authenticate } from "../middleware/authenticate.js";
+import { authorize } from "../middleware/authorize.js";
+import { approvalMatrixRouter } from "./approvalMatrixRules.js";
+import { statusCheckAdminRouter } from "./statusCheckAdmin.js";
+import { adminHierarchyRouter } from "./staffMessaging.js";
+import {
+  fetchAgentDetail,
+  fetchEmployeeDetail,
+  updateAgentDetails,
+  updateEmployeeDetails,
+  resetStaffPassword
+} from "../lib/adminStaffManage.js";
+import { parseCsvToRows } from "../lib/parseCsv.js";
+import { buildFunnelAnalytics, buildProductConversionRows } from "../lib/funnelAnalytics.js";
+import {
+  buildAgentCommissionTemplateCsv,
+  fetchAgentCommissionCirculars,
+  importAgentCommissionRows,
+  mapCommissionConfigRow,
+  normalizeCommissionCsvRow,
+  upsertAgentCommissionConfig
+} from "../lib/agentCommission.js";
+import { createUploadMiddleware, spreadUpload } from "../lib/multerUpload.js";
+import { saveUploadedFile } from "../lib/storage/index.js";
+import { toStoredPath } from "../lib/storage/keys.js";
+import { basename } from "node:path";
+const adminRouter = Router();
+adminRouter.use("/hierarchy", adminHierarchyRouter);
+const pdfFileFilter = (_req, file, cb) => {
+  const ok = file.mimetype === "application/pdf" || file.originalname.toLowerCase().endsWith(".pdf");
+  cb(ok ? null : new Error("Only PDF files are allowed"), ok);
+};
+const circularUpload = createUploadMiddleware({
+  subfolder: "commission-circulars",
+  maxBytes: 20 * 1024 * 1024,
+  fileFilter: pdfFileFilter
+});
+const commissionBulkUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 }
+});
+function circularStoredUrl(file) {
+  if (!file) return null;
+  return file.storedPath || toStoredPath(file.filename) || `/uploads/commission-circulars/${basename(file.filename || "")}`;
+}
+async function storeCircularUploads(files = []) {
+  const map = {};
+  for (const f of files) {
+    const saved = await saveUploadedFile({
+      buffer: f.buffer,
+      originalName: f.originalname,
+      folder: "commission-circulars",
+      mimeType: f.mimetype || "application/pdf"
+    });
+    const entry = {
+      storedUrl: saved.storedPath,
+      filename: saved.key,
+      filePath: saved.storedPath,
+      originalName: f.originalname
+    };
+    map[f.originalname] = entry;
+    map[f.originalname.toLowerCase()] = entry;
+    map[basename(f.originalname)] = entry;
+    map[basename(f.originalname).toLowerCase()] = entry;
+  }
+  return map;
+}
+function wrapMulter(uploadMiddleware) {
+  return (req, res, next) => {
+    uploadMiddleware(req, res, (err) => {
+      if (!err) return next();
+      err.status = err.status || 400;
+      next(err);
+    });
+  };
+}
+adminRouter.use("/status-check", statusCheckAdminRouter);
+adminRouter.use("/approval-matrix-rules", approvalMatrixRouter);
+function mapAgentProfile(row) {
+  const agentCode = row.agent_code || null;
+  return {
+    id: row.id,
+    email: row.email,
+    agent_name: row.full_name,
+    agent_code: agentCode,
+    username: row.username || null,
+    onboarding_status: row.ao_status || row.onboarding_status || row.account_status || "pending",
+    created_at: row.created_at,
+    agent: {
+      total_clients: row.total_clients ?? 0,
+      total_commission: row.total_commission ?? 0,
+      success_rate: row.success_rate ?? 0
+    },
+    user_profile: {
+      role: row.role,
+      is_active: Boolean(row.is_active)
+    }
+  };
+}
+function mapEmployeeProfile(row, accessRows = []) {
+  const employeeCode = row.employee_code || (row.id ? `EMP-${String(row.id).slice(0, 8).toUpperCase()}` : "N/A");
+  const accessControls = accessRows.map((r) => ({
+    moduleName: r.moduleName,
+    permissions: r.permissions || [],
+    isActive: r.isActive,
+    expiresAt: r.expiresAt
+  }));
+  const effective = buildEffectiveEmployeeAccess(accessRows);
+  return {
+    id: row.id,
+    email: row.email,
+    employee_name: row.full_name,
+    employee_code: employeeCode,
+    username: row.username || null,
+    onboarding_status: row.eo_status || row.onboarding_status || row.account_status || "pending",
+    created_at: row.created_at,
+    user_profile: {
+      role: row.role,
+      is_active: Boolean(row.is_active)
+    },
+    access_controls: accessControls,
+    granted_modules: effective?.grantedModuleLabels || [],
+    access_configured: accessRows.length > 0,
+    access_active: effective ? effective.isActive : true,
+    access_expires_at: effective?.expiresAt || null
+  };
+}
+adminRouter.get(
+  "/stats",
+  authenticate,
+  authorize({ resource: "reports", action: "read" }),
+  async (req, res, next) => {
+    try {
+      const pool = getPool();
+      const [[appStats]] = await pool.execute(
+        `SELECT
+           COUNT(*) AS total,
+           SUM(CASE WHEN status IN ('submitted', 'pending', 'under_review') THEN 1 ELSE 0 END) AS pending,
+           SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) AS approved
+         FROM loan_applications`
+      );
+      const [[agentStats]] = await pool.execute(
+        `SELECT COUNT(*) AS active_agents
+         FROM user_profiles
+         WHERE role = 'agent' AND is_active = TRUE AND account_status = 'active'`
+      );
+      const total = Number(appStats?.total || 0);
+      const approved = Number(appStats?.approved || 0);
+      const approvalRate = total > 0 ? `${(approved / total * 100).toFixed(1)}%` : "0%";
+      res.json({
+        total_applications: total,
+        pending_reviews: Number(appStats?.pending || 0),
+        active_agents: Number(agentStats?.active_agents || 0),
+        approval_rate: approvalRate
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+adminRouter.get(
+  "/funnel-analytics",
+  authenticate,
+  authorize({ resource: "reports", action: "read" }),
+  async (req, res, next) => {
+    try {
+      const pool = getPool();
+      const days = parseInt(req.query.days, 10) || 30;
+      const dateFrom = String(req.query.dateFrom || req.query.date_from || "").trim() || null;
+      const dateTo = String(req.query.dateTo || req.query.date_to || "").trim() || null;
+      const data = await buildFunnelAnalytics(pool, { days, dateFrom, dateTo });
+      res.json(data);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+adminRouter.get(
+  "/funnel-analytics/product-export.csv",
+  authenticate,
+  authorize({ resource: "reports", action: "read" }),
+  async (req, res, next) => {
+    try {
+      const pool = getPool();
+      const days = parseInt(req.query.days, 10) || 30;
+      const dateFrom = String(req.query.dateFrom || req.query.date_from || "").trim() || null;
+      const dateTo = String(req.query.dateTo || req.query.date_to || "").trim() || null;
+      const productKey = String(req.query.productKey || req.query.product_key || "").trim();
+      if (!productKey) return res.status(400).json({ error: "productKey is required" });
+      const { productLabel, rows } = await buildProductConversionRows(pool, {
+        days,
+        dateFrom,
+        dateTo,
+        productKey
+      });
+      const csvEscape = (value) => {
+        if (value == null) return "";
+        const str = String(value).replace(/\r?\n/g, " ").trim();
+        if (str.includes('"') || str.includes(",") || str.includes(";")) {
+          return `"${str.replace(/"/g, '""')}"`;
+        }
+        return str;
+      };
+      const header = [
+        "Product",
+        "Channel",
+        "Reference ID",
+        "Reference Number",
+        "Sale Status",
+        "Lead Created At",
+        "Converted At",
+        "Lead Created By Role",
+        "Lead Created By",
+        "Converted By Role",
+        "Converted By",
+        "Payout Owner Role",
+        "Payout Owner",
+        "Payout Amount"
+      ];
+      const lines = (rows || []).map(
+        (row) => [
+          productLabel,
+          row.channel,
+          row.referenceId,
+          row.referenceNumber,
+          row.saleStatus,
+          row.createdAt,
+          row.convertedAt,
+          row.createdByRole,
+          row.createdByName,
+          row.convertedByRole,
+          row.convertedByName,
+          row.payoutOwnerRole,
+          row.payoutOwnerName,
+          row.payoutAmount
+        ].map(csvEscape).join(",")
+      );
+      const stamp = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
+      const slug = productLabel.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+      const csv = [header.map(csvEscape).join(","), ...lines].join("\n");
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader("Content-Disposition", `attachment; filename="funnel-${slug}-${stamp}.csv"`);
+      res.send(csv);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+adminRouter.get(
+  "/assignees",
+  authenticate,
+  authorize({ resource: "agents", action: "read" }),
+  async (req, res, next) => {
+    try {
+      await ensureOnboardingSchema();
+      const pool = getPool();
+      await backfillMissingAgentCodes(pool);
+      const [employees] = await pool.execute(
+        `SELECT up.id, up.full_name, up.email, up.account_status, up.onboarding_status,
+                eo.employee_code, eo.username
+         FROM user_profiles up
+         LEFT JOIN employee_onboarding eo ON eo.user_id = up.id
+         WHERE up.role = 'employee'
+         ORDER BY up.full_name ASC, up.email ASC`
+      );
+      const [agents] = await pool.execute(
+        `SELECT up.id, up.full_name, up.email, up.account_status, up.onboarding_status,
+                ao.agent_code, ao.username
+         FROM user_profiles up
+         LEFT JOIN agent_onboarding ao ON ao.user_id = up.id
+         WHERE up.role = 'agent'
+         ORDER BY up.full_name ASC, up.email ASC`
+      );
+      const mapStaff = (row, role) => {
+        const code = role === "agent" ? row.agent_code || "—" : row.employee_code || `EMP-${String(row.id).slice(0, 8).toUpperCase()}`;
+        const name = row.full_name || row.email || "Staff";
+        return {
+          id: row.id,
+          role,
+          name,
+          code,
+          email: row.email,
+          username: row.username || null,
+          status: row.onboarding_status || row.account_status || "pending",
+          label: `${code} — ${name}`
+        };
+      };
+      res.json({
+        employees: employees.map((r) => mapStaff(r, "employee")),
+        agents: agents.map((r) => mapStaff(r, "agent")),
+        all: [
+          ...employees.map((r) => mapStaff(r, "employee")),
+          ...agents.map((r) => mapStaff(r, "agent"))
+        ]
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+adminRouter.get(
+  "/agents",
+  authenticate,
+  authorize({ resource: "agents", action: "read" }),
+  async (req, res, next) => {
+    try {
+      const pool = getPool();
+      await ensureOnboardingSchema();
+      await backfillMissingAgentCodes(pool);
+      const [rows] = await pool.execute(
+        `SELECT up.*,
+                ao.agent_code,
+                ao.username,
+                ao.onboarding_status AS ao_status,
+                (SELECT COUNT(*) FROM loan_applications la WHERE la.agent_id = up.id) AS total_clients,
+                0 AS total_commission,
+                0 AS success_rate
+         FROM user_profiles up
+         LEFT JOIN agent_onboarding ao ON ao.user_id = up.id
+         WHERE up.role = 'agent'
+         ORDER BY up.created_at DESC`
+      );
+      res.json(
+        rows.map(
+          (row) => mapAgentProfile({
+            ...row,
+            agent_code: row.agent_code || null
+          })
+        )
+      );
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+adminRouter.get(
+  "/employees",
+  authenticate,
+  authorize({ resource: "employees", action: "read" }),
+  async (req, res, next) => {
+    try {
+      const pool = getPool();
+      await ensureOnboardingSchema();
+      await ensureStaffExtrasSchema();
+      const [rows] = await pool.execute(
+        `SELECT up.*,
+                eo.employee_code,
+                eo.username,
+                eo.onboarding_status AS eo_status
+         FROM user_profiles up
+         LEFT JOIN employee_onboarding eo ON eo.user_id = up.id
+         WHERE up.role = 'employee'
+         ORDER BY up.created_at DESC`
+      );
+      const accessByUser = await fetchEmployeeAccessControlsMap(rows.map((r) => r.id));
+      res.json(
+        rows.map((row) => mapEmployeeProfile(row, accessByUser[row.id] || []))
+      );
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+adminRouter.post(
+  "/agents",
+  authenticate,
+  authorize({ resource: "agents", action: "manage" }),
+  async (req, res, next) => {
+    try {
+      const row = await createAgentAccount(req.body, req.auth.userId);
+      res.status(201).json(mapAgentProfile(row));
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+adminRouter.post(
+  "/employees",
+  authenticate,
+  authorize({ resource: "employees", action: "manage" }),
+  async (req, res, next) => {
+    try {
+      const row = await createEmployeeAccount(req.body, req.auth.userId);
+      res.status(201).json(mapEmployeeProfile(row));
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+adminRouter.get(
+  "/agents/:id",
+  authenticate,
+  authorize({ resource: "agents", action: "read" }),
+  async (req, res, next) => {
+    try {
+      const detail = await fetchAgentDetail(req.params.id);
+      res.json(detail);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+adminRouter.patch(
+  "/agents/:id",
+  authenticate,
+  authorize({ resource: "agents", action: "update" }),
+  async (req, res, next) => {
+    try {
+      const detail = await updateAgentDetails(req.params.id, req.body);
+      await writeAuditLog({
+        userId: req.auth.userId,
+        actionType: "update",
+        tableName: "agent_onboarding",
+        recordId: req.params.id,
+        newValues: { scope: "admin_agent_update" }
+      });
+      res.json(detail);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+adminRouter.post(
+  "/agents/:id/reset-password",
+  authenticate,
+  authorize({ resource: "agents", action: "update" }),
+  async (req, res, next) => {
+    try {
+      const { password, notifyEmail } = req.body || {};
+      const detail = await fetchAgentDetail(req.params.id);
+      await resetStaffPassword({
+        userId: req.params.id,
+        password,
+        role: "agent",
+        fullName: detail.agentName,
+        email: detail.email,
+        notifyEmail: Boolean(notifyEmail)
+      });
+      await writeAuditLog({
+        userId: req.auth.userId,
+        actionType: "update",
+        tableName: "auth_users",
+        recordId: req.params.id,
+        newValues: { scope: "admin_agent_password_reset" }
+      });
+      res.json({ success: true, message: "Agent password updated" });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+adminRouter.get(
+  "/employees/:id",
+  authenticate,
+  authorize({ resource: "employees", action: "read" }),
+  async (req, res, next) => {
+    try {
+      const detail = await fetchEmployeeDetail(req.params.id);
+      res.json(detail);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+adminRouter.patch(
+  "/employees/:id",
+  authenticate,
+  authorize({ resource: "employees", action: "update" }),
+  async (req, res, next) => {
+    try {
+      const detail = await updateEmployeeDetails(req.params.id, req.body);
+      await writeAuditLog({
+        userId: req.auth.userId,
+        actionType: "update",
+        tableName: "employee_onboarding",
+        recordId: req.params.id,
+        newValues: { scope: "admin_employee_update" }
+      });
+      res.json(detail);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+adminRouter.post(
+  "/employees/:id/reset-password",
+  authenticate,
+  authorize({ resource: "employees", action: "update" }),
+  async (req, res, next) => {
+    try {
+      const { password, notifyEmail } = req.body || {};
+      const detail = await fetchEmployeeDetail(req.params.id);
+      await resetStaffPassword({
+        userId: req.params.id,
+        password,
+        role: "employee",
+        fullName: detail.employeeName,
+        email: detail.email,
+        notifyEmail: Boolean(notifyEmail)
+      });
+      await writeAuditLog({
+        userId: req.auth.userId,
+        actionType: "update",
+        tableName: "auth_users",
+        recordId: req.params.id,
+        newValues: { scope: "admin_employee_password_reset" }
+      });
+      res.json({ success: true, message: "Employee password updated" });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+adminRouter.delete(
+  "/employees/:id",
+  authenticate,
+  authorize({ resource: "employees", action: "manage" }),
+  async (req, res, next) => {
+    const pool = getPool();
+    try {
+      const employeeId = String(req.params.id || "").trim();
+      if (!employeeId) {
+        return res.status(400).json({ error: "Employee id is required" });
+      }
+      if (employeeId === req.auth.userId) {
+        return res.status(400).json({ error: "You cannot delete your own account" });
+      }
+      const detail = await fetchEmployeeDetail(employeeId);
+      if (!detail?.id) {
+        return res.status(404).json({ error: "Employee not found" });
+      }
+      const [[assigned]] = await pool.execute(
+        `SELECT COUNT(*)::int AS c
+         FROM loan_applications
+         WHERE assigned_employee_id = :id
+           AND status NOT IN ('approved', 'rejected')`,
+        { id: employeeId }
+      );
+      if (Number(assigned?.c || 0) > 0) {
+        return res.status(409).json({
+          error: "Cannot delete employee with active assigned applications. Reassign those applications first."
+        });
+      }
+      await pool.execute("BEGIN");
+      await pool.execute(`DELETE FROM employee_access_controls WHERE employee_user_id = :id`, { id: employeeId });
+      await pool.execute(`DELETE FROM employee_onboarding WHERE user_id = :id`, { id: employeeId });
+      await pool.execute(`DELETE FROM agent_employee_hierarchy WHERE employee_user_id = :id`, { id: employeeId });
+      await pool.execute(`UPDATE loan_applications SET assigned_employee_id = NULL WHERE assigned_employee_id = :id`, {
+        id: employeeId
+      });
+      await pool.execute(`UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = :id AND revoked_at IS NULL`, {
+        id: employeeId
+      });
+      await pool.execute(`DELETE FROM auth_users WHERE id = :id`, { id: employeeId });
+      await pool.execute(`DELETE FROM user_profiles WHERE id = :id AND role = 'employee'`, { id: employeeId });
+      await pool.execute("COMMIT");
+      await writeAuditLog({
+        userId: req.auth.userId,
+        actionType: "delete",
+        tableName: "user_profiles",
+        recordId: employeeId,
+        oldValues: {
+          employeeName: detail.employeeName,
+          email: detail.email
+        },
+        newValues: { scope: "admin_employee_delete" }
+      });
+      res.json({ success: true, message: "Employee profile deleted successfully" });
+    } catch (err) {
+      try {
+        await pool.execute("ROLLBACK");
+      } catch {
+      }
+      next(err);
+    }
+  }
+);
+function mapCustomerRow(row) {
+  return {
+    id: row.id,
+    customerCode: row.customer_code,
+    fullName: row.full_name,
+    email: row.display_email || row.email,
+    phone: row.phone,
+    accountStatus: row.account_status,
+    isActive: Boolean(row.is_active),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    applicationCount: Number(row.application_count || 0)
+  };
+}
+adminRouter.get(
+  "/customers",
+  authenticate,
+  authorize({ resource: "customers", action: "read" }),
+  async (req, res, next) => {
+    try {
+      await ensureMilestone3Schema();
+      const pool = getPool();
+      const search = req.query.search?.trim();
+      let sql = `
+        SELECT up.*,
+               CASE
+                 WHEN up.email LIKE '%@rfincare.customer' OR up.email LIKE '%@oauth.rfincare.local'
+                 THEN COALESCE(reg.latest_email, lead.latest_email, up.email)
+                 ELSE up.email
+               END AS display_email,
+               COALESCE(app_counts.application_count, 0) AS application_count
+        FROM user_profiles up
+        LEFT JOIN (
+          SELECT customer_id, COUNT(*)::int AS application_count
+          FROM loan_applications
+          GROUP BY customer_id
+        ) app_counts ON app_counts.customer_id = up.id
+        LEFT JOIN (
+          SELECT phone, MAX(email) AS latest_email
+          FROM customer_registrations
+          GROUP BY phone
+        ) reg ON reg.phone = up.phone
+        LEFT JOIN (
+          SELECT phone, MAX(email) AS latest_email
+          FROM marketing_leads
+          GROUP BY phone
+        ) lead ON lead.phone = up.phone
+        WHERE up.role = 'customer'`;
+      const params = {};
+      if (search) {
+        sql += ` AND (
+          up.full_name ILIKE :search OR up.email ILIKE :search
+          OR up.phone ILIKE :search OR up.customer_code ILIKE :search
+        )`;
+        params.search = `%${search}%`;
+      }
+      sql += " ORDER BY up.created_at DESC LIMIT 500";
+      const [rows] = await pool.execute(sql, params);
+      const missingCodes = rows.filter((row) => !row.customer_code);
+      if (missingCodes.length) {
+        await Promise.all(
+          missingCodes.map((row) => assignUniqueCustomerCode(pool, row.id))
+        );
+        const [refreshed] = await pool.execute(sql, params);
+        return res.json(refreshed.map(mapCustomerRow));
+      }
+      res.json(rows.map(mapCustomerRow));
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+adminRouter.patch(
+  "/customers/:id",
+  authenticate,
+  authorize({ resource: "customers", action: "update" }),
+  async (req, res, next) => {
+    try {
+      await ensureMilestone3Schema();
+      const pool = getPool();
+      const { is_active, account_status } = req.body;
+      const isActive = is_active !== void 0 ? is_active ? 1 : 0 : void 0;
+      const [[before]] = await pool.execute(
+        `SELECT * FROM user_profiles WHERE id = :id AND role = 'customer' LIMIT 1`,
+        { id: req.params.id }
+      );
+      if (!before) {
+        const e = new Error("Customer not found");
+        e.status = 404;
+        throw e;
+      }
+      if (!before.customer_code) {
+        await assignUniqueCustomerCode(pool, req.params.id);
+      }
+      await pool.execute(
+        `UPDATE user_profiles
+         SET is_active = COALESCE(:is_active, is_active),
+             account_status = COALESCE(:account_status, account_status)
+         WHERE id = :id AND role = 'customer'`,
+        {
+          id: req.params.id,
+          is_active: isActive,
+          account_status: account_status || null
+        }
+      );
+      const [[row]] = await pool.execute(
+        `SELECT up.*,
+                CASE
+                  WHEN up.email LIKE '%@rfincare.customer' OR up.email LIKE '%@oauth.rfincare.local'
+                  THEN COALESCE(reg.latest_email, lead.latest_email, up.email)
+                  ELSE up.email
+                END AS display_email,
+                (SELECT COUNT(*) FROM loan_applications la WHERE la.customer_id = up.id) AS application_count
+         FROM user_profiles up
+         LEFT JOIN (
+           SELECT phone, MAX(email) AS latest_email
+           FROM customer_registrations
+           GROUP BY phone
+         ) reg ON reg.phone = up.phone
+         LEFT JOIN (
+           SELECT phone, MAX(email) AS latest_email
+           FROM marketing_leads
+           GROUP BY phone
+         ) lead ON lead.phone = up.phone
+         WHERE up.id = :id LIMIT 1`,
+        { id: req.params.id }
+      );
+      await writeAuditLog({
+        userId: req.auth.userId,
+        actionType: "UPDATE",
+        tableName: "user_profiles",
+        recordId: req.params.id,
+        oldValues: {
+          is_active: before.is_active,
+          account_status: before.account_status
+        },
+        newValues: { is_active: row.is_active, account_status: row.account_status }
+      });
+      res.json(mapCustomerRow(row));
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+adminRouter.get(
+  "/agents/commission/csv-template",
+  authenticate,
+  authorize({ resource: "agents", action: "read" }),
+  (_req, res) => {
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", 'attachment; filename="agent-commission-template.csv"');
+    res.send(buildAgentCommissionTemplateCsv());
+  }
+);
+adminRouter.post(
+  "/agents/commission/bulk-csv",
+  authenticate,
+  authorize({ resource: "agents", action: "update" }),
+  wrapMulter(
+    commissionBulkUpload.fields([
+      { name: "file", maxCount: 1 },
+      { name: "circulars", maxCount: 50 }
+    ])
+  ),
+  async (req, res, next) => {
+    try {
+      await ensureStaffExtrasSchema();
+      const csvFile = req.files?.file?.[0];
+      if (!csvFile) return res.status(400).json({ error: "CSV file is required (field name: file)" });
+      const text = csvFile.buffer.toString("utf8");
+      const rawRows = parseCsvToRows(text);
+      const circularFilesByName = await storeCircularUploads(req.files?.circulars || []);
+      const pool = getPool();
+      const summary = await importAgentCommissionRows(pool, rawRows, {
+        updatedBy: req.auth.userId,
+        circularFilesByName
+      });
+      await writeAuditLog({
+        userId: req.auth.userId,
+        actionType: "BULK_IMPORT",
+        tableName: "agent_commission_config",
+        recordId: null,
+        newValues: { imported: summary.imported, failed: summary.failed }
+      });
+      res.json(summary);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+adminRouter.get(
+  "/agents/:id/commission",
+  authenticate,
+  authorize({ resource: "agents", action: "read" }),
+  async (req, res, next) => {
+    try {
+      await ensureStaffExtrasSchema();
+      const pool = getPool();
+      const [rows] = await pool.execute(
+        `SELECT * FROM agent_commission_config
+         WHERE agent_user_id = :id
+         ORDER BY loan_type ASC, updated_at DESC`,
+        { id: req.params.id }
+      );
+      if (rows.length) {
+        return res.json(rows.map(mapCommissionConfigRow));
+      }
+      const [[fallback]] = await pool.execute(
+        `SELECT * FROM global_commission_config WHERE id = 'default' LIMIT 1`
+      );
+      res.json(fallback ? [mapCommissionConfigRow({ ...fallback, agent_user_id: req.params.id })] : []);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+adminRouter.put(
+  "/agents/:id/commission",
+  authenticate,
+  authorize({ resource: "agents", action: "update" }),
+  async (req, res, next) => {
+    try {
+      await ensureStaffExtrasSchema();
+      const pool = getPool();
+      const [[agent]] = await pool.execute(
+        `SELECT ao.agent_code, ao.agent_name, up.id
+         FROM user_profiles up
+         LEFT JOIN agent_onboarding ao ON ao.user_id = up.id
+         WHERE up.id = :id AND up.role = 'agent' LIMIT 1`,
+        { id: req.params.id }
+      );
+      if (!agent) return res.status(404).json({ error: "Agent not found" });
+      const agentCode = await ensureAgentCodeForUser(pool, req.params.id) || agent.agent_code || "";
+      const body = req.body || {};
+      const row = normalizeCommissionCsvRow({
+        agent_code: agentCode || body.agentCode || body.agent_code || "",
+        agent_name: agent.agent_name || body.agentName || body.agent_name || "",
+        loan_type: body.loanType || body.loan_type || "home_loan",
+        commission_type: body.commissionType || body.commission_type || "percentage",
+        commission_value: String(body.commissionValue ?? body.commission_value ?? 2.5),
+        min_loan_amount: body.minLoanAmount ?? body.min_loan_amount ?? "",
+        max_loan_amount: body.maxLoanAmount ?? body.max_loan_amount ?? "",
+        effective_from: body.effectiveFrom || body.effective_from || "",
+        effective_to: body.effectiveTo || body.effective_to || "",
+        circular_title: body.circularTitle || body.circular_title || "",
+        upload: body.circularFileUrl || body.circular_file_url || body.upload || ""
+      });
+      const configId = await upsertAgentCommissionConfig(pool, req.params.id, row, {
+        updatedBy: req.auth.userId
+      });
+      await writeAuditLog({
+        userId: req.auth.userId,
+        actionType: "UPDATE",
+        tableName: "agent_commission_config",
+        recordId: configId,
+        newValues: body
+      });
+      res.json({ ok: true, configId });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+adminRouter.get(
+  "/commission/circulars",
+  authenticate,
+  authorize({ resource: "agents", action: "read" }),
+  async (_req, res, next) => {
+    try {
+      await ensureStaffExtrasSchema();
+      const pool = getPool();
+      const rows = await fetchAgentCommissionCirculars(pool);
+      res.json(rows);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+adminRouter.post(
+  "/commission/circulars",
+  authenticate,
+  authorize({ resource: "agents", action: "update" }),
+  ...spreadUpload(circularUpload, "single", "file"),
+  async (req, res, next) => {
+    try {
+      await ensureStaffExtrasSchema();
+      if (!req.file) return res.status(400).json({ error: "PDF file is required" });
+      const pool = getPool();
+      const id = newId();
+      const title = req.body?.title?.trim() || req.file.originalname;
+      const description = req.body?.description?.trim() || null;
+      const fileUrl = circularStoredUrl(req.file);
+      await pool.execute(
+        `INSERT INTO agent_commission_circulars
+         (id, title, description, file_name, file_path, file_url, uploaded_by)
+         VALUES (:id, :title, :description, :file_name, :file_path, :file_url, :uploaded_by)`,
+        {
+          id,
+          title,
+          description,
+          file_name: req.file.originalname,
+          file_path: fileUrl,
+          file_url: fileUrl,
+          uploaded_by: req.auth.userId
+        }
+      );
+      res.status(201).json({ id, title, description, fileUrl });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+adminRouter.get(
+  "/employees/:id/access-controls",
+  authenticate,
+  authorize({ resource: "employees", action: "read" }),
+  async (req, res, next) => {
+    try {
+      await ensureStaffExtrasSchema();
+      const pool = getPool();
+      const [rows] = await pool.execute(
+        `SELECT * FROM employee_access_controls WHERE employee_user_id = :id`,
+        { id: req.params.id }
+      );
+      res.json(
+        rows.map((r) => {
+          let permissions = r.permissions_json;
+          if (typeof permissions === "string") {
+            try {
+              permissions = JSON.parse(permissions);
+            } catch {
+              permissions = [];
+            }
+          }
+          return {
+            moduleName: r.module_name,
+            permissions: permissions || [],
+            isActive: Boolean(r.is_active),
+            expiresAt: r.expires_at
+          };
+        })
+      );
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+async function upsertEmployeeModuleAccess(pool, employeeUserId, entry, { isActive, expiresAt, updatedBy }) {
+  const moduleName = entry.moduleName || entry.module_name;
+  const permissions = entry.permissions || [];
+  const rowActive = Boolean(isActive);
+  await pool.execute(
+    `INSERT INTO employee_access_controls (
+       id, employee_user_id, module_name, permissions_json, is_active, expires_at, updated_by
+     ) VALUES (
+       :id, :employee_user_id, :module_name, :permissions_json, :is_active, :expires_at, :updated_by
+     ) ON CONFLICT (id) DO UPDATE SET permissions_json = EXCLUDED.permissions_json,
+       is_active = EXCLUDED.is_active,
+       expires_at = EXCLUDED.expires_at,
+       updated_by = EXCLUDED.updated_by`,
+    {
+      id: newId(),
+      employee_user_id: employeeUserId,
+      module_name: moduleName,
+      permissions_json: JSON.stringify(permissions),
+      is_active: rowActive ? 1 : 0,
+      expires_at: expiresAt,
+      updated_by: updatedBy
+    }
+  );
+}
+adminRouter.put(
+  "/employees/:id/access-controls",
+  authenticate,
+  authorize({ resource: "employees", action: "update" }),
+  async (req, res, next) => {
+    try {
+      await ensureStaffExtrasSchema();
+      const pool = getPool();
+      const input = req.body || {};
+      const isActive = input.isActive !== false && input.is_active !== false;
+      const expiresAt = input.expiresAt || input.expires_at || null;
+      const modules = Array.isArray(input.modules) ? input.modules : [
+        {
+          moduleName: input.moduleName || input.module_name || "applications",
+          permissions: input.permissions || []
+        }
+      ];
+      await pool.execute(
+        `DELETE FROM employee_access_controls WHERE employee_user_id = :id`,
+        { id: req.params.id }
+      );
+      for (const entry of modules) {
+        if (!entry?.moduleName && !entry?.module_name) continue;
+        await upsertEmployeeModuleAccess(pool, req.params.id, entry, {
+          isActive,
+          expiresAt,
+          updatedBy: req.auth.userId
+        });
+      }
+      await writeAuditLog({
+        userId: req.auth.userId,
+        actionType: "UPDATE",
+        tableName: "employee_access_controls",
+        recordId: req.params.id,
+        newValues: { modules: modules.map((m) => ({ module: m.moduleName || m.module_name, permissions: m.permissions })) }
+      });
+      res.json({ ok: true, updated: modules.length });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+export {
+  adminRouter
+};

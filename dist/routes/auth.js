@@ -1,0 +1,810 @@
+import { Router } from "express";
+import bcrypt from "bcryptjs";
+import crypto from "node:crypto";
+import { z } from "zod";
+import { getPool, isDuplicateEntryError, isDuplicateColumnError, isNoSuchTableError, isIgnorableMigrationError, isTableExistsError, isBadFieldError } from "../db/pool.js";
+import { newId } from "../lib/ids.js";
+import { sha256Hex } from "../lib/crypto.js";
+import { signAccessToken, signRefreshToken, verifyRefreshToken } from "../lib/jwt.js";
+import { authenticate } from "../middleware/authenticate.js";
+import { authorize } from "../middleware/authorize.js";
+import { getSessionCookieOptions } from "../lib/cookieOptions.js";
+import { generateOtp, hashOtp, sendOtpNotification } from "../lib/otp.js";
+import { assignUniqueCustomerCode } from "../lib/customerCode.js";
+import { ensureMilestone3Schema } from "../db/ensureMilestone3Schema.js";
+import { writeAuditLog } from "../lib/audit.js";
+import { buildMobileAuthJson } from "../lib/mobileClient.js";
+import { verifyCurrentPassword } from "../lib/verifyCurrentPassword.js";
+const authRouter = Router();
+const SignupSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(8),
+  fullName: z.string().min(1).optional(),
+  phone: z.string().min(6).optional(),
+  role: z.enum(["customer", "agent", "employee", "admin", "super_admin"]).optional()
+});
+const LoginSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(1)
+});
+function getClientIp(req) {
+  return req.headers["x-forwarded-for"]?.toString()?.split(",")?.[0]?.trim() || req.socket?.remoteAddress || null;
+}
+function refreshCookieMaxAge() {
+  return Number(process.env.JWT_REFRESH_TTL_SECONDS || 60 * 60 * 24 * 30) * 1e3;
+}
+function setRefreshCookie(res, token) {
+  res.cookie("refresh_token", token, getSessionCookieOptions("/auth/refresh", refreshCookieMaxAge()));
+}
+function clearRefreshCookie(res) {
+  const opts = getSessionCookieOptions("/auth/refresh", 0);
+  res.clearCookie("refresh_token", { path: opts.path, secure: opts.secure, sameSite: opts.sameSite });
+}
+async function issueTokens({ userId, email, role, req }) {
+  const pool = getPool();
+  const tokenId = newId();
+  const refreshJwt = signRefreshToken({ tokenId, userId });
+  const refreshHash = sha256Hex(refreshJwt);
+  const now = /* @__PURE__ */ new Date();
+  const expiresAt = new Date(now.getTime() + Number(process.env.JWT_REFRESH_TTL_SECONDS || 60 * 60 * 24 * 30) * 1e3);
+  await pool.execute(
+    `INSERT INTO refresh_tokens (id, user_id, token_hash, issued_at, expires_at, user_agent, ip_address)
+     VALUES (:id, :userId, :tokenHash, :issuedAt, :expiresAt, :ua, :ip)`,
+    {
+      id: tokenId,
+      userId,
+      tokenHash: refreshHash,
+      issuedAt: now,
+      expiresAt,
+      ua: req.headers["user-agent"]?.toString()?.slice(0, 512) ?? null,
+      ip: getClientIp(req)
+    }
+  );
+  const accessJwt = signAccessToken({ userId, email, role });
+  return { accessJwt, refreshJwt };
+}
+authRouter.post("/signup", async (req, res, next) => {
+  try {
+    const input = SignupSchema.parse(req.body);
+    const pool = getPool();
+    const userId = newId();
+    const passwordHash = await bcrypt.hash(input.password, 12);
+    const role = input.role || "customer";
+    await pool.execute(
+      `INSERT INTO auth_users (id, email, password_hash) VALUES (:id, :email, :ph)`,
+      { id: userId, email: input.email, ph: passwordHash }
+    );
+    await ensureMilestone3Schema();
+    await pool.execute(
+      `INSERT INTO user_profiles (id, email, full_name, phone, role, account_status, is_active)
+       VALUES (:id, :email, :fullName, :phone, :role, 'active', 1)`,
+      {
+        id: userId,
+        email: input.email,
+        fullName: input.fullName ?? null,
+        phone: input.phone ?? null,
+        role
+      }
+    );
+    if (role === "customer") {
+      await assignUniqueCustomerCode(pool, userId);
+    }
+    const { accessJwt, refreshJwt } = await issueTokens({ userId, email: input.email, role, req });
+    setRefreshCookie(res, refreshJwt);
+    res.status(201).json(
+      buildMobileAuthJson(req, {
+        accessJwt,
+        refreshJwt,
+        user: { id: userId, email: input.email, role }
+      })
+    );
+  } catch (err) {
+    if (isDuplicateEntryError(err)) {
+      err.status = 409;
+      err.message = "Email already exists";
+    }
+    next(err);
+  }
+});
+authRouter.post("/login", async (req, res, next) => {
+  try {
+    const input = LoginSchema.parse(req.body);
+    const pool = getPool();
+    const [[userRow]] = await pool.execute(
+      `SELECT id, email, password_hash FROM auth_users WHERE email = :email LIMIT 1`,
+      { email: input.email }
+    );
+    if (!userRow) {
+      const e = new Error("Invalid email or password");
+      e.status = 401;
+      throw e;
+    }
+    const [[profile]] = await pool.execute(
+      `SELECT id, role, account_status, is_active, failed_login_attempts, locked_until
+       FROM user_profiles WHERE id = :id LIMIT 1`,
+      { id: userRow.id }
+    );
+    if (!profile || !profile.is_active) {
+      const e = new Error("Account is inactive. Please contact administrator.");
+      e.status = 403;
+      throw e;
+    }
+    if (profile.account_status === "suspended") {
+      const e = new Error("Account is suspended. Please contact administrator.");
+      e.status = 403;
+      throw e;
+    }
+    const lockStillActive = profile.locked_until && new Date(profile.locked_until) > /* @__PURE__ */ new Date();
+    const lockExpired = profile.locked_until && new Date(profile.locked_until) <= /* @__PURE__ */ new Date();
+    if (profile.account_status === "locked" && (lockExpired || !profile.locked_until)) {
+      await pool.execute(
+        `UPDATE user_profiles
+         SET account_status = 'active', failed_login_attempts = 0, locked_until = NULL
+         WHERE id = :id`,
+        { id: profile.id }
+      );
+      profile.account_status = "active";
+      profile.failed_login_attempts = 0;
+      profile.locked_until = null;
+    }
+    if (lockStillActive) {
+      const e = new Error("Account is temporarily locked. Please try again in a few minutes.");
+      e.status = 403;
+      throw e;
+    }
+    if (profile.account_status === "locked") {
+      const e = new Error("Account is locked due to multiple failed login attempts.");
+      e.status = 403;
+      throw e;
+    }
+    const ok = await bcrypt.compare(input.password, userRow.password_hash);
+    if (!ok) {
+      const attempts = Number(profile?.failed_login_attempts || 0) + 1;
+      const updates = { attempts, locked: 0, lockedUntil: null };
+      if (attempts >= 5) {
+        updates.locked = 1;
+        updates.lockedUntil = new Date(Date.now() + 30 * 60 * 1e3);
+      }
+      await pool.execute(
+        `UPDATE user_profiles
+         SET failed_login_attempts = :attempts,
+             account_status = CASE WHEN :locked = 1 THEN 'locked' ELSE account_status END,
+             locked_until = :lockedUntil
+         WHERE id = :id`,
+        { attempts: updates.attempts, locked: updates.locked, lockedUntil: updates.lockedUntil, id: profile.id }
+      );
+      const e = new Error("Invalid email or password");
+      e.status = 401;
+      throw e;
+    }
+    await pool.execute(
+      `UPDATE user_profiles
+       SET failed_login_attempts = 0,
+           locked_until = NULL,
+           account_status = CASE WHEN account_status = 'locked' THEN 'active' ELSE account_status END
+       WHERE id = :id`,
+      { id: profile.id }
+    );
+    const { accessJwt, refreshJwt } = await issueTokens({
+      userId: profile.id,
+      email: userRow.email,
+      role: profile.role,
+      req
+    });
+    setRefreshCookie(res, refreshJwt);
+    res.json(
+      buildMobileAuthJson(req, {
+        accessJwt,
+        refreshJwt,
+        user: { id: profile.id, email: userRow.email, role: profile.role }
+      })
+    );
+  } catch (err) {
+    next(err);
+  }
+});
+authRouter.post("/refresh", async (req, res, next) => {
+  try {
+    const token = req.cookies?.refresh_token || req.body?.refreshToken;
+    if (!token) {
+      const e = new Error("Missing refresh token");
+      e.status = 401;
+      throw e;
+    }
+    const payload = verifyRefreshToken(token);
+    const userId = payload.sub;
+    const tokenId = payload.jti;
+    const pool = getPool();
+    const refreshHash = sha256Hex(token);
+    const [[row]] = await pool.execute(
+      `SELECT id, user_id, expires_at, revoked_at, rotated_to_token_id
+       FROM refresh_tokens
+       WHERE id = :id AND user_id = :userId AND token_hash = :tokenHash
+       LIMIT 1`,
+      { id: tokenId, userId, tokenHash: refreshHash }
+    );
+    if (!row || row.revoked_at || row.rotated_to_token_id) {
+      const e = new Error("Refresh token is no longer valid");
+      e.status = 401;
+      throw e;
+    }
+    if (new Date(row.expires_at) < /* @__PURE__ */ new Date()) {
+      const e = new Error("Refresh token expired");
+      e.status = 401;
+      throw e;
+    }
+    const [[profile]] = await pool.execute(
+      `SELECT id, email, role, account_status, is_active
+       FROM user_profiles WHERE id = :id LIMIT 1`,
+      { id: userId }
+    );
+    if (!profile || !profile.is_active || profile.account_status !== "active") {
+      const e = new Error("Account is not active");
+      e.status = 403;
+      throw e;
+    }
+    const newTokenId = newId();
+    const newRefreshJwt = signRefreshToken({ tokenId: newTokenId, userId });
+    const newHash = sha256Hex(newRefreshJwt);
+    const now = /* @__PURE__ */ new Date();
+    const expiresAt = new Date(now.getTime() + Number(process.env.JWT_REFRESH_TTL_SECONDS || 60 * 60 * 24 * 30) * 1e3);
+    await pool.execute(
+      `UPDATE refresh_tokens SET revoked_at = :revokedAt, rotated_to_token_id = :rotatedTo WHERE id = :id`,
+      { revokedAt: now, rotatedTo: newTokenId, id: tokenId }
+    );
+    await pool.execute(
+      `INSERT INTO refresh_tokens (id, user_id, token_hash, issued_at, expires_at, user_agent, ip_address)
+       VALUES (:id, :userId, :tokenHash, :issuedAt, :expiresAt, :ua, :ip)`,
+      {
+        id: newTokenId,
+        userId,
+        tokenHash: newHash,
+        issuedAt: now,
+        expiresAt,
+        ua: req.headers["user-agent"]?.toString()?.slice(0, 512) ?? null,
+        ip: getClientIp(req)
+      }
+    );
+    const accessJwt = signAccessToken({ userId, email: profile.email, role: profile.role });
+    setRefreshCookie(res, newRefreshJwt);
+    res.json(buildMobileAuthJson(req, { accessJwt, refreshJwt: newRefreshJwt }));
+  } catch (err) {
+    next(err);
+  }
+});
+authRouter.post("/logout", async (req, res, next) => {
+  try {
+    const token = req.cookies?.refresh_token || req.body?.refreshToken;
+    if (token) {
+      try {
+        const payload = verifyRefreshToken(token);
+        const pool = getPool();
+        await pool.execute(
+          `UPDATE refresh_tokens SET revoked_at = :now WHERE id = :id AND user_id = :userId`,
+          { now: /* @__PURE__ */ new Date(), id: payload.jti, userId: payload.sub }
+        );
+      } catch {
+      }
+    }
+    clearRefreshCookie(res);
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+authRouter.get("/me", async (req, res, next) => {
+  try {
+    const auth = req.headers.authorization || "";
+    const token = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length) : null;
+    if (!token) {
+      const e = new Error("Missing access token");
+      e.status = 401;
+      throw e;
+    }
+    const { verifyAccessToken } = await import("../lib/jwt.js");
+    const payload = verifyAccessToken(token);
+    const pool = getPool();
+    const [[profile]] = await pool.execute(
+      `SELECT * FROM user_profiles WHERE id = :id LIMIT 1`,
+      { id: payload.sub }
+    );
+    if (!profile) {
+      const e = new Error("User profile not found");
+      e.status = 404;
+      throw e;
+    }
+    let employeeAccess = null;
+    if (profile.role === "employee") {
+      const { getEffectiveEmployeeAccess } = await import("../lib/employeeAccessControls.js");
+      employeeAccess = await getEffectiveEmployeeAccess(profile.id);
+    }
+    res.json({
+      user: { id: profile.id, email: profile.email, role: profile.role },
+      profile,
+      employeeAccess
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+authRouter.post("/register-portal", async (req, res, next) => {
+  try {
+    const pool = getPool();
+    const id = newId();
+    const data = req.body;
+    await pool.execute(
+      `INSERT INTO customer_registrations (
+        id, email, full_name, phone, oauth_provider, oauth_provider_id, 
+        date_of_birth, gender, address_line1, address_line2, city, state, 
+        pin_code, employment_type, employer_name, annual_income, bank_name, 
+        account_name, registration_status
+      ) VALUES (
+        :id, :email, :full_name, :phone, :oauth_provider, :oauth_provider_id,
+        :date_of_birth, :gender, :address_line1, :address_line2, :city, :state,
+        :pin_code, :employment_type, :employer_name, :annual_income, :bank_name,
+        :account_name, 'pending'
+      )`,
+      {
+        id,
+        email: data.email,
+        full_name: data.fullName || data.full_name,
+        phone: data.phone,
+        oauth_provider: data.oauthProvider || data.oauth_provider || "email",
+        oauth_provider_id: data.oauthProviderId || data.oauth_provider_id || null,
+        date_of_birth: data.dateOfBirth || data.date_of_birth || null,
+        gender: data.gender || null,
+        address_line1: data.addressLine1 || data.address_line1 || null,
+        address_line2: data.addressLine2 || data.address_line2 || null,
+        city: data.city || null,
+        state: data.state || null,
+        pin_code: data.pinCode || data.pin_code || null,
+        employment_type: data.employmentType || data.employment_type || null,
+        employer_name: data.employerName || data.employer_name || null,
+        annual_income: data.annualIncome || data.annual_income || null,
+        bank_name: data.bankName || data.bank_name || null,
+        account_name: data.accountName || data.account_name || null
+      }
+    );
+    res.status(201).json({ id, status: "pending" });
+  } catch (err) {
+    next(err);
+  }
+});
+authRouter.get("/registrations", authenticate, authorize({ resource: "registration", action: "read" }), async (req, res, next) => {
+  try {
+    const pool = getPool();
+    const [rows] = await pool.execute(
+      `SELECT * FROM customer_registrations ORDER BY created_at DESC`
+    );
+    res.json({ registrations: rows });
+  } catch (err) {
+    next(err);
+  }
+});
+authRouter.post("/registrations/:id/approve", authenticate, authorize({ resource: "registration", action: "update" }), async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { password } = req.body;
+    const pool = getPool();
+    const [[reg]] = await pool.execute(
+      `SELECT * FROM customer_registrations WHERE id = :id LIMIT 1`,
+      { id }
+    );
+    if (!reg) {
+      const e = new Error("Registration not found");
+      e.status = 404;
+      throw e;
+    }
+    const userId = newId();
+    const passwordHash = await bcrypt.hash(password || "Temporary@123", 12);
+    await pool.execute(
+      `INSERT INTO auth_users (id, email, password_hash) VALUES (:id, :email, :ph)`,
+      { id: userId, email: reg.email, ph: passwordHash }
+    );
+    await ensureMilestone3Schema();
+    await pool.execute(
+      `INSERT INTO user_profiles (id, email, full_name, phone, role, account_status, is_active)
+       VALUES (:id, :email, :fullName, :phone, 'customer', 'active', 1)`,
+      { id: userId, email: reg.email, fullName: reg.full_name, phone: reg.phone }
+    );
+    const customerCode = await assignUniqueCustomerCode(pool, userId);
+    await pool.execute(
+      `UPDATE customer_registrations 
+       SET registration_status = 'approved', reviewed_by = :reviewerId, approved_at = NOW()
+       WHERE id = :id`,
+      { id, reviewerId: req.auth.userId }
+    );
+    await writeAuditLog({
+      userId: req.auth.userId,
+      actionType: "APPROVE",
+      tableName: "user_profiles",
+      recordId: userId,
+      newValues: { customerCode, email: reg.email }
+    });
+    res.json({ success: true, userId, customerCode });
+  } catch (err) {
+    next(err);
+  }
+});
+authRouter.post("/registrations/:id/reject", authenticate, authorize({ resource: "registration", action: "update" }), async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { reason } = req.body;
+    const pool = getPool();
+    await pool.execute(
+      `UPDATE customer_registrations 
+       SET registration_status = 'rejected', rejection_reason = :reason, reviewed_by = :reviewerId, reviewed_at = NOW()
+       WHERE id = :id`,
+      { id, reason, reviewerId: req.auth.userId }
+    );
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+authRouter.post("/change-password", authenticate, async (_req, res) => {
+  return res.status(403).json({
+    error: "Direct password change is disabled. Use password reset with OTP verification in your portal settings."
+  });
+});
+const AuthenticatedPasswordResetRequestSchema = z.object({
+  channel: z.enum(["email", "sms", "whatsapp"]).default("email")
+});
+const AuthenticatedPasswordResetConfirmSchema = z.object({
+  otp: z.string().length(6),
+  newPassword: z.string().min(8),
+  currentPassword: z.string().min(1)
+});
+authRouter.post("/password-reset/request-otp", authenticate, async (req, res, next) => {
+  try {
+    if (req.auth.role !== "customer") {
+      return res.status(403).json({ error: "Customer access only" });
+    }
+    const input = AuthenticatedPasswordResetRequestSchema.parse(req.body ?? {});
+    const pool = getPool();
+    const [[profile]] = await pool.execute(
+      `SELECT au.id, au.email, up.phone
+       FROM auth_users au
+       JOIN user_profiles up ON up.id = au.id
+       WHERE au.id = :id AND up.role = 'customer'
+       LIMIT 1`,
+      { id: req.auth.userId }
+    );
+    if (!profile) {
+      return res.status(404).json({ error: "Customer profile not found" });
+    }
+    const email = String(profile.email || "").toLowerCase();
+    const phone = profile.phone ? String(profile.phone).replace(/\D/g, "").slice(-10) : null;
+    if (input.channel !== "email" && !phone) {
+      return res.status(400).json({ error: "No registered mobile number on file for SMS OTP" });
+    }
+    const otp = generateOtp();
+    const id = newId();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1e3);
+    await pool.execute(
+      `INSERT INTO lead_otps (id, lead_id, email, phone, otp_hash, purpose, channel, expires_at)
+       VALUES (:id, NULL, :email, :phone, :hash, 'password_reset', :channel, :exp)`,
+      {
+        id,
+        email,
+        phone,
+        hash: hashOtp(otp),
+        channel: input.channel,
+        exp: expiresAt
+      }
+    );
+    await sendOtpNotification({
+      email,
+      phone,
+      otp,
+      channel: input.channel
+    });
+    res.json({
+      success: true,
+      message: input.channel === "email" ? "OTP sent to your registered email" : "OTP sent to your registered mobile number",
+      expiresInSeconds: 600,
+      ...process.env.LOG_OTP === "true" ? { devOtp: otp } : {}
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+authRouter.post("/password-reset/confirm", authenticate, async (req, res, next) => {
+  try {
+    if (req.auth.role !== "customer") {
+      return res.status(403).json({ error: "Customer access only" });
+    }
+    const input = AuthenticatedPasswordResetConfirmSchema.parse(req.body);
+    const pool = getPool();
+    await verifyCurrentPassword(req.auth.userId, input.currentPassword);
+    const [[user]] = await pool.execute(
+      `SELECT au.id, au.email FROM auth_users au
+       JOIN user_profiles up ON up.id = au.id
+       WHERE au.id = :id AND up.role = 'customer'
+       LIMIT 1`,
+      { id: req.auth.userId }
+    );
+    if (!user) {
+      return res.status(404).json({ error: "Customer profile not found" });
+    }
+    const email = String(user.email || "").toLowerCase();
+    const [[otpRow]] = await pool.execute(
+      `SELECT id FROM lead_otps
+       WHERE email = :email AND otp_hash = :hash
+         AND purpose = 'password_reset' AND verified_at IS NULL AND expires_at > NOW()
+       ORDER BY created_at DESC LIMIT 1`,
+      { email, hash: hashOtp(input.otp) }
+    );
+    if (!otpRow) {
+      return res.status(401).json({ error: "Invalid or expired OTP" });
+    }
+    const hashed = await bcrypt.hash(input.newPassword, 12);
+    await pool.execute(`UPDATE auth_users SET password_hash = :ph WHERE id = :id`, {
+      ph: hashed,
+      id: req.auth.userId
+    });
+    await pool.execute(`UPDATE lead_otps SET verified_at = NOW() WHERE id = :id`, { id: otpRow.id });
+    await pool.execute(
+      `UPDATE user_profiles SET password_change_required = FALSE WHERE id = :id`,
+      { id: req.auth.userId }
+    );
+    await pool.execute(
+      `UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = :id AND revoked_at IS NULL`,
+      { id: req.auth.userId }
+    );
+    res.json({ success: true, message: "Password updated. Please sign in again." });
+  } catch (err) {
+    next(err);
+  }
+});
+const ForgotPasswordRequestSchema = z.object({
+  email: z.string().email(),
+  channel: z.enum(["email", "sms", "whatsapp"]).default("email")
+});
+const ForgotPasswordConfirmSchema = z.object({
+  email: z.string().email(),
+  otp: z.string().length(6),
+  newPassword: z.string().min(8)
+});
+authRouter.post("/forgot-password/request-otp", async (req, res, next) => {
+  try {
+    const input = ForgotPasswordRequestSchema.parse(req.body);
+    const pool = getPool();
+    const [[user]] = await pool.execute(
+      `SELECT au.id, up.phone
+       FROM auth_users au
+       LEFT JOIN user_profiles up ON up.id = au.id
+       WHERE au.email = :email LIMIT 1`,
+      { email: input.email.toLowerCase() }
+    );
+    if (!user) {
+      return res.json({ success: true, message: "If an account exists, an OTP has been sent.", expiresInSeconds: 600 });
+    }
+    const otp = generateOtp();
+    const id = newId();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1e3);
+    const phone = user.phone ? String(user.phone).replace(/\D/g, "").slice(-10) : null;
+    await pool.execute(
+      `INSERT INTO lead_otps (id, lead_id, email, phone, otp_hash, purpose, channel, expires_at)
+       VALUES (:id, NULL, :email, :phone, :hash, 'password_reset', :channel, :exp)`,
+      {
+        id,
+        email: input.email.toLowerCase(),
+        phone,
+        hash: hashOtp(otp),
+        channel: input.channel,
+        exp: expiresAt
+      }
+    );
+    await sendOtpNotification({
+      email: input.email.toLowerCase(),
+      phone,
+      otp,
+      channel: input.channel
+    });
+    res.json({ success: true, message: "OTP sent", expiresInSeconds: 600 });
+  } catch (err) {
+    if (err?.name === "ZodError") {
+      err.status = 400;
+      err.message = err.issues?.[0]?.message || "Invalid request";
+    }
+    next(err);
+  }
+});
+authRouter.post("/forgot-password/confirm", async (req, res, next) => {
+  try {
+    const input = ForgotPasswordConfirmSchema.parse(req.body);
+    const pool = getPool();
+    const [[otpRow]] = await pool.execute(
+      `SELECT id FROM lead_otps
+       WHERE email = :email AND otp_hash = :hash
+         AND purpose = 'password_reset' AND verified_at IS NULL AND expires_at > NOW()
+       ORDER BY created_at DESC LIMIT 1`,
+      { email: input.email.toLowerCase(), hash: hashOtp(input.otp) }
+    );
+    if (!otpRow) {
+      return res.status(401).json({ error: "Invalid or expired OTP" });
+    }
+    const [[user]] = await pool.execute(
+      `SELECT id FROM auth_users WHERE email = :email LIMIT 1`,
+      { email: input.email.toLowerCase() }
+    );
+    if (!user) {
+      return res.status(404).json({ error: "Account not found" });
+    }
+    const hashed = await bcrypt.hash(input.newPassword, 12);
+    await pool.execute(`UPDATE auth_users SET password_hash = :ph WHERE id = :id`, {
+      ph: hashed,
+      id: user.id
+    });
+    await pool.execute(`UPDATE lead_otps SET verified_at = NOW() WHERE id = :id`, { id: otpRow.id });
+    await pool.execute(
+      `UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = :id AND revoked_at IS NULL`,
+      { id: user.id }
+    );
+    res.json({ success: true, message: "Password reset successfully. Please sign in with your new password." });
+  } catch (err) {
+    if (err?.name === "ZodError") {
+      err.status = 400;
+      err.message = err.issues?.[0]?.message || "Invalid request";
+    }
+    next(err);
+  }
+});
+authRouter.get("/sessions", authenticate, async (req, res, next) => {
+  try {
+    const pool = getPool();
+    const [rows] = await pool.execute(
+      `SELECT id, issued_at, expires_at, user_agent, ip_address 
+       FROM refresh_tokens 
+       WHERE user_id = :userId AND revoked_at IS NULL AND expires_at > NOW()
+       ORDER BY issued_at DESC`,
+      { userId: req.auth.userId }
+    );
+    res.json({ sessions: rows });
+  } catch (err) {
+    next(err);
+  }
+});
+authRouter.delete("/sessions/:id", authenticate, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const pool = getPool();
+    await pool.execute(
+      `UPDATE refresh_tokens SET revoked_at = NOW() WHERE id = :id AND user_id = :userId`,
+      { id, userId: req.auth.userId }
+    );
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+const ApplicationOtpRequestSchema = z.object({
+  phone: z.string().min(10),
+  email: z.string().email()
+});
+const ApplicationOtpVerifySchema = z.object({
+  phone: z.string().min(10),
+  otp: z.string().length(6),
+  email: z.string().email(),
+  fullName: z.string().min(1).optional()
+});
+function normalizePhone(phone) {
+  const digits = String(phone).replace(/\D/g, "");
+  return digits.length >= 10 ? digits.slice(-10) : digits;
+}
+authRouter.post("/application/request-otp", async (req, res, next) => {
+  try {
+    const input = ApplicationOtpRequestSchema.parse(req.body);
+    const phone = normalizePhone(input.phone);
+    const pool = getPool();
+    const otp = generateOtp();
+    const id = newId();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1e3);
+    await pool.execute(
+      `INSERT INTO lead_otps (id, lead_id, email, phone, otp_hash, purpose, channel, expires_at)
+       VALUES (:id, NULL, :email, :phone, :hash, 'application_submit', 'sms', :exp)`,
+      {
+        id,
+        email: input.email,
+        phone,
+        hash: hashOtp(otp),
+        exp: expiresAt
+      }
+    );
+    await sendOtpNotification({ phone, email: input.email, otp, channel: "sms" });
+    res.json({ success: true, expiresInSeconds: 600 });
+  } catch (err) {
+    next(err);
+  }
+});
+authRouter.post("/application/verify-otp", async (req, res, next) => {
+  try {
+    const input = ApplicationOtpVerifySchema.parse(req.body);
+    const phone = normalizePhone(input.phone);
+    const pool = getPool();
+    const [[otpRow]] = await pool.execute(
+      `SELECT id FROM lead_otps
+       WHERE phone = :phone AND otp_hash = :hash AND purpose = 'application_submit'
+         AND verified_at IS NULL AND expires_at > NOW()
+       ORDER BY created_at DESC LIMIT 1`,
+      { phone, hash: hashOtp(input.otp) }
+    );
+    if (!otpRow) {
+      return res.status(401).json({ error: "Invalid or expired OTP" });
+    }
+    await pool.execute(`UPDATE lead_otps SET verified_at = NOW() WHERE id = :id`, { id: otpRow.id });
+    let [[profile]] = await pool.execute(
+      `SELECT id, email, role FROM user_profiles
+       WHERE phone = :phone OR email = :email
+       ORDER BY (phone = :phone) DESC
+       LIMIT 1`,
+      { phone, email: input.email }
+    );
+    let userId;
+    let email = input.email;
+    let role = "customer";
+    if (!profile) {
+      userId = newId();
+      const password = `RFC${crypto.randomBytes(4).toString("hex")}A1!`;
+      const passwordHash = await bcrypt.hash(password, 12);
+      await pool.execute(
+        `INSERT INTO auth_users (id, email, password_hash) VALUES (:id, :email, :ph)`,
+        { id: userId, email: input.email, ph: passwordHash }
+      );
+      await pool.execute(
+        `INSERT INTO user_profiles (id, email, full_name, phone, role, account_status, is_active)
+         VALUES (:id, :email, :fullName, :phone, 'customer', 'active', 1)`,
+        {
+          id: userId,
+          email: input.email,
+          fullName: input.fullName ?? null,
+          phone
+        }
+      );
+    } else {
+      userId = profile.id;
+      email = profile.email;
+      role = profile.role;
+      await pool.execute(
+        `UPDATE user_profiles SET phone = COALESCE(phone, :phone), full_name = COALESCE(full_name, :fullName)
+         WHERE id = :id`,
+        { id: userId, phone, fullName: input.fullName ?? null }
+      );
+    }
+    const { accessJwt, refreshJwt } = await issueTokens({ userId, email, role, req });
+    setRefreshCookie(res, refreshJwt);
+    res.json(
+      buildMobileAuthJson(req, {
+        verified: true,
+        accessJwt,
+        refreshJwt,
+        user: { id: userId, email, role }
+      })
+    );
+  } catch (err) {
+    next(err);
+  }
+});
+authRouter.get(
+  "/users",
+  authenticate,
+  authorize({ resource: "users", action: "read" }),
+  async (req, res, next) => {
+    try {
+      const pool = getPool();
+      const [users] = await pool.execute(
+        `SELECT u.id, u.email, p.full_name, p.role, p.account_status, p.is_active, u.created_at
+         FROM auth_users u
+         LEFT JOIN user_profiles p ON u.id = p.id
+         ORDER BY u.created_at DESC`
+      );
+      res.json({ users });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+export {
+  authRouter
+};

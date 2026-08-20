@@ -26,7 +26,7 @@ import {
 const __dirname = dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: join(__dirname, '../.env') });
 
-const port = Number(process.env.API_PORT || 8080);
+const port = Number(process.env.PORT || process.env.API_PORT || 8080);
 
 mkdirSync(getUploadDir(), { recursive: true });
 
@@ -34,7 +34,9 @@ if (isCloudStorage()) {
   assertS3Config();
 }
 
-const app = createApp();
+const app = createApp({
+  serveStatic: process.env.SERVE_STATIC !== 'false',
+});
 
 async function bootstrap() {
   try {
