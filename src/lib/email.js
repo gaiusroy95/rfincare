@@ -11,14 +11,51 @@ export function smtpConfigured() {
 }
 
 function smtpPassword() {
-  const raw = process.env.SMTP_PASS || process.env.SMTP_PASSWORD || '';
-  return String(raw).replace(/^["']|["']$/g, '').trim();
+  let raw = process.env.SMTP_PASS || process.env.SMTP_PASSWORD || '';
+  raw = String(raw).trim();
+  // Strip wrapping quotes that often get pasted into Cloud Run / .env
+  if (
+    (raw.startsWith('"') && raw.endsWith('"'))
+    || (raw.startsWith("'") && raw.endsWith("'"))
+  ) {
+    raw = raw.slice(1, -1).trim();
+  }
+  // Gmail App Passwords are 16 chars; Google displays them with spaces — remove spaces.
+  const host = String(process.env.SMTP_HOST || '').toLowerCase();
+  if (host.includes('gmail.com') || host.includes('googlemail.com')) {
+    raw = raw.replace(/\s+/g, '');
+  }
+  return raw;
 }
 
 function smtpFromAddress() {
   return String(
     process.env.SMTP_FROM || process.env.SMTP_FROM_EMAIL || process.env.SMTP_USER || '',
   ).trim();
+}
+
+function humanizeSmtpError(err) {
+  const message = String(err?.message || err || '');
+  const response = String(err?.response || '');
+  const combined = `${message} ${response}`;
+
+  if (/535|BadCredentials|Username and Password not accepted/i.test(combined)) {
+    return (
+      'Gmail SMTP login failed (535 BadCredentials). Use a Google App Password (not your normal Gmail password), '
+      + 'set SMTP_USER to the full Gmail address, set SMTP_PASS to the 16-character app password WITHOUT spaces or quotes, '
+      + 'and ensure 2-Step Verification is ON. Then update Cloud Run Variables & Secrets and redeploy/restart the service.'
+    );
+  }
+  if (/EAUTH/i.test(combined) || /Invalid login/i.test(combined)) {
+    return (
+      'SMTP authentication failed. Check SMTP_HOST, SMTP_USER, SMTP_PASS/SMTP_PASSWORD on the server '
+      + '(Cloud Run Variables). For Gmail you must use an App Password.'
+    );
+  }
+  return (
+    message
+    || 'Email could not be delivered via SMTP. Check SMTP_* env vars or hosting outbound port access.'
+  );
 }
 
 async function sendViaSmtp({ to, subject, text, html, attachments = [] }) {
@@ -28,19 +65,27 @@ async function sendViaSmtp({ to, subject, text, html, attachments = [] }) {
   const port = Number(process.env.SMTP_PORT || 587);
   const secure = process.env.SMTP_SECURE === 'true' || port === 465;
 
+  if (!user || !pass) {
+    const err = new Error(
+      'SMTP_USER and SMTP_PASS (or SMTP_PASSWORD) are required when SMTP_HOST is set.',
+    );
+    err.code = 'EAUTH';
+    throw err;
+  }
+
   const transporter = nodemailer.createTransport({
     host: process.env.SMTP_HOST,
     port,
     secure,
     requireTLS: !secure && port === 587,
-    auth: user && pass ? { user, pass } : undefined,
+    auth: { user, pass },
     connectionTimeout: Number(process.env.SMTP_CONNECTION_TIMEOUT_MS || 10000),
     greetingTimeout: Number(process.env.SMTP_GREETING_TIMEOUT_MS || 10000),
     socketTimeout: Number(process.env.SMTP_SOCKET_TIMEOUT_MS || 15000),
   });
 
   await transporter.sendMail({
-    from: smtpFromAddress(),
+    from: smtpFromAddress() || user,
     to,
     subject,
     text,
@@ -70,9 +115,7 @@ export async function sendEmail({ to, subject, text, html, attachments }) {
         sent: false,
         channel: 'smtp',
         reason: err?.code || 'smtp_error',
-        warning:
-          err?.message ||
-          'Email could not be delivered via SMTP. Check SMTP_* env vars or hosting outbound port access.',
+        warning: humanizeSmtpError(err),
         attachmentCount: mailAttachments.length,
       };
     }

@@ -886,8 +886,154 @@ documentsRouter.delete(
   async (req, res, next) => {
     try {
       const pool = getPool();
+      if (isAgentRole(req.auth.role)) {
+        const [[doc]] = await pool.execute(
+          `SELECT id, application_id FROM customer_documents WHERE id = :id LIMIT 1`,
+          { id: req.params.id },
+        );
+        if (!doc) {
+          const e = new Error('Document not found');
+          e.status = 404;
+          throw e;
+        }
+        const allowed = await agentCanAccessApplication(pool, req.auth.userId, doc.application_id);
+        if (!allowed) {
+          const e = new Error('Insufficient permissions');
+          e.status = 403;
+          throw e;
+        }
+      }
       await pool.execute(`DELETE FROM customer_documents WHERE id = :id`, { id: req.params.id });
-      res.json({ ok: true });
+      res.json({ ok: true, deleted: 1 });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+documentsRouter.post(
+  '/bulk-delete',
+  authenticate,
+  async (req, res, next) => {
+    try {
+      const body = z
+        .object({
+          documentIds: z.array(z.string().min(1)).optional(),
+          applicationIds: z.array(z.string().min(1)).optional(),
+        })
+        .parse(req.body || {});
+
+      const documentIds = [...new Set((body.documentIds || []).filter(Boolean))];
+      const applicationIds = [...new Set((body.applicationIds || []).filter(Boolean))];
+      if (!documentIds.length && !applicationIds.length) {
+        return res.status(400).json({ error: 'Provide documentIds and/or applicationIds' });
+      }
+
+      const role = req.auth.role;
+      const canStaffDelete = isStaffRole(role) || hasPermission(role, 'update:documents') || hasPermission(role, 'update:*');
+      const isAgent = isAgentRole(role);
+      if (!canStaffDelete && !isAgent) {
+        const e = new Error('Insufficient permissions');
+        e.status = 403;
+        throw e;
+      }
+
+      if (role === 'employee') {
+        await assertEmployeeAccess(req, 'documents', 'write');
+      }
+
+      const pool = getPool();
+      await ensureDocumentSchema();
+
+      let idsToDelete = [...documentIds];
+
+      if (applicationIds.length) {
+        if (isAgent) {
+          const scope = await resolveAgentScopeParams(pool, req.auth.userId);
+          const appParams = {};
+          const appPlaceholders = applicationIds.map((id, i) => {
+            const key = `app_${i}`;
+            appParams[key] = id;
+            return `:${key}`;
+          });
+          const [allowedApps] = await pool.execute(
+            `SELECT id FROM loan_applications
+             WHERE id IN (${appPlaceholders.join(', ')})
+               AND ${agentApplicationScopeSql('loan_applications')}`,
+            { ...appParams, ...scope },
+          );
+          const allowedSet = new Set((allowedApps || []).map((r) => r.id));
+          const scopedAppIds = applicationIds.filter((id) => allowedSet.has(id));
+          if (scopedAppIds.length) {
+            const p = {};
+            const ph = scopedAppIds.map((id, i) => {
+              const key = `dapp_${i}`;
+              p[key] = id;
+              return `:${key}`;
+            });
+            const [rows] = await pool.execute(
+              `SELECT id FROM customer_documents WHERE application_id IN (${ph.join(', ')})`,
+              p,
+            );
+            idsToDelete.push(...(rows || []).map((r) => r.id));
+          }
+        } else {
+          const p = {};
+          const ph = applicationIds.map((id, i) => {
+            const key = `dapp_${i}`;
+            p[key] = id;
+            return `:${key}`;
+          });
+          const [rows] = await pool.execute(
+            `SELECT id FROM customer_documents WHERE application_id IN (${ph.join(', ')})`,
+            p,
+          );
+          idsToDelete.push(...(rows || []).map((r) => r.id));
+        }
+      }
+
+      idsToDelete = [...new Set(idsToDelete.filter(Boolean))];
+      if (!idsToDelete.length) {
+        return res.json({ ok: true, deleted: 0 });
+      }
+
+      if (isAgent) {
+        const scope = await resolveAgentScopeParams(pool, req.auth.userId);
+        const p = {};
+        const ph = idsToDelete.map((id, i) => {
+          const key = `doc_${i}`;
+          p[key] = id;
+          return `:${key}`;
+        });
+        const [owned] = await pool.execute(
+          `SELECT cd.id
+           FROM customer_documents cd
+           JOIN loan_applications la ON la.id = cd.application_id
+           WHERE cd.id IN (${ph.join(', ')})
+             AND ${agentApplicationScopeSql('la')}`,
+          { ...p, ...scope },
+        );
+        idsToDelete = (owned || []).map((r) => r.id);
+        if (!idsToDelete.length) {
+          const e = new Error('Insufficient permissions');
+          e.status = 403;
+          throw e;
+        }
+      }
+
+      const delParams = {};
+      const delPh = idsToDelete.map((id, i) => {
+        const key = `del_${i}`;
+        delParams[key] = id;
+        return `:${key}`;
+      });
+      const [result] = await pool.execute(
+        `DELETE FROM customer_documents WHERE id IN (${delPh.join(', ')})`,
+        delParams,
+      );
+      const deleted = Number(result?.affectedRows ?? result?.rowCount ?? idsToDelete.length);
+
+      res.json({ ok: true, deleted, documentIds: idsToDelete });
     } catch (err) {
       next(err);
     }

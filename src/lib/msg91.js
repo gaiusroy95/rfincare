@@ -44,27 +44,56 @@ export function getMsg91Config(overrides = {}) {
     process.env.MSG91_TEMPLATE_ID ||
     '';
 
+  const normalizeSender = (value) =>
+    String(value || '')
+      .trim()
+      .toUpperCase()
+      .replace(/[^A-Z0-9]/g, '');
+
+  const panelSender = normalizeSender(overrides.msg91SenderId);
+  const envSender = normalizeSender(process.env.MSG91_SENDER_ID);
+  // MSG91 DLT sender IDs must be exactly 6 chars. Prefer a valid panel value, then env.
+  let senderId = 'RFINCR';
+  let senderIdWarning = null;
+  if (panelSender.length === 6) {
+    senderId = panelSender;
+  } else if (envSender.length === 6) {
+    senderId = envSender;
+    if (panelSender && panelSender.length !== 6) {
+      senderIdWarning = `Admin sender ID "${overrides.msg91SenderId}" is not 6 characters; using server MSG91_SENDER_ID (${envSender}).`;
+    }
+  } else if (panelSender) {
+    senderIdWarning = `Sender ID "${overrides.msg91SenderId || process.env.MSG91_SENDER_ID}" is invalid (need exactly 6 A–Z/0–9). Using RFINCR fallback — update DLT sender ID or delivery may fail.`;
+  }
+
   return {
     authKey: (process.env.MSG91_AUTH_KEY || '').trim(),
-    senderId:
-      overrides.msg91SenderId || process.env.MSG91_SENDER_ID || 'RFINCR',
-    otpTemplateId: templateId,
-    flowTemplateId:
-      overrides.msg91FlowTemplateId ||
-      process.env.MSG91_FLOW_TEMPLATE_ID ||
-      '',
-    whatsappTemplateId:
-      overrides.msg91WhatsappTemplateId ||
-      process.env.MSG91_WHATSAPP_TEMPLATE_ID ||
-      '',
-    whatsappNamespace:
-      overrides.msg91WhatsappNamespace ||
-      process.env.MSG91_WHATSAPP_NAMESPACE ||
-      '',
-    whatsappLanguage:
-      overrides.msg91WhatsappLanguage ||
-      process.env.MSG91_WHATSAPP_LANGUAGE ||
-      'en',
+    senderId,
+    senderIdWarning,
+    otpTemplateId: String(templateId || '').trim(),
+    flowTemplateId: String(
+      overrides.msg91FlowTemplateId || process.env.MSG91_FLOW_TEMPLATE_ID || '',
+    ).trim(),
+    whatsappTemplateId: String(
+      overrides.msg91WhatsappTemplateId || process.env.MSG91_WHATSAPP_TEMPLATE_ID || '',
+    ).trim(),
+    whatsappNamespace: String(
+      overrides.msg91WhatsappNamespace || process.env.MSG91_WHATSAPP_NAMESPACE || '',
+    ).trim(),
+    whatsappIntegratedNumber: String(
+      overrides.msg91WhatsappIntegratedNumber
+        || process.env.MSG91_WHATSAPP_INTEGRATED_NUMBER
+        || '',
+    )
+      .trim()
+      .replace(/\D/g, ''),
+    whatsappLanguage: String(
+      overrides.msg91WhatsappLanguage || process.env.MSG91_WHATSAPP_LANGUAGE || 'en',
+    ).trim() || 'en',
+    whatsappIncludeButton:
+      overrides.msg91WhatsappIncludeButton === true
+      || overrides.msg91WhatsappIncludeButton === 'true'
+      || process.env.MSG91_WHATSAPP_INCLUDE_BUTTON === 'true',
     route: process.env.MSG91_ROUTE || '4',
     countryCode: '91',
   };
@@ -72,6 +101,16 @@ export function getMsg91Config(overrides = {}) {
 
 export function isMsg91Configured() {
   return Boolean(getMsg91Config().authKey);
+}
+
+export function isMsg91WhatsappConfigured(overrides = {}) {
+  const config = getMsg91Config(overrides);
+  return Boolean(
+    config.authKey
+      && config.whatsappTemplateId
+      && config.whatsappNamespace
+      && config.whatsappIntegratedNumber,
+  );
 }
 
 export function getMsg91EmailConfig(overrides = {}) {
@@ -159,7 +198,7 @@ async function parseMsg91Response(res) {
 /**
  * Send OTP via MSG91 v5 OTP API (DLT-approved OTP template).
  */
-export async function sendMsg91Otp({ phone, otp, config: overrides = {} }) {
+export async function sendMsg91Otp({ phone, otp, config: overrides = {}, messageTemplate }) {
   const config = getMsg91Config(overrides);
   requireAuthKey(config);
 
@@ -174,6 +213,7 @@ export async function sendMsg91Otp({ phone, otp, config: overrides = {} }) {
       message: null,
       otp,
       config: overrides,
+      messageTemplate,
     });
   }
 
@@ -193,6 +233,7 @@ export async function sendMsg91Otp({ phone, otp, config: overrides = {} }) {
         template_id: config.otpTemplateId,
         mobile: mobileE164,
         otp: String(otp),
+        sender_id: config.senderId,
       }),
       timeoutMessage:
         'MSG91 OTP request timed out. Verify MSG91_AUTH_KEY, MSG91_OTP_TEMPLATE_ID, and server outbound network access.',
@@ -201,7 +242,14 @@ export async function sendMsg91Otp({ phone, otp, config: overrides = {} }) {
   );
 
   await parseMsg91Response(res);
-  return { sent: true, provider: 'msg91', mode: 'otp_api', mobile: mobileE164 };
+  return {
+    sent: true,
+    provider: 'msg91',
+    mode: 'otp_api',
+    mobile: mobileE164,
+    senderId: config.senderId,
+    warning: config.senderIdWarning || undefined,
+  };
 }
 
 /**
@@ -274,21 +322,27 @@ export async function sendMsg91TransactionalSms({
     MSG91_FETCH_TIMEOUT_MS,
   );
   const text = await res.text();
-  if (!res.ok || /invalid|error|authentication|denied/i.test(text)) {
-    throw new Error(`MSG91 SMS failed: ${text.slice(0, 300)}`);
+  const trimmed = String(text || '').trim();
+  // MSG91 sendhttp often returns request id OR JSON/error text.
+  if (
+    !res.ok
+    || /invalid|error|authentication|denied|reject/i.test(trimmed)
+    || /^\{.*"type"\s*:\s*"error"/i.test(trimmed)
+  ) {
+    throw new Error(`MSG91 SMS failed: ${trimmed.slice(0, 300)}`);
   }
 
-  return { sent: true, provider: 'msg91', mode: 'transactional_sms', requestId: text.trim() };
+  return { sent: true, provider: 'msg91', mode: 'transactional_sms', requestId: trimmed };
 }
 
-function buildMsg91WhatsappOtpComponents(otp) {
+function buildMsg91WhatsappOtpComponents(otp, includeButton = false) {
   const otpValue = String(otp);
   const bodyKey = process.env.MSG91_WHATSAPP_OTP_BODY_KEY || 'body_1';
   const components = {
     [bodyKey]: { type: 'text', value: otpValue },
   };
 
-  if (process.env.MSG91_WHATSAPP_INCLUDE_BUTTON === 'true') {
+  if (includeButton) {
     const buttonKey = process.env.MSG91_WHATSAPP_OTP_BUTTON_KEY || 'button_1';
     components[buttonKey] = { subtype: 'url', type: 'text', value: otpValue };
   }
@@ -305,15 +359,16 @@ export async function sendMsg91Whatsapp({ phone, otp, config: overrides = {} }) 
   requireAuthKey(config);
 
   if (!config.whatsappTemplateId) {
-    return sendMsg91Otp({ phone, otp, config: overrides });
+    const err = new Error(
+      'MSG91 WhatsApp template name is missing. Set it in Admin → OTP settings (or MSG91_WHATSAPP_TEMPLATE_ID), or disable WhatsApp OTP.',
+    );
+    err.status = 503;
+    throw err;
   }
 
-  const integratedNumber = (
-    process.env.MSG91_WHATSAPP_INTEGRATED_NUMBER || ''
-  ).trim();
-  if (!integratedNumber) {
+  if (!config.whatsappIntegratedNumber) {
     const err = new Error(
-      'MSG91 WhatsApp OTP is enabled but MSG91_WHATSAPP_INTEGRATED_NUMBER is not set. Add your onboarded WhatsApp number from the MSG91 dashboard to server env, or disable WhatsApp OTP in Admin → OTP settings.',
+      'MSG91 WhatsApp OTP is enabled but the onboarded WhatsApp number is missing. Set MSG91 WhatsApp integrated number in Admin → OTP settings (or MSG91_WHATSAPP_INTEGRATED_NUMBER).',
     );
     err.status = 503;
     throw err;
@@ -321,7 +376,7 @@ export async function sendMsg91Whatsapp({ phone, otp, config: overrides = {} }) 
 
   if (!config.whatsappNamespace) {
     const err = new Error(
-      'MSG91 WhatsApp template namespace is missing. Set MSG91_WHATSAPP_NAMESPACE in server env (MSG91 → WhatsApp → Templates → your template details), or disable WhatsApp OTP in Admin → OTP settings.',
+      'MSG91 WhatsApp template namespace is missing. Set it in Admin → OTP settings (or MSG91_WHATSAPP_NAMESPACE).',
     );
     err.status = 503;
     throw err;
@@ -339,7 +394,7 @@ export async function sendMsg91Whatsapp({ phone, otp, config: overrides = {} }) 
         Accept: 'application/json',
       },
       body: JSON.stringify({
-        integrated_number: integratedNumber,
+        integrated_number: config.whatsappIntegratedNumber,
         content_type: 'template',
         payload: {
           messaging_product: 'whatsapp',
@@ -354,7 +409,7 @@ export async function sendMsg91Whatsapp({ phone, otp, config: overrides = {} }) 
             to_and_components: [
               {
                 to: [recipient],
-                components: buildMsg91WhatsappOtpComponents(otp),
+                components: buildMsg91WhatsappOtpComponents(otp, config.whatsappIncludeButton),
               },
             ],
           },
@@ -366,7 +421,13 @@ export async function sendMsg91Whatsapp({ phone, otp, config: overrides = {} }) 
   );
 
   await parseMsg91Response(res);
-  return { sent: true, provider: 'msg91', mode: 'whatsapp' };
+  return {
+    sent: true,
+    provider: 'msg91',
+    mode: 'whatsapp',
+    template: config.whatsappTemplateId,
+    to: recipient,
+  };
 }
 
 /**
@@ -464,12 +525,13 @@ export async function testMsg91Connection(overrides = {}) {
   return {
     ok: true,
     senderId: config.senderId,
+    senderIdWarning: config.senderIdWarning || null,
     otpTemplateId: config.otpTemplateId || '(using plain SMS — set MSG91_OTP_TEMPLATE_ID)',
     flowTemplateId: config.flowTemplateId || null,
     whatsappTemplateId: config.whatsappTemplateId || null,
     whatsappNamespace: config.whatsappNamespace || null,
-    whatsappIntegratedNumber:
-      (process.env.MSG91_WHATSAPP_INTEGRATED_NUMBER || '').trim() || null,
+    whatsappIntegratedNumber: config.whatsappIntegratedNumber || null,
+    whatsappConfigured: isMsg91WhatsappConfigured(overrides),
     email: {
       configured: isMsg91EmailConfigured(overrides),
       domain: emailConfig.domain || null,

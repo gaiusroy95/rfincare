@@ -91,16 +91,74 @@ export async function reserveUniqueAgentCodeForFy(connOrPool, fyLabel) {
 
 /**
  * Assign RFA code when missing on agent_onboarding (existing agents included).
- * Returns the active code or null if no onboarding row exists.
+ * Creates a minimal onboarding row when the user is an agent but has none.
+ * Returns the active code or null if the user is not an agent.
  */
 export async function ensureAgentCodeForUser(connOrPool, userId) {
   if (!userId) return null;
   const pool = connOrPool?.execute ? connOrPool : getPool();
-  const [[row]] = await pool.execute(
-    `SELECT agent_code FROM agent_onboarding WHERE user_id = :id LIMIT 1`,
+
+  const [[profile]] = await pool.execute(
+    `SELECT id, role, full_name, email, phone
+     FROM user_profiles
+     WHERE id = :id
+     LIMIT 1`,
     { id: userId },
   );
-  if (!row) return null;
+  if (!profile) return null;
+
+  const role = String(profile.role || '').toLowerCase();
+  const [[row]] = await pool.execute(
+    `SELECT id, agent_code FROM agent_onboarding WHERE user_id = :id LIMIT 1`,
+    { id: userId },
+  );
+
+  if (!row) {
+    if (role !== 'agent') {
+      return null;
+    }
+    // Agent accounts created without onboarding still need a code for attribution.
+    const { newId } = await import('./ids.js');
+    const code = await reserveUniqueAgentCode(pool);
+    const email = String(profile.email || `${userId}@agents.local`).trim().toLowerCase();
+    const name = String(profile.full_name || 'Agent').trim() || 'Agent';
+    const usernameBase = email.split('@')[0].replace(/[^a-zA-Z0-9._-]/g, '').slice(0, 24) || 'agent';
+    const username = `${usernameBase}_${String(userId).replace(/-/g, '').slice(0, 8)}`;
+    try {
+      await pool.execute(
+        `INSERT INTO agent_onboarding (
+           id, user_id, username, agent_name, agent_code, email, mobile_number,
+           account_number, bank_name, ifsc_code, onboarding_status
+         ) VALUES (
+           :id, :user_id, :username, :agent_name, :agent_code, :email, :mobile,
+           :acc, :bank, :ifsc, 'active'
+         )`,
+        {
+          id: newId(),
+          user_id: userId,
+          username,
+          agent_name: name,
+          agent_code: code,
+          email,
+          mobile: String(profile.phone || '0000000000').slice(0, 32),
+          acc: 'PENDING',
+          bank: 'PENDING',
+          ifsc: 'PENDING',
+        },
+      );
+      return code;
+    } catch (err) {
+      // Race: another request may have inserted; re-read.
+      const [[again]] = await pool.execute(
+        `SELECT agent_code FROM agent_onboarding WHERE user_id = :id LIMIT 1`,
+        { id: userId },
+      );
+      const existing = String(again?.agent_code || '').trim();
+      if (existing) return existing;
+      console.warn('[agentCode] failed to create onboarding:', err?.message);
+      return null;
+    }
+  }
 
   const existing = String(row.agent_code || '').trim();
   if (existing) return existing;

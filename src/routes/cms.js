@@ -159,6 +159,10 @@ const OtpProviderSettingsSchema = z.object({
       msg91OtpTemplateId: z.string().optional(),
       msg91FlowTemplateId: z.string().optional(),
       msg91WhatsappTemplateId: z.string().optional(),
+      msg91WhatsappNamespace: z.string().optional(),
+      msg91WhatsappIntegratedNumber: z.string().optional(),
+      msg91WhatsappLanguage: z.string().optional(),
+      msg91WhatsappIncludeButton: z.union([z.boolean(), z.string()]).optional(),
       msg91EmailDomain: z.string().optional(),
       msg91EmailFromEmail: z.string().optional(),
       msg91EmailFromName: z.string().optional(),
@@ -276,7 +280,7 @@ cmsRouter.get('/otp-settings', async (_req, res, next) => {
     const settings = await getOtpProviderSettings();
     res.json({
       ...settings,
-      infrastructure: getOtpInfrastructureStatus(),
+      infrastructure: getOtpInfrastructureStatus(settings.providerConfig),
     });
   } catch (err) {
     next(err);
@@ -288,7 +292,7 @@ cmsRouter.get('/otp-settings/status', async (_req, res, next) => {
     const settings = await getOtpProviderSettings();
     const msg91Status = await testMsg91Connection(settings.providerConfig);
     res.json({
-      infrastructure: getOtpInfrastructureStatus(),
+      infrastructure: getOtpInfrastructureStatus(settings.providerConfig),
       activeSettings: {
         smsProvider: settings.smsProvider,
         emailProvider: settings.emailProvider,
@@ -323,12 +327,17 @@ cmsRouter.post('/otp-settings/test', async (req, res, next) => {
         email: body.email,
         otp,
         channel: 'email',
-        settings: { ...settings, emailProvider: 'msg91' },
+        settings,
       });
       return res.json({
         success: true,
         channel,
-        ...(process.env.LOG_OTP === 'true' ? { devOtp: otp } : {}),
+        delivered: result?.email?.delivered !== false && result?.email?.sent !== false,
+        provider: result?.email?.provider || settings.emailProvider,
+        warning: result?.email?.warning,
+        ...(process.env.LOG_OTP === 'true' || settings.emailProvider === 'console'
+          ? { devOtp: otp }
+          : {}),
         result,
       });
     }
@@ -343,10 +352,18 @@ cmsRouter.post('/otp-settings/test', async (req, res, next) => {
       channel,
       settings,
     });
+    const channelResult = result?.[channel] || result?.sms || result?.whatsapp;
     res.json({
       success: true,
       channel,
-      ...(process.env.LOG_OTP === 'true' ? { devOtp: otp } : {}),
+      delivered: channelResult?.sent !== false,
+      provider: channelResult?.provider || (channel === 'whatsapp' ? settings.whatsappProvider : settings.smsProvider),
+      warning: channelResult?.warning,
+      ...(process.env.LOG_OTP === 'true'
+        || (channel === 'sms' && settings.smsProvider === 'console')
+        || (channel === 'whatsapp' && settings.whatsappProvider === 'console')
+        ? { devOtp: otp }
+        : {}),
       result,
     });
   } catch (err) {
@@ -360,7 +377,7 @@ cmsRouter.put('/otp-settings', async (req, res, next) => {
     const updated = await updateOtpProviderSettings(input, req.auth.userId);
     res.json({
       ...updated,
-      infrastructure: getOtpInfrastructureStatus(),
+      infrastructure: getOtpInfrastructureStatus(updated.providerConfig),
     });
   } catch (err) {
     next(err);

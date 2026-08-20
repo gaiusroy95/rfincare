@@ -17,6 +17,7 @@ import { loanApplicationsRouter } from './routes/loanApplications.js';
 import { adminRouter } from './routes/admin.js';
 import { publicContentRouter } from './routes/publicContent.js';
 import { appointmentsRouter } from './routes/appointments.js';
+import { contactInquiriesRouter } from './routes/contactInquiries.js';
 import { cmsRouter } from './routes/cms.js';
 import { oauthRouter } from './routes/oauth.js';
 import { developmentRouter } from './routes/development.js';
@@ -97,6 +98,8 @@ export function createApp({ serveStatic = true } = {}) {
   app.use('/api/public', publicContentRouter);
   app.use('/public/appointments', appointmentsRouter);
   app.use('/api/public/appointments', appointmentsRouter);
+  app.use('/public/contact', contactInquiriesRouter);
+  app.use('/api/public/contact', contactInquiriesRouter);
   app.use('/cms', cmsRouter);
   app.use('/auth/oauth', oauthRouter);
   app.use('/development-panel', developmentRouter);

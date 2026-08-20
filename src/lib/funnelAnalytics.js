@@ -157,7 +157,14 @@ export async function buildFunnelAnalytics(pool, { days = 30, dateFrom, dateTo }
     `SELECT
        la.id,
        la.application_number,
-       la.loan_type,
+       COALESCE(
+         NULLIF(TRIM(CAST(la.data->>'loan_type_label' AS TEXT)), ''),
+         NULLIF(TRIM(CAST(la.data->>'loan_type' AS TEXT)), ''),
+         NULLIF(TRIM(CAST(la.data->>'loanType' AS TEXT)), ''),
+         NULLIF(TRIM(CAST(la.data->>'loan_purpose' AS TEXT)), ''),
+         NULLIF(TRIM(CAST(la.data->>'loanPurpose' AS TEXT)), ''),
+         'personal_loan'
+       ) AS loan_type,
        la.status,
        la.created_at,
        la.reviewed_at,

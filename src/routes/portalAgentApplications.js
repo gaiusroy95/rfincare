@@ -25,7 +25,7 @@ function requireAgent(req) {
   }
 }
 
-async function resolveAgentMeta(pool, userId) {
+async function resolveAgentMeta(pool, userId, { requireCode = false } = {}) {
   const [[row]] = await pool.execute(
     `SELECT up.full_name, up.email, ao.agent_code, ao.username
      FROM user_profiles up
@@ -37,6 +37,13 @@ async function resolveAgentMeta(pool, userId) {
     (await ensureAgentCodeForUser(pool, userId)) ||
     row?.agent_code ||
     null;
+  if (requireCode && !agentCode) {
+    const e = new Error(
+      'Your agent code is not set up yet. Contact admin to complete agent onboarding, then try again.',
+    );
+    e.status = 400;
+    throw e;
+  }
   return {
     agentId: userId,
     agentCode,
@@ -47,10 +54,22 @@ async function resolveAgentMeta(pool, userId) {
 }
 
 async function assertAgentOwnsApplication(pool, agentId, applicationId) {
+  const meta = await resolveAgentMeta(pool, agentId, { requireCode: false });
+  const params = { id: applicationId, agentId };
+  const match = [
+    `CAST(COALESCE(agent_id, '') AS TEXT) = CAST(:agentId AS TEXT)`,
+  ];
+  if (meta.agentCode) {
+    params.code = meta.agentCode;
+    match.push(
+      `LOWER(TRIM(CAST(COALESCE(sourced_agent_code, '') AS TEXT))) = LOWER(TRIM(CAST(:code AS TEXT)))`,
+    );
+  }
   const [[row]] = await pool.execute(
     `SELECT * FROM loan_applications
-     WHERE id = :id AND agent_id = :agentId LIMIT 1`,
-    { id: applicationId, agentId },
+     WHERE id = :id AND (${match.join(' OR ')})
+     LIMIT 1`,
+    params,
   );
   if (!row) {
     const e = new Error('Application not found or not linked to your agent code');
@@ -123,7 +142,7 @@ portalAgentApplicationsRouter.post('/applications', async (req, res, next) => {
     const pool = getPool();
     await ensureStaffMessagingSchema();
     const agentId = req.auth.userId;
-    const meta = await resolveAgentMeta(pool, agentId);
+    const meta = await resolveAgentMeta(pool, agentId, { requireCode: true });
     const body = req.body || {};
     const customerId = body.customer_id || body.customerId;
     if (!customerId) {

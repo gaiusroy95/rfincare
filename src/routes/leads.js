@@ -17,8 +17,10 @@ import {
   upsertMarketingLead,
 } from '../lib/marketingLeads.js';
 import { normalizeAgentCode } from '../lib/agentAttribution.js';
-import { applyReferralToLead } from '../lib/referralTracking.js';
+import { ensureAgentCodeForUser } from '../lib/agentCode.js';
+import { applyReferralToLead, ensureReferralSchema } from '../lib/referralTracking.js';
 import { authenticate } from '../middleware/authenticate.js';
+import { verifyAccessToken } from '../lib/jwt.js';
 import { hasPermission } from '../auth/permissions.js';
 import { sqlCastParam, sqlParamEquals, sqlLiteralEquals } from '../lib/sqlCollation.js';
 
@@ -108,38 +110,113 @@ const CreateLeadSchema = z.object({
   referral_code: z.string().optional().nullable(),
   referralProgram: z.string().optional().nullable(),
   referral_program: z.string().optional().nullable(),
+  leadKind: z.enum(['customer', 'agent']).optional().nullable(),
+  lead_kind: z.enum(['customer', 'agent']).optional().nullable(),
+  assignedTo: z.string().optional().nullable(),
+  assigned_to: z.string().optional().nullable(),
+  agentUserId: z.string().optional().nullable(),
+  agent_user_id: z.string().optional().nullable(),
 });
 
 async function applyAgentCodeToLead(pool, leadId, body) {
+  await ensureReferralSchema(pool);
   const applied = await applyReferralToLead(pool, leadId, body);
-  if (applied) return applied;
+  // Always stamp explicit agent code so agent-portal creates show in the pipeline,
+  // even when a prior referral payload resolved without sourced_agent_code.
   const agentCode = normalizeAgentCode(
     body.sourcedAgentCode || body.sourced_agent_code || body.agentCode,
   );
-  if (!agentCode || !leadId) return;
-  try {
-    await pool.execute(
-      `UPDATE marketing_leads SET sourced_agent_code = :code WHERE id = :id`,
-      { code: agentCode, id: leadId },
-    );
-  } catch {
-    /* column may not exist until migration */
+  if (agentCode && leadId) {
+    try {
+      await pool.execute(
+        `UPDATE marketing_leads SET sourced_agent_code = :code WHERE id = :id`,
+        { code: agentCode, id: leadId },
+      );
+    } catch {
+      /* column may not exist until migration */
+    }
   }
+  return applied;
+}
+
+/**
+ * Soft-auth: stamp agent/employee attribution from Bearer token when present.
+ * Returns { body, agentUserId, employeeUserId }.
+ */
+async function attachAuthenticatedStaffAttribution(req, pool, body) {
+  try {
+    const auth = req.headers.authorization || '';
+    const token = auth.startsWith('Bearer ') ? auth.slice('Bearer '.length) : null;
+    if (!token) return { body, agentUserId: null, employeeUserId: null };
+    const payload = verifyAccessToken(token);
+    if (!payload?.sub) return { body, agentUserId: null, employeeUserId: null };
+    const [[profile]] = await pool.execute(
+      `SELECT id, role FROM user_profiles WHERE id = :id LIMIT 1`,
+      { id: payload.sub },
+    );
+    if (!profile) return { body, agentUserId: null, employeeUserId: null };
+
+    const role = String(profile.role || '').toLowerCase();
+    if (role === 'agent') {
+      const agentCode = normalizeAgentCode(await ensureAgentCodeForUser(pool, profile.id));
+      return {
+        body: {
+          ...body,
+          ...(agentCode ? { sourcedAgentCode: agentCode, agentCode } : {}),
+          source: body.source || 'agent_portal',
+        },
+        agentUserId: profile.id,
+        employeeUserId: null,
+      };
+    }
+
+    if (role === 'employee') {
+      return {
+        body: {
+          ...body,
+          source: body.source || 'employee_portal',
+        },
+        agentUserId: null,
+        employeeUserId: profile.id,
+      };
+    }
+
+    return { body, agentUserId: null, employeeUserId: null };
+  } catch {
+    return { body, agentUserId: null, employeeUserId: null };
+  }
+}
+
+/** @deprecated use attachAuthenticatedStaffAttribution */
+async function attachAuthenticatedAgentCode(req, pool, body) {
+  const result = await attachAuthenticatedStaffAttribution(req, pool, body);
+  return result;
 }
 
 leadsRouter.post('/', async (req, res, next) => {
   try {
-    const body = CreateLeadSchema.parse(req.body);
+    let body = CreateLeadSchema.parse(req.body);
     const pool = getPool();
+    const attached = await attachAuthenticatedStaffAttribution(req, pool, body);
+    body = attached.body;
+    const agentUserId = attached.agentUserId;
+    const employeeUserId = attached.employeeUserId;
     const fullName = body.fullName || body.full_name || '';
     const sessionKey = body.sessionKey || body.session_key || null;
+    const leadKind = String(body.leadKind || body.lead_kind || '').toLowerCase();
+    const source =
+      body.source
+      || (agentUserId ? 'agent_portal' : null)
+      || (employeeUserId && leadKind === 'agent' ? 'employee_agent_lead' : null)
+      || (employeeUserId ? 'employee_portal' : null)
+      || 'eligibility';
 
     const { row, created } = await upsertMarketingLead(pool, {
       fullName,
       email: body.email,
       phone: body.phone,
       loanType: body.loanType || body.loan_type || null,
-      source: body.source || 'eligibility',
+      source,
       consentAccepted: Boolean(body.consentAccepted || body.consent_accepted),
       sessionKey,
       status: 'new',
@@ -147,7 +224,85 @@ leadsRouter.post('/', async (req, res, next) => {
 
     await applyAgentCodeToLead(pool, row?.id, body);
 
-    res.status(created ? 201 : 200).json({ ...formatLead(row), created, updated: !created });
+    let assigneeId = body.assignedTo || body.assigned_to || null;
+    let stampAgentCode = normalizeAgentCode(
+      body.sourcedAgentCode || body.sourced_agent_code || body.agentCode,
+    );
+
+    // Agent portal create → assign to that agent.
+    if (agentUserId && row?.id) {
+      assigneeId = agentUserId;
+    }
+
+    // Employee creates:
+    // - customer lead → assign to employee
+    // - agent lead → assign to selected agent (+ stamp their code)
+    if (employeeUserId && row?.id) {
+      if (leadKind === 'agent') {
+        const selectedAgentId = body.agentUserId || body.agent_user_id || assigneeId;
+        if (selectedAgentId) {
+          const [[agentRow]] = await pool.execute(
+            `SELECT up.id, ao.agent_code
+             FROM user_profiles up
+             LEFT JOIN agent_onboarding ao ON ao.user_id = up.id
+             WHERE up.id = :id AND up.role = 'agent'
+             LIMIT 1`,
+            { id: selectedAgentId },
+          );
+          if (agentRow) {
+            assigneeId = agentRow.id;
+            stampAgentCode =
+              stampAgentCode
+              || normalizeAgentCode(await ensureAgentCodeForUser(pool, agentRow.id))
+              || normalizeAgentCode(agentRow.agent_code);
+          }
+        }
+      } else {
+        // Default customer lead captured by employee
+        assigneeId = assigneeId || employeeUserId;
+      }
+    }
+
+    if (row?.id && (assigneeId || stampAgentCode)) {
+      try {
+        await pool.execute(
+          `UPDATE marketing_leads
+           SET assigned_to = COALESCE(:assignee, assigned_to),
+               status = CASE WHEN :assignee IS NOT NULL THEN 'assigned' ELSE status END,
+               sourced_agent_code = COALESCE(:code, sourced_agent_code),
+               source = COALESCE(NULLIF(TRIM(source), ''), :source),
+               updated_at = NOW()
+           WHERE id = :id`,
+          {
+            id: row.id,
+            assignee: assigneeId || null,
+            code: stampAgentCode || null,
+            source,
+          },
+        );
+      } catch {
+        /* ignore */
+      }
+    }
+
+    const [[fresh]] = await pool.execute(
+      `SELECT ml.*,
+              up.full_name AS assignee_name,
+              up.role AS assignee_role,
+              COALESCE(ao.agent_code, eo.employee_code) AS assignee_code
+       FROM marketing_leads ml
+       LEFT JOIN user_profiles up ON up.id = ml.assigned_to
+       LEFT JOIN agent_onboarding ao ON ao.user_id = up.id AND up.role = 'agent'
+       LEFT JOIN employee_onboarding eo ON eo.user_id = up.id AND up.role = 'employee'
+       WHERE ml.id = :id`,
+      { id: row?.id },
+    );
+
+    res.status(created ? 201 : 200).json({
+      ...formatLead(fresh || row),
+      created,
+      updated: !created,
+    });
   } catch (err) {
     next(err);
   }
@@ -162,6 +317,47 @@ leadsRouter.get('/otp-settings', async (_req, res, next) => {
       smsProvider: settings.smsProvider,
       emailProvider: settings.emailProvider,
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** Agents list for employee lead capture (syncs attribution into Admin leads). */
+leadsRouter.get('/agent-options', authenticate, async (req, res, next) => {
+  try {
+    const role = req.auth.role;
+    if (
+      !canReadLeads(role)
+      && role !== 'agent'
+    ) {
+      const e = new Error('Insufficient permissions');
+      e.status = 403;
+      throw e;
+    }
+    await ensureOnboardingSchema();
+    const pool = getPool();
+    const [agents] = await pool.execute(
+      `SELECT up.id, up.full_name, up.email, up.account_status,
+              ao.agent_code, ao.username
+       FROM user_profiles up
+       LEFT JOIN agent_onboarding ao ON ao.user_id = up.id
+       WHERE up.role = 'agent'
+         AND COALESCE(up.is_active, TRUE) = TRUE
+       ORDER BY up.full_name ASC, up.email ASC`,
+    );
+    res.json(
+      (agents || []).map((row) => {
+        const code = row.agent_code || '—';
+        const name = row.full_name || row.email || 'Agent';
+        return {
+          id: row.id,
+          name,
+          code,
+          email: row.email,
+          label: `${code} — ${name}`,
+        };
+      }),
+    );
   } catch (err) {
     next(err);
   }
@@ -250,8 +446,10 @@ function effectiveOtpSettings(settings, otpResult) {
 /** Create/update lead and send OTP in one request (eligibility gate). */
 leadsRouter.post('/start-verification', async (req, res, next) => {
   try {
-    const body = CreateLeadSchema.parse(req.body);
+    let body = CreateLeadSchema.parse(req.body);
     const pool = getPool();
+    const attached = await attachAuthenticatedAgentCode(req, pool, body);
+    body = attached.body;
     const fullName = body.fullName || body.full_name || '';
     const sessionKey = body.sessionKey || body.session_key || null;
     const phone = String(body.phone).replace(/\D/g, '').slice(-10);
@@ -282,6 +480,10 @@ leadsRouter.post('/start-verification', async (req, res, next) => {
       emailOtp: otpResult.emailOtp,
     });
 
+    const [[fresh]] = await pool.execute(`SELECT * FROM marketing_leads WHERE id = :id`, {
+      id: row.id,
+    });
+
     res.status(200).json({
       ...formatOtpSendResponse({
         settings,
@@ -291,7 +493,7 @@ leadsRouter.post('/start-verification', async (req, res, next) => {
         warnings: otpResult.warnings,
         otpResult,
       }),
-      lead: formatLead(row),
+      lead: formatLead(fresh || row),
     });
   } catch (err) {
     next(err);
@@ -801,31 +1003,31 @@ leadsRouter.get('/', authenticate, async (req, res, next) => {
       if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(monthFilter)) {
         return res.status(400).json({ error: 'month must be in YYYY-MM format' });
       }
-      const monthStart = new Date(`${monthFilter}-01T00:00:00.000Z`);
-      const monthEnd = new Date(monthStart);
-      monthEnd.setUTCMonth(monthEnd.getUTCMonth() + 1);
-      where.push('ml.created_at >= :monthStart AND ml.created_at < :monthEnd');
-      params.monthStart = monthStart.toISOString();
-      params.monthEnd = monthEnd.toISOString();
+      // Calendar month in India time — matches the admin date pickers users expect.
+      where.push(
+        `to_char(GREATEST(ml.created_at, ml.updated_at) AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM') = :monthFilter`,
+      );
+      params.monthFilter = monthFilter;
     }
 
     if (dateFrom) {
-      const parsed = new Date(`${dateFrom}T00:00:00.000Z`);
-      if (Number.isNaN(parsed.getTime())) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateFrom)) {
         return res.status(400).json({ error: 'dateFrom must be in YYYY-MM-DD format' });
       }
-      where.push('ml.created_at >= :dateFrom');
-      params.dateFrom = parsed.toISOString();
+      where.push(
+        `(GREATEST(ml.created_at, ml.updated_at) AT TIME ZONE 'Asia/Kolkata')::date >= CAST(:dateFrom AS date)`,
+      );
+      params.dateFrom = dateFrom;
     }
 
     if (dateTo) {
-      const parsed = new Date(`${dateTo}T00:00:00.000Z`);
-      if (Number.isNaN(parsed.getTime())) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateTo)) {
         return res.status(400).json({ error: 'dateTo must be in YYYY-MM-DD format' });
       }
-      parsed.setUTCDate(parsed.getUTCDate() + 1);
-      where.push('ml.created_at < :dateToPlusOne');
-      params.dateToPlusOne = parsed.toISOString();
+      where.push(
+        `(GREATEST(ml.created_at, ml.updated_at) AT TIME ZONE 'Asia/Kolkata')::date <= CAST(:dateTo AS date)`,
+      );
+      params.dateTo = dateTo;
     }
     const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
     const limitSql = canManageLeads(role) ? 'LIMIT 5000' : 'LIMIT 200';
@@ -840,7 +1042,7 @@ leadsRouter.get('/', authenticate, async (req, res, next) => {
        LEFT JOIN agent_onboarding ao ON ao.user_id = up.id AND up.role = 'agent'
        LEFT JOIN employee_onboarding eo ON eo.user_id = up.id AND up.role = 'employee'
        ${whereSql}
-       ORDER BY ml.created_at DESC
+       ORDER BY GREATEST(ml.created_at, ml.updated_at) DESC
        ${limitSql}`,
       params,
     );
@@ -905,15 +1107,63 @@ leadsRouter.patch('/:id/assign', authenticate, async (req, res, next) => {
       e.status = 403;
       throw e;
     }
-    const assigneeId = req.body?.assignedTo || req.body?.assigned_to;
+    const assigneeId = req.body?.assignedTo || req.body?.assigned_to || null;
     const pool = getPool();
-    await pool.execute(
-      `UPDATE marketing_leads SET assigned_to = :assignee, status = 'assigned' WHERE id = :id`,
-      { id: req.params.id, assignee: assigneeId },
+
+    let sourcedAgentCode = null;
+    if (assigneeId) {
+      const [[assignee]] = await pool.execute(
+        `SELECT up.id, up.role, ao.agent_code
+         FROM user_profiles up
+         LEFT JOIN agent_onboarding ao ON ao.user_id = up.id
+         WHERE up.id = :id
+         LIMIT 1`,
+        { id: assigneeId },
+      );
+      if (!assignee) {
+        return res.status(400).json({ error: 'Assignee not found' });
+      }
+      if (String(assignee.role || '').toLowerCase() === 'agent') {
+        sourcedAgentCode =
+          (await ensureAgentCodeForUser(pool, assigneeId))
+          || String(assignee.agent_code || '').trim()
+          || null;
+      }
+    }
+
+    // Stamp sourced_agent_code when assigning to an agent so the lead appears
+    // in that agent's Client Pipeline (which keys off agent code + assigned_to).
+    if (assigneeId && sourcedAgentCode) {
+      await pool.execute(
+        `UPDATE marketing_leads
+         SET assigned_to = :assignee,
+             status = 'assigned',
+             sourced_agent_code = :code
+         WHERE id = :id`,
+        { id: req.params.id, assignee: assigneeId, code: sourcedAgentCode },
+      );
+    } else {
+      await pool.execute(
+        `UPDATE marketing_leads
+         SET assigned_to = :assignee,
+             status = CASE WHEN :assignee IS NULL THEN status ELSE 'assigned' END
+         WHERE id = :id`,
+        { id: req.params.id, assignee: assigneeId },
+      );
+    }
+
+    const [[row]] = await pool.execute(
+      `SELECT ml.*,
+              up.full_name AS assignee_name,
+              up.role AS assignee_role,
+              COALESCE(ao.agent_code, eo.employee_code) AS assignee_code
+       FROM marketing_leads ml
+       LEFT JOIN user_profiles up ON up.id = ml.assigned_to
+       LEFT JOIN agent_onboarding ao ON ao.user_id = up.id AND up.role = 'agent'
+       LEFT JOIN employee_onboarding eo ON eo.user_id = up.id AND up.role = 'employee'
+       WHERE ml.id = :id`,
+      { id: req.params.id },
     );
-    const [[row]] = await pool.execute(`SELECT * FROM marketing_leads WHERE id = :id`, {
-      id: req.params.id,
-    });
     res.json(formatLead(row));
   } catch (err) {
     next(err);
