@@ -219,16 +219,47 @@ const BANK_LIST_COLUMNS = `
 
 function slimProductData(rawData) {
   const d = parseProductData(rawData);
+  const listOrNull = (value) => {
+    if (Array.isArray(value)) return value.filter(Boolean);
+    if (typeof value === 'string' && value.trim()) {
+      try {
+        const parsed = JSON.parse(value);
+        if (Array.isArray(parsed)) return parsed.filter(Boolean);
+      } catch {
+        return value
+          .split('\n')
+          .map((s) => s.trim())
+          .filter(Boolean);
+      }
+    }
+    return value ?? null;
+  };
+
   return {
     loan_type: d.loan_type || d.loanType || d.type || d.productType || null,
+    product_category_slug:
+      d.product_category_slug || d.productCategorySlug || d.catalog_slug || d.catalogSlug || null,
+    catalog_api_key: d.catalog_api_key || d.catalogApiKey || null,
     interest_rate_min: d.interest_rate_min ?? d.interestRateMin ?? null,
     interest_rate_max: d.interest_rate_max ?? d.interestRateMax ?? null,
     processing_fee_percentage: d.processing_fee_percentage ?? d.processingFeePercentage ?? null,
     processing_fee_fixed: d.processing_fee_fixed ?? d.processingFeeFixed ?? null,
     other_charges: d.other_charges ?? d.otherCharges ?? d.other_fees ?? d.otherFees ?? null,
+    prepayment_charges: d.prepayment_charges ?? d.prepaymentCharges ?? null,
+    foreclosure_charges: d.foreclosure_charges ?? d.foreclosureCharges ?? null,
+    late_payment_charges: d.late_payment_charges ?? d.latePaymentCharges ?? null,
+    documentation_charges: d.documentation_charges ?? d.documentationCharges ?? null,
+    min_loan_amount: d.min_loan_amount ?? d.minLoanAmount ?? null,
     max_loan_amount: d.max_loan_amount ?? d.maxLoanAmount ?? null,
+    min_tenure_years: d.min_tenure_years ?? d.minTenureYears ?? null,
     max_tenure_years: d.max_tenure_years ?? d.maxTenureYears ?? null,
-    features: d.features ?? null,
+    disbursal_timeline: d.disbursal_timeline ?? d.disbursalTimeline ?? null,
+    collateral_required: d.collateral_required ?? d.collateralRequired ?? null,
+    apply_url: d.apply_url ?? d.applyUrl ?? null,
+    features: listOrNull(d.features),
+    eligibility_criteria: listOrNull(d.eligibility_criteria ?? d.eligibilityCriteria),
+    policies: listOrNull(d.policies),
+    documentation_required: listOrNull(d.documentation_required ?? d.documentationRequired),
   };
 }
 

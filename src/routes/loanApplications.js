@@ -23,6 +23,10 @@ import {
   fetchMarketplaceEnquiries,
   isMarketplaceProductFilter,
 } from '../lib/marketplaceEnquiries.js';
+import {
+  autoAssignApplicationsForEmployeeVerification,
+  fetchEmployeeOwnedApplicationIds,
+} from '../lib/employeeApplicationAssignment.js';
 
 export const loanApplicationsRouter = Router();
 
@@ -370,9 +374,17 @@ loanApplicationsRouter.get(
     try {
       await assertEmployeeAccess(req, 'applications', 'read');
       const pool = getPool();
-      const { where, params } = await buildListQuery(pool, req.auth.role, req.auth.userId, {});
+      const ownedIds = await fetchEmployeeOwnedApplicationIds(pool, req.auth.userId);
+      if (!ownedIds.size) {
+        return res.json([]);
+      }
+      const params = {};
+      const placeholders = Array.from(ownedIds).map((id, i) => {
+        params[`app${i}`] = id;
+        return `:app${i}`;
+      });
       const [rows] = await pool.execute(
-        `${LIST_SELECT} ${where} ORDER BY la.created_at DESC`,
+        `${LIST_SELECT} WHERE la.id IN (${placeholders.join(', ')}) ORDER BY la.created_at DESC`,
         params,
       );
       res.json(rows.map(formatApplication));
@@ -976,6 +988,8 @@ loanApplicationsRouter.patch(
               + `bank=${bank_approval_status || existing.bank_approval_status}`,
           },
         );
+        // Re-resolve responsible employee for the new stage (priority 1→2→3).
+        await autoAssignApplicationsForEmployeeVerification(pool);
       }
 
       const row = await fetchApplicationById(pool, req.params.id);

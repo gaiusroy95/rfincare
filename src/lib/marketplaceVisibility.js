@@ -11,6 +11,8 @@ const DEFAULT_VISIBILITY = {
   postOfficeMarketplace: true,
   governmentSchemesMarketplace: true,
   investmentMarketplace: true,
+  retirementPlanning: true,
+  wealthManagement: true,
 };
 
 function mapRow(row) {
@@ -24,6 +26,12 @@ function mapRow(row) {
     postOfficeMarketplace: Boolean(row.post_office_marketplace_enabled),
     governmentSchemesMarketplace: Boolean(row.government_schemes_marketplace_enabled),
     investmentMarketplace: Boolean(row.investment_marketplace_enabled),
+    retirementPlanning: row.retirement_planning_enabled == null
+      ? true
+      : Boolean(row.retirement_planning_enabled),
+    wealthManagement: row.wealth_management_enabled == null
+      ? true
+      : Boolean(row.wealth_management_enabled),
     updatedAt: row.updated_at || null,
   };
 }
@@ -45,10 +53,11 @@ export async function updateMarketplaceVisibility(input, updatedBy) {
        insurance_marketplace_enabled, mutual_fund_marketplace_enabled,
        fixed_income_marketplace_enabled, post_office_marketplace_enabled,
        government_schemes_marketplace_enabled, investment_marketplace_enabled,
+       retirement_planning_enabled, wealth_management_enabled,
        updated_by
      ) VALUES (
        :id, :bank_enabled, :cc_enabled, :insurance_enabled, :mf_enabled, :fi_enabled,
-       :po_enabled, :gov_enabled, :inv_enabled, :updated_by
+       :po_enabled, :gov_enabled, :inv_enabled, :retirement_enabled, :wealth_enabled, :updated_by
      )
      ON CONFLICT (id) DO UPDATE SET
        bank_marketplace_enabled = EXCLUDED.bank_marketplace_enabled,
@@ -59,6 +68,8 @@ export async function updateMarketplaceVisibility(input, updatedBy) {
        post_office_marketplace_enabled = EXCLUDED.post_office_marketplace_enabled,
        government_schemes_marketplace_enabled = EXCLUDED.government_schemes_marketplace_enabled,
        investment_marketplace_enabled = EXCLUDED.investment_marketplace_enabled,
+       retirement_planning_enabled = EXCLUDED.retirement_planning_enabled,
+       wealth_management_enabled = EXCLUDED.wealth_management_enabled,
        updated_by = EXCLUDED.updated_by,
        updated_at = CURRENT_TIMESTAMP`,
     {
@@ -71,6 +82,8 @@ export async function updateMarketplaceVisibility(input, updatedBy) {
       po_enabled: input.postOfficeMarketplace ? 1 : 0,
       gov_enabled: input.governmentSchemesMarketplace ? 1 : 0,
       inv_enabled: input.investmentMarketplace ? 1 : 0,
+      retirement_enabled: input.retirementPlanning !== false ? 1 : 0,
+      wealth_enabled: input.wealthManagement !== false ? 1 : 0,
       updated_by: updatedBy ?? null,
     },
   );

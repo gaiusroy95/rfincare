@@ -10,12 +10,12 @@ import { dispatchFileUpdateNotification } from '../lib/fileNotificationService.j
 import { ensureAgentCodeForUser } from '../lib/agentCode.js';
 import { sendStaffWelcomeEmail } from '../lib/email.js';
 import { sqlCastParam, sqlCoalescePatch } from '../lib/sqlCollation.js';
-import { newId } from '../lib/ids.js';
 import {
   assertEmployeeAccess,
   getEffectiveEmployeeAccess,
   requireEmployeeModuleAccess,
 } from '../lib/employeeAccessControls.js';
+import { autoAssignPendingAgentsToEmployees } from '../lib/employeeApplicationAssignment.js';
 
 export const portalEmployeeMilestone4Router = Router();
 
@@ -24,86 +24,6 @@ function requireEmployee(req) {
     const e = new Error('Employee access only');
     e.status = 403;
     throw e;
-  }
-}
-
-async function autoAssignPendingAgentsToEmployees(pool) {
-  const [pendingAgents] = await pool.execute(
-    `SELECT ao.user_id
-     FROM agent_onboarding ao
-     JOIN user_profiles up ON up.id = ao.user_id
-     WHERE CAST(ao.qc_status AS TEXT) IN ('pending_qc', 'qc_review')
-       AND up.role = 'agent'`,
-  );
-  if (!pendingAgents.length) return;
-
-  const pendingIds = pendingAgents.map((r) => r.user_id);
-  const params = {};
-  const pendingPlaceholders = pendingIds.map((id, i) => {
-    params[`aid${i}`] = id;
-    return `:aid${i}`;
-  });
-
-  const [existingMappings] = await pool.execute(
-    `SELECT agent_user_id, employee_user_id, is_primary
-     FROM agent_employee_hierarchy
-     WHERE agent_user_id IN (${pendingPlaceholders.join(', ')})`,
-    params,
-  );
-
-  const alreadyMappedAgents = new Set((existingMappings || []).map((r) => r.agent_user_id));
-  const unmappedAgentIds = pendingIds.filter((id) => !alreadyMappedAgents.has(id));
-  if (!unmappedAgentIds.length) return;
-
-  const [employees] = await pool.execute(
-    `SELECT id, email
-     FROM user_profiles
-     WHERE role = 'employee' AND is_active = TRUE
-     ORDER BY created_at ASC`,
-  );
-  if (!employees.length) return;
-
-  const [counts] = await pool.execute(
-    `SELECT employee_user_id, COUNT(*)::int AS c
-     FROM agent_employee_hierarchy
-     GROUP BY employee_user_id`,
-  );
-  const countMap = new Map((counts || []).map((r) => [r.employee_user_id, Number(r.c || 0)]));
-
-  const candidates = employees
-    .map((e) => ({ id: e.id, email: e.email || '', count: countMap.get(e.id) || 0 }))
-    .sort((a, b) => a.count - b.count || String(a.id).localeCompare(String(b.id)));
-
-  for (const agentUserId of unmappedAgentIds) {
-    candidates.sort((a, b) => a.count - b.count || String(a.id).localeCompare(String(b.id)));
-    const pick = candidates[0];
-    if (!pick) break;
-
-    // Extra safety against race conditions.
-    const [[exists]] = await pool.execute(
-      `SELECT id
-       FROM agent_employee_hierarchy
-       WHERE agent_user_id = :agent_user_id
-       LIMIT 1`,
-      { agent_user_id: agentUserId },
-    );
-    if (exists?.id) continue;
-
-    await pool.execute(
-      `INSERT INTO agent_employee_hierarchy
-       (id, agent_user_id, employee_user_id, communication_email, hierarchy_level, is_primary, notes, created_by)
-       VALUES
-       (:id, :agent_user_id, :employee_user_id, :communication_email, 1, 1, :notes, :created_by)`,
-      {
-        id: newId(),
-        agent_user_id: agentUserId,
-        employee_user_id: pick.id,
-        communication_email: pick.email,
-        notes: 'Auto-assigned for QC verification',
-        created_by: 'system:auto-assign',
-      },
-    );
-    pick.count += 1;
   }
 }
 

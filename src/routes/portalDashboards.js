@@ -26,6 +26,10 @@ import {
   mapLedgerEntryToCommission,
 } from '../lib/agentCommissionLedger.js';
 import { buildAgentRecentActivities } from '../lib/agentRecentActivities.js';
+import {
+  autoAssignApplicationsForEmployeeVerification,
+  fetchEmployeeOwnedApplicationIds,
+} from '../lib/employeeApplicationAssignment.js';
 
 export const portalDashboardsRouter = Router();
 
@@ -117,132 +121,6 @@ function mapLeadToPipelineClient(row) {
     createdAt: row.created_at || null,
     followUpAt: row.updated_at || row.created_at || null,
   };
-}
-
-function parseJsonSafe(value, fallback = {}) {
-  if (!value) return fallback;
-  if (typeof value === 'object') return value;
-  try {
-    return JSON.parse(value);
-  } catch {
-    return fallback;
-  }
-}
-
-function normalizeAgentCode(value) {
-  return String(value || '').trim().toLowerCase();
-}
-
-function stagePriorityOrder(row) {
-  const status = String(row?.status || '').toLowerCase();
-  const docStage = String(row?.document_stage_status || '').toLowerCase();
-  const bankStage = String(row?.bank_approval_status || '').toLowerCase();
-  if (['documents_pending', 'pending', 'uploaded', 'in_review'].includes(docStage)) return 1;
-  if (['submitted_to_bank', 'under_review', 'bank_review'].includes(bankStage)) return 2;
-  if (['approved', 'rejected', 'completed'].includes(status)) return 3;
-  if (['submitted', 'pending', 'under_review', 'draft'].includes(status)) return 1;
-  return 2;
-}
-
-function resolveResponsibleEmployeeIdForStage(app, hierarchyRows = []) {
-  if (!hierarchyRows.length) return app.assigned_employee_id || null;
-  const sorted = [...hierarchyRows].sort((a, b) => {
-    const la = Number(a.hierarchy_level || 999);
-    const lb = Number(b.hierarchy_level || 999);
-    if (la !== lb) return la - lb;
-    if (Boolean(a.is_primary) !== Boolean(b.is_primary)) return a.is_primary ? -1 : 1;
-    return String(a.employee_user_id || '').localeCompare(String(b.employee_user_id || ''));
-  });
-  const targetIdx = Math.max(0, Math.min(sorted.length - 1, stagePriorityOrder(app) - 1));
-  return sorted[targetIdx]?.employee_user_id || app.assigned_employee_id || null;
-}
-
-async function filterApplicationsForEmployeeByHierarchy(pool, employeeId, apps = []) {
-  const rows = Array.isArray(apps) ? apps : [];
-  if (!rows.length) return [];
-
-  const agentIds = [...new Set(rows.map((r) => r.agent_id).filter(Boolean))];
-  const appData = rows.map((r) => parseJsonSafe(r.data, {}));
-  const candidateCodes = [
-    ...new Set(
-      rows
-        .map((r, idx) =>
-          normalizeAgentCode(
-            r.sourced_agent_code
-              || appData[idx]?.sourced_agent_code
-              || appData[idx]?.sourcedAgentCode
-              || appData[idx]?.agent_code
-              || appData[idx]?.agentCode,
-          ),
-        )
-        .filter(Boolean),
-    ),
-  ];
-
-  const agentCodeToUser = new Map();
-  if (candidateCodes.length) {
-    const codeParams = {};
-    const codePlaceholders = candidateCodes.map((code, i) => {
-      codeParams[`code${i}`] = code;
-      return `:code${i}`;
-    });
-    const [codeRows] = await pool.execute(
-      `SELECT user_id, agent_code
-       FROM agent_onboarding
-       WHERE LOWER(TRIM(CAST(agent_code AS TEXT))) IN (${codePlaceholders.join(', ')})`,
-      codeParams,
-    );
-    for (const row of codeRows || []) {
-      agentCodeToUser.set(normalizeAgentCode(row.agent_code), row.user_id);
-      if (row.user_id) agentIds.push(row.user_id);
-    }
-  }
-
-  const uniqueAgentIds = [...new Set(agentIds.filter(Boolean))];
-  const hierarchyByAgent = new Map();
-  if (uniqueAgentIds.length) {
-    const hParams = {};
-    const hPlaceholders = uniqueAgentIds.map((id, i) => {
-      hParams[`aid${i}`] = id;
-      return `:aid${i}`;
-    });
-    const [hRows] = await pool.execute(
-      `SELECT agent_user_id, employee_user_id, hierarchy_level, is_primary
-       FROM agent_employee_hierarchy
-       WHERE agent_user_id IN (${hPlaceholders.join(', ')})`,
-      hParams,
-    );
-    for (const row of hRows || []) {
-      if (!hierarchyByAgent.has(row.agent_user_id)) hierarchyByAgent.set(row.agent_user_id, []);
-      hierarchyByAgent.get(row.agent_user_id).push(row);
-    }
-  }
-
-  const result = [];
-  for (let i = 0; i < rows.length; i += 1) {
-    const app = rows[i];
-    const data = appData[i];
-    const resolvedAgentId =
-      app.agent_id
-      || agentCodeToUser.get(
-        normalizeAgentCode(
-          app.sourced_agent_code
-            || data?.sourced_agent_code
-            || data?.sourcedAgentCode
-            || data?.agent_code
-            || data?.agentCode,
-        ),
-      )
-      || null;
-    const ownerId = resolveResponsibleEmployeeIdForStage(
-      app,
-      resolvedAgentId ? hierarchyByAgent.get(resolvedAgentId) || [] : [],
-    );
-    if (ownerId === employeeId || app.assigned_employee_id === employeeId) {
-      result.push(app);
-    }
-  }
-  return result;
 }
 
 portalDashboardsRouter.get('/agent/dashboard', authenticate, async (req, res, next) => {
@@ -785,34 +663,42 @@ portalDashboardsRouter.get('/employee/dashboard', authenticate, async (req, res,
     const employeeId = req.auth.userId;
     await ensureAgentLearningSchema();
 
-    const [rawApps] = await pool.execute(
-      `SELECT la.*, c.full_name AS customer_full_name
-       FROM loan_applications la
-       LEFT JOIN user_profiles c ON c.id = la.customer_id
-       WHERE la.assigned_employee_id = :id
-          OR EXISTS (
-            SELECT 1
-            FROM agent_employee_hierarchy h
-            LEFT JOIN agent_onboarding ao ON ao.user_id = h.agent_user_id
-            WHERE h.employee_user_id = :id
-              AND (
-                h.agent_user_id = la.agent_id
-                OR LOWER(TRIM(CAST(COALESCE(la.sourced_agent_code, '') AS TEXT))) = LOWER(TRIM(CAST(COALESCE(ao.agent_code, '') AS TEXT)))
-                OR LOWER(TRIM(CAST(COALESCE(la.data->>'sourced_agent_code', '') AS TEXT))) = LOWER(TRIM(CAST(COALESCE(ao.agent_code, '') AS TEXT)))
-                OR LOWER(TRIM(CAST(COALESCE(la.data->>'sourcedAgentCode', '') AS TEXT))) = LOWER(TRIM(CAST(COALESCE(ao.agent_code, '') AS TEXT)))
-                OR LOWER(TRIM(CAST(COALESCE(la.data->>'agent_code', '') AS TEXT))) = LOWER(TRIM(CAST(COALESCE(ao.agent_code, '') AS TEXT)))
-                OR LOWER(TRIM(CAST(COALESCE(la.data->>'agentCode', '') AS TEXT))) = LOWER(TRIM(CAST(COALESCE(ao.agent_code, '') AS TEXT)))
-              )
-          )
-       ORDER BY la.created_at DESC`,
-      { id: employeeId },
-    );
-    const apps = await filterApplicationsForEmployeeByHierarchy(pool, employeeId, rawApps);
+    await autoAssignApplicationsForEmployeeVerification(pool);
+    const ownedIds = await fetchEmployeeOwnedApplicationIds(pool, employeeId, { autoAssign: false });
 
-    const [[pendingDocs]] = await pool.execute(
-      `SELECT COUNT(*) AS c FROM customer_documents cd
-       WHERE COALESCE(cd.verification_status, cd.status, 'pending') IN ('pending','uploaded')`,
-    );
+    let apps = [];
+    if (ownedIds.size) {
+      const idParams = { id: employeeId };
+      const placeholders = Array.from(ownedIds).map((appId, i) => {
+        idParams[`oid${i}`] = appId;
+        return `:oid${i}`;
+      });
+      const [ownedApps] = await pool.execute(
+        `SELECT la.*, c.full_name AS customer_full_name
+         FROM loan_applications la
+         LEFT JOIN user_profiles c ON c.id = la.customer_id
+         WHERE la.id IN (${placeholders.join(', ')})
+         ORDER BY la.created_at DESC`,
+        idParams,
+      );
+      apps = ownedApps || [];
+    }
+
+    let pendingDocCount = 0;
+    if (ownedIds.size) {
+      const docParams = {};
+      const docPlaceholders = Array.from(ownedIds).map((appId, i) => {
+        docParams[`did${i}`] = appId;
+        return `:did${i}`;
+      });
+      const [[pendingDocs]] = await pool.execute(
+        `SELECT COUNT(*) AS c FROM customer_documents cd
+         WHERE cd.application_id IN (${docPlaceholders.join(', ')})
+           AND COALESCE(cd.verification_status, cd.status, 'pending') IN ('pending','uploaded')`,
+        docParams,
+      );
+      pendingDocCount = Number(pendingDocs?.c || 0);
+    }
 
     const [activities] = await pool.execute(
       `SELECT action_type, table_name, record_id, created_at
@@ -834,7 +720,7 @@ portalDashboardsRouter.get('/employee/dashboard', authenticate, async (req, res,
         pendingReview: canApplications
           ? apps.filter((a) => ['submitted', 'pending', 'under_review'].includes(a.status)).length
           : 0,
-        pendingDocuments: canDocuments ? Number(pendingDocs?.c || 0) : 0,
+        pendingDocuments: canDocuments ? pendingDocCount : 0,
         completedToday: canApplications
           ? apps.filter((a) => {
               if (!a.reviewed_at) return false;

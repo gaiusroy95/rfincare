@@ -191,6 +191,8 @@ const MarketplaceVisibilitySchema = z.object({
   postOfficeMarketplace: z.boolean(),
   governmentSchemesMarketplace: z.boolean(),
   investmentMarketplace: z.boolean(),
+  retirementPlanning: z.boolean().optional().default(true),
+  wealthManagement: z.boolean().optional().default(true),
 });
 
 cmsRouter.get('/site-contact', async (req, res, next) => {

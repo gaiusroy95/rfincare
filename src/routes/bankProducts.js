@@ -21,49 +21,48 @@ function parseProductJson(value) {
 function extractProductData(body = {}) {
   const src = body.data != null ? parseProductJson(body.data) : body;
   const merged = { ...src };
-  const keys = [
-    'loan_type',
-    'loanType',
-    'interest_rate_min',
-    'interestRateMin',
-    'interest_rate_max',
-    'interestRateMax',
-    'processing_fee_percentage',
-    'processingFeePercentage',
-    'processing_fee_fixed',
-    'processingFeeFixed',
-    'other_charges',
-    'otherCharges',
-    'max_loan_amount',
-    'maxLoanAmount',
-    'max_tenure_years',
-    'maxTenureYears',
-    'features',
-    'required_documents',
-    'requiredDocuments',
+
+  // Drop non-data envelope fields if the whole body was spread as src
+  delete merged.name;
+  delete merged.bank_id;
+  delete merged.bankId;
+  delete merged.is_active;
+  delete merged.isActive;
+  delete merged.id;
+  delete merged.data;
+
+  const aliasPairs = [
+    ['loanType', 'loan_type'],
+    ['productCategorySlug', 'product_category_slug'],
+    ['catalogApiKey', 'catalog_api_key'],
+    ['interestRateMin', 'interest_rate_min'],
+    ['interestRateMax', 'interest_rate_max'],
+    ['processingFeePercentage', 'processing_fee_percentage'],
+    ['processingFeeFixed', 'processing_fee_fixed'],
+    ['otherCharges', 'other_charges'],
+    ['prepaymentCharges', 'prepayment_charges'],
+    ['foreclosureCharges', 'foreclosure_charges'],
+    ['latePaymentCharges', 'late_payment_charges'],
+    ['documentationCharges', 'documentation_charges'],
+    ['maxLoanAmount', 'max_loan_amount'],
+    ['minLoanAmount', 'min_loan_amount'],
+    ['maxTenureYears', 'max_tenure_years'],
+    ['minTenureYears', 'min_tenure_years'],
+    ['disbursalTimeline', 'disbursal_timeline'],
+    ['collateralRequired', 'collateral_required'],
+    ['eligibilityCriteria', 'eligibility_criteria'],
+    ['documentationRequired', 'documentation_required'],
+    ['requiredDocuments', 'documentation_required'],
+    ['required_documents', 'documentation_required'],
+    ['applyUrl', 'apply_url'],
   ];
-  for (const key of keys) {
-    if (src[key] !== undefined) merged[key] = src[key];
+
+  for (const [camel, snake] of aliasPairs) {
+    if (merged[camel] !== undefined && merged[snake] === undefined) {
+      merged[snake] = merged[camel];
+    }
   }
-  if (merged.loanType && !merged.loan_type) merged.loan_type = merged.loanType;
-  if (merged.interestRateMin != null && merged.interest_rate_min == null) {
-    merged.interest_rate_min = merged.interestRateMin;
-  }
-  if (merged.interestRateMax != null && merged.interest_rate_max == null) {
-    merged.interest_rate_max = merged.interestRateMax;
-  }
-  if (merged.processingFeePercentage != null && merged.processing_fee_percentage == null) {
-    merged.processing_fee_percentage = merged.processingFeePercentage;
-  }
-  if (merged.otherCharges != null && merged.other_charges == null) {
-    merged.other_charges = merged.otherCharges;
-  }
-  if (merged.maxLoanAmount != null && merged.max_loan_amount == null) {
-    merged.max_loan_amount = merged.maxLoanAmount;
-  }
-  if (merged.maxTenureYears != null && merged.max_tenure_years == null) {
-    merged.max_tenure_years = merged.maxTenureYears;
-  }
+
   return merged;
 }
 

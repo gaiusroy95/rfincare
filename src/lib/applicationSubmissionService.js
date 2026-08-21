@@ -9,6 +9,7 @@ import { sendMsg91TransactionalSms } from './msg91.js';
 import { writeAuditLog } from './audit.js';
 import { createCustomerNotification } from '../routes/notifications.js';
 import { getUserNotificationPreferences } from './expoPushService.js';
+import { autoAssignApplicationsForEmployeeVerification } from './employeeApplicationAssignment.js';
 
 function parseJson(value) {
   if (!value) return {};
@@ -280,6 +281,12 @@ export async function finalizeApplicationSubmission({
     });
   } catch (err) {
     console.warn('[submission] audit log failed:', err.message);
+  }
+
+  try {
+    await autoAssignApplicationsForEmployeeVerification(pool);
+  } catch (err) {
+    console.warn('[submission] employee auto-assign failed:', err.message);
   }
 
   return {
