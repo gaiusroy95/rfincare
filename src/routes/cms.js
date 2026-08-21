@@ -552,8 +552,34 @@ cmsRouter.delete('/videos/:id', async (req, res, next) => {
 
 cmsRouter.get('/legal', async (req, res, next) => {
   try {
-    const [rows] = await getPool().query(`SELECT slug, title, updated_at FROM legal_pages ORDER BY slug`);
-    res.json(rows);
+    const [rows] = await getPool().query(
+      `SELECT slug, title, updated_at FROM legal_pages ORDER BY slug`,
+    );
+    res.json(
+      (rows || []).map((row) => ({
+        slug: row.slug,
+        title: row.title,
+        updatedAt: row.updated_at ?? row.updatedat ?? row.updatedAt ?? null,
+      })),
+    );
+  } catch (err) {
+    next(err);
+  }
+});
+
+cmsRouter.get('/legal/:slug', async (req, res, next) => {
+  try {
+    const [[row]] = await getPool().query(
+      `SELECT slug, title, body_html, updated_at FROM legal_pages WHERE slug = :slug`,
+      { slug: req.params.slug },
+    );
+    if (!row) return res.status(404).json({ error: 'Not found' });
+    res.json({
+      slug: row.slug,
+      title: row.title,
+      bodyHtml: row.body_html ?? row.bodyhtml ?? row.bodyHtml ?? '',
+      updatedAt: row.updated_at ?? row.updatedat ?? row.updatedAt ?? null,
+    });
   } catch (err) {
     next(err);
   }
@@ -563,13 +589,26 @@ cmsRouter.put('/legal/:slug', async (req, res, next) => {
   try {
     const { title, bodyHtml } = z.object({ title: z.string(), bodyHtml: z.string() }).parse(req.body);
     await getPool().execute(
-      `INSERT INTO legal_pages (slug, title, body_html, updated_by)
-       VALUES (:slug, :title, :body, :by) ON CONFLICT (slug) DO UPDATE SET title = EXCLUDED.title,
+      `INSERT INTO legal_pages (slug, title, body_html, updated_by, updated_at)
+       VALUES (:slug, :title, :body, :by, NOW())
+       ON CONFLICT (slug) DO UPDATE SET
+         title = EXCLUDED.title,
          body_html = EXCLUDED.body_html,
-         updated_by = EXCLUDED.updated_by`,
+         updated_by = EXCLUDED.updated_by,
+         updated_at = NOW()`,
       { slug: req.params.slug, title, body: bodyHtml, by: req.auth.userId },
     );
-    res.json({ ok: true });
+    const [[row]] = await getPool().query(
+      `SELECT slug, title, body_html, updated_at FROM legal_pages WHERE slug = :slug`,
+      { slug: req.params.slug },
+    );
+    res.json({
+      ok: true,
+      slug: row?.slug ?? req.params.slug,
+      title: row?.title ?? title,
+      bodyHtml: row?.body_html ?? row?.bodyhtml ?? bodyHtml,
+      updatedAt: row?.updated_at ?? row?.updatedat ?? null,
+    });
   } catch (err) {
     next(err);
   }

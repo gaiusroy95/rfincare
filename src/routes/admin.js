@@ -179,6 +179,10 @@ adminRouter.get(
          WHERE role = 'agent' AND is_active = TRUE AND account_status = 'active'`,
       );
 
+      const [[leadStats]] = await pool.execute(
+        `SELECT COUNT(*) AS total FROM marketing_leads`,
+      );
+
       const total = Number(appStats?.total || 0);
       const approved = Number(appStats?.approved || 0);
       const approvalRate =
@@ -189,6 +193,7 @@ adminRouter.get(
         pending_reviews: Number(appStats?.pending || 0),
         active_agents: Number(agentStats?.active_agents || 0),
         approval_rate: approvalRate,
+        total_leads: Number(leadStats?.total || 0),
       });
     } catch (err) {
       next(err);
