@@ -247,6 +247,13 @@ function slimProductData(rawData) {
     other_charges: d.other_charges ?? d.otherCharges ?? d.other_fees ?? d.otherFees ?? null,
     prepayment_charges: d.prepayment_charges ?? d.prepaymentCharges ?? null,
     foreclosure_charges: d.foreclosure_charges ?? d.foreclosureCharges ?? null,
+    foreclosure_fee_pct: d.foreclosure_fee_pct ?? d.foreclosureFeePct ?? null,
+    foreclosure_allowed_after_months:
+      d.foreclosure_allowed_after_months ?? d.foreclosureAllowedAfterMonths ?? null,
+    part_payment_fee_pct: d.part_payment_fee_pct ?? d.partPaymentFeePct ?? null,
+    bouncing_charges: d.bouncing_charges ?? d.bouncingCharges ?? null,
+    late_fee_pct: d.late_fee_pct ?? d.lateFeePct ?? null,
+    late_payment_fee_fixed: d.late_payment_fee_fixed ?? d.latePaymentFeeFixed ?? null,
     late_payment_charges: d.late_payment_charges ?? d.latePaymentCharges ?? null,
     documentation_charges: d.documentation_charges ?? d.documentationCharges ?? null,
     min_loan_amount: d.min_loan_amount ?? d.minLoanAmount ?? null,

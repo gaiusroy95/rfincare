@@ -9,6 +9,7 @@ import { ensureStaffMessagingSchema } from '../db/ensureStaffMessagingSchema.js'
 import { dispatchFileUpdateNotification } from '../lib/fileNotificationService.js';
 import { ensureAgentCodeForUser } from '../lib/agentCode.js';
 import { sendStaffWelcomeEmail } from '../lib/email.js';
+import { pullCibilForEmployee } from '../lib/cibilService.js';
 import { sqlCastParam, sqlCoalescePatch } from '../lib/sqlCollation.js';
 import {
   assertEmployeeAccess,
@@ -248,6 +249,40 @@ portalEmployeeMilestone4Router.post('/agent-onboarding/:userId/qc', async (req, 
   }
 });
 
+const EmployeeCibilPullSchema = z.object({
+  fullName: z.string().min(2, 'Name is required'),
+  fatherName: z.string().min(2, "Father's name is required"),
+  panNumber: z.string().regex(/^[A-Z]{5}[0-9]{4}[A-Z]$/i, 'Enter a valid PAN number'),
+  mobile: z.string().min(10, 'Mobile number is required'),
+  pincode: z.string().regex(/^\d{6}$/, 'Enter a valid 6-digit pincode'),
+  consentAccepted: z.literal(true, { errorMap: () => ({ message: 'Consent is required' }) }),
+});
+
+portalEmployeeMilestone4Router.post('/cibil/pull', async (req, res, next) => {
+  try {
+    requireEmployee(req);
+    if (req.auth.role === 'employee') {
+      await assertEmployeeAccess(req, 'applications', 'read');
+    }
+    const input = EmployeeCibilPullSchema.parse(req.body);
+    const phone = String(input.mobile).replace(/\D/g, '').slice(-10);
+    const result = await pullCibilForEmployee(
+      {
+        fullName: input.fullName.trim(),
+        fatherName: input.fatherName.trim(),
+        panNumber: input.panNumber.toUpperCase(),
+        mobile: phone,
+        pincode: input.pincode,
+        consentAccepted: true,
+      },
+      req.auth.userId,
+    );
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
 portalEmployeeMilestone4Router.get('/notifications', async (req, res, next) => {
   try {
     requireEmployee(req);
@@ -259,6 +294,131 @@ portalEmployeeMilestone4Router.get('/notifications', async (req, res, next) => {
       { uid: req.auth.userId },
     );
     res.json(rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+function mapEmployeeManagedAgent(row) {
+  return {
+    id: row.id,
+    agentName: row.agent_name || row.full_name,
+    agentCode: row.agent_code || null,
+    username: row.username || null,
+    email: row.email,
+    mobileNumber: row.mobile_number || row.phone,
+    accountStatus: row.account_status,
+    onboardingStatus: row.ao_status || row.onboarding_status,
+    isActive: Boolean(row.is_active),
+    createdAt: row.created_at,
+    totalApplications: Number(row.total_applications || 0),
+  };
+}
+
+portalEmployeeMilestone4Router.get('/agents', async (req, res, next) => {
+  try {
+    requireEmployee(req);
+    await assertEmployeeAccess(req, 'agents', 'read');
+    const pool = getPool();
+    const [rows] = await pool.execute(
+      `SELECT up.*,
+              ao.agent_code,
+              ao.username,
+              ao.agent_name,
+              ao.mobile_number,
+              ao.onboarding_status AS ao_status,
+              (SELECT COUNT(*) FROM loan_applications la WHERE la.agent_id = up.id) AS total_applications
+       FROM user_profiles up
+       LEFT JOIN agent_onboarding ao ON ao.user_id = up.id
+       WHERE up.role = 'agent'
+       ORDER BY up.created_at DESC
+       LIMIT 500`,
+    );
+    res.json(rows.map(mapEmployeeManagedAgent));
+  } catch (err) {
+    next(err);
+  }
+});
+
+portalEmployeeMilestone4Router.post('/agents', async (req, res, next) => {
+  try {
+    requireEmployee(req);
+    await assertEmployeeAccess(req, 'agents', 'write');
+    const { createAgentAccount } = await import('../lib/staffOnboarding.js');
+    const row = await createAgentAccount(req.body, req.auth.userId);
+    res.status(201).json(
+      mapEmployeeManagedAgent({
+        ...row,
+        agent_name: row.full_name || row.agent_name,
+        agent_code: row.agent_code,
+        ao_status: row.ao_status || row.onboarding_status,
+        total_applications: 0,
+      }),
+    );
+  } catch (err) {
+    next(err);
+  }
+});
+
+const AgentStatusSchema = z.object({
+  accountStatus: z.enum(['active', 'inactive', 'suspended', 'pending']),
+});
+
+portalEmployeeMilestone4Router.patch('/agents/:id/status', async (req, res, next) => {
+  try {
+    requireEmployee(req);
+    await assertEmployeeAccess(req, 'agents', 'write');
+    const input = AgentStatusSchema.parse({
+      accountStatus: req.body?.accountStatus ?? req.body?.account_status,
+    });
+    const { updateAgentDetails, fetchAgentDetail } = await import('../lib/adminStaffManage.js');
+    const detail = await updateAgentDetails(req.params.id, {
+      accountStatus: input.accountStatus,
+      onboardingStatus: input.accountStatus === 'active' ? 'active' : input.accountStatus,
+    });
+    res.json(detail || (await fetchAgentDetail(req.params.id)));
+  } catch (err) {
+    next(err);
+  }
+});
+
+portalEmployeeMilestone4Router.get('/agents/:id/reports', async (req, res, next) => {
+  try {
+    requireEmployee(req);
+    await assertEmployeeAccess(req, 'agents', 'read');
+    const {
+      buildAgentCommissionReport,
+      commissionReportToCsv,
+      commissionReportToPdf,
+    } = await import('../lib/commissionReportService.js');
+
+    const report = await buildAgentCommissionReport(req.params.id, {
+      from: req.query.from || null,
+      to: req.query.to || null,
+      applicationStatus: req.query.applicationStatus || 'all',
+      commissionStatus: req.query.commissionStatus || 'all',
+      loanType: req.query.loanType || 'all',
+    });
+
+    const format = String(req.query.format || 'json').toLowerCase();
+    if (format === 'csv' || format === 'xlsx' || format === 'excel') {
+      const csv = commissionReportToCsv(report);
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="agent-report-${req.params.id.slice(0, 8)}-${Date.now()}.csv"`,
+      );
+      return res.send(csv);
+    }
+    if (format === 'pdf') {
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="agent-report-${req.params.id.slice(0, 8)}-${Date.now()}.pdf"`,
+      );
+      return res.send(commissionReportToPdf(report));
+    }
+    res.json(report);
   } catch (err) {
     next(err);
   }

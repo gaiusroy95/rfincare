@@ -58,7 +58,7 @@ function humanizeSmtpError(err) {
   );
 }
 
-async function sendViaSmtp({ to, subject, text, html, attachments = [] }) {
+async function sendViaSmtp({ to, subject, text, html, attachments = [], cc }) {
   const nodemailer = await import('nodemailer');
   const pass = smtpPassword();
   const user = String(process.env.SMTP_USER || '').trim();
@@ -87,6 +87,7 @@ async function sendViaSmtp({ to, subject, text, html, attachments = [] }) {
   await transporter.sendMail({
     from: smtpFromAddress() || user,
     to,
+    cc: cc || undefined,
     subject,
     text,
     html: html || text,
@@ -94,7 +95,7 @@ async function sendViaSmtp({ to, subject, text, html, attachments = [] }) {
   });
 }
 
-export async function sendEmail({ to, subject, text, html, attachments }) {
+export async function sendEmail({ to, subject, text, html, attachments, cc }) {
   if (!to) return { sent: false, reason: 'no_recipient' };
 
   const mailAttachments = Array.isArray(attachments)
@@ -103,11 +104,19 @@ export async function sendEmail({ to, subject, text, html, attachments }) {
 
   if (smtpConfigured()) {
     try {
-      await sendViaSmtp({ to, subject, text, html, attachments: mailAttachments });
+      await sendViaSmtp({
+        to,
+        subject,
+        text,
+        html,
+        attachments: mailAttachments,
+        cc,
+      });
       return {
         sent: true,
         channel: 'smtp',
         attachmentCount: mailAttachments.length,
+        ccSupported: true,
       };
     } catch (err) {
       console.error('[email:smtp]', err?.message || err);
@@ -121,7 +130,7 @@ export async function sendEmail({ to, subject, text, html, attachments }) {
     }
   }
 
-  console.log('[email]', { to, subject }, process.env.LOG_OTP === 'true' ? text : '(body hidden)');
+  console.log('[email]', { to, cc, subject }, process.env.LOG_OTP === 'true' ? text : '(body hidden)');
   return {
     sent: false,
     channel: 'log',
@@ -271,6 +280,31 @@ export async function sendPartnerRejectionEmail({ email, fullName, reason }) {
     <p>Thank you for your partner application. We are unable to approve it at this time.</p>
     ${reason ? `<p><strong>Reason:</strong> ${reason}</p>` : ''}
     <p>Contact support if you have questions.</p>
+  `;
+
+  return sendEmail({ to: email, subject, text, html });
+}
+
+export async function sendEmployeeTerminationEmail({ email, fullName, reason, remarks }) {
+  const subject = 'Rfincare employee account terminated';
+  const text = [
+    `Hello ${fullName || email},`,
+    '',
+    'Your Rfincare employee account has been terminated and login access is now disabled.',
+    reason ? `\nReason: ${reason}` : '',
+    remarks ? `\nRemarks: ${remarks}` : '',
+    '',
+    'If you believe this was done in error, contact your administrator.',
+    '',
+    '— Rfincare Team',
+  ].join('\n');
+
+  const html = `
+    <p>Hello ${fullName || email},</p>
+    <p>Your <strong>Rfincare employee</strong> account has been terminated and login access is disabled.</p>
+    ${reason ? `<p><strong>Reason:</strong> ${reason}</p>` : ''}
+    ${remarks ? `<p><strong>Remarks:</strong> ${remarks}</p>` : ''}
+    <p>Contact your administrator if you have questions.</p>
   `;
 
   return sendEmail({ to: email, subject, text, html });

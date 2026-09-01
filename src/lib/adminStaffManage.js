@@ -2,7 +2,7 @@ import bcrypt from 'bcryptjs';
 
 import { getPool } from '../db/pool.js';
 import { ensureOnboardingSchema } from '../db/ensureOnboardingSchema.js';
-import { sendStaffWelcomeEmail } from './email.js';
+import { sendStaffWelcomeEmail, sendEmployeeTerminationEmail } from './email.js';
 import { ensureAgentCodeForUser } from './agentCode.js';
 import { sqlCastParam, sqlCoalescePatch, sqlLiteralEquals, sqlParamEqualsLower } from './sqlCollation.js';
 
@@ -251,6 +251,66 @@ export async function updateEmployeeDetails(userId, body) {
       onboarding_status: onboardingStatus || null,
     },
   );
+
+  return fetchEmployeeDetail(userId);
+}
+
+export async function terminateEmployee(userId, { reason, remarks, terminatedBy } = {}) {
+  if (!reason || String(reason).trim().length < 2) {
+    const e = new Error('Termination reason is required');
+    e.status = 400;
+    throw e;
+  }
+  await ensureOnboardingSchema();
+  const detail = await fetchEmployeeDetail(userId);
+  const pool = getPool();
+  const reasonText = String(reason).trim();
+  const remarksText = remarks ? String(remarks).trim() : '';
+
+  await pool.execute(
+    `UPDATE user_profiles SET
+       account_status = 'inactive',
+       onboarding_status = 'inactive',
+       is_active = FALSE
+     WHERE id = :id AND ${sqlLiteralEquals('role', 'employee')}`,
+    { id: userId },
+  );
+
+  try {
+    await pool.execute(
+      `UPDATE employee_onboarding SET
+         onboarding_status = 'inactive',
+         termination_reason = :reason,
+         termination_remarks = :remarks,
+         terminated_at = NOW(),
+         terminated_by = :by
+       WHERE user_id = :id`,
+      {
+        id: userId,
+        reason: reasonText,
+        remarks: remarksText || null,
+        by: terminatedBy || null,
+      },
+    );
+  } catch (err) {
+    // Pre-migration fallback: still deactivate onboarding row
+    await pool.execute(
+      `UPDATE employee_onboarding SET onboarding_status = 'inactive' WHERE user_id = :id`,
+      { id: userId },
+    );
+    if (!String(err?.message || '').includes('termination_')) {
+      console.warn('[terminate-employee]', err.message);
+    }
+  }
+
+  if (detail.email) {
+    await sendEmployeeTerminationEmail({
+      email: detail.email,
+      fullName: detail.employeeName || detail.fullName,
+      reason: reasonText,
+      remarks: remarksText,
+    }).catch((err) => console.warn('[employee-termination-email]', err.message));
+  }
 
   return fetchEmployeeDetail(userId);
 }

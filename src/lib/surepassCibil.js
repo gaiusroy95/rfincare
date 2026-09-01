@@ -107,15 +107,18 @@ function formatMobile(value) {
   return String(value || '').replace(/\D/g, '').slice(-10);
 }
 
-export function buildSurepassCibilBody({ name, pan, mobile, dob, gender, consent = true }) {
+export function buildSurepassCibilBody({ name, pan, mobile, dob, gender, fatherName, pincode, consent = true }) {
   const panNumber = String(pan || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
   const mobileNo = formatMobile(mobile);
   const fullName = String(name || '').trim();
   const dateOfBirth = formatDob(dob);
   const genderValue = formatGender(gender);
+  const father = String(fatherName || '').trim();
+  const pin = String(pincode || '').replace(/\D/g, '').slice(0, 6);
   return {
     name: fullName,
     full_name: fullName,
+    father_name: father || undefined,
     pan: panNumber,
     pan_number: panNumber,
     id_number: panNumber,
@@ -125,6 +128,8 @@ export function buildSurepassCibilBody({ name, pan, mobile, dob, gender, consent
     dob: dateOfBirth,
     date_of_birth: dateOfBirth,
     gender: genderValue,
+    pincode: pin || undefined,
+    pin_code: pin || undefined,
     consent: consent ? 'Y' : 'N',
     consent_text: 'I hereby authorize Rfincare and its bureau partner to fetch my credit information.',
   };

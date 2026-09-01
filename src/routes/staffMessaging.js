@@ -101,10 +101,12 @@ async function fetchHierarchyMapping(pool, agentUserId, employeeUserId = null) {
   const [rows] = await pool.execute(
     `SELECT h.*,
             ag.full_name AS agent_name, ag.email AS agent_email,
-            em.full_name AS employee_name, em.email AS employee_email
+            em.full_name AS employee_name, em.email AS employee_email,
+            COALESCE(eo.mobile_number, em.phone) AS employee_phone
      FROM agent_employee_hierarchy h
      LEFT JOIN user_profiles ag ON ag.id = h.agent_user_id
      LEFT JOIN user_profiles em ON em.id = h.employee_user_id
+     LEFT JOIN employee_onboarding eo ON eo.user_id = h.employee_user_id
      WHERE h.agent_user_id = :agentUserId${extra}
      ORDER BY h.is_primary DESC, h.hierarchy_level ASC, h.created_at ASC`,
     params,
@@ -456,6 +458,197 @@ adminHierarchyRouter.delete(
   },
 );
 
+const HIERARCHY_CSV_HEADER =
+  'agent_code,agent_name,location,level1_name,level1_email,level1_mobile,level2_name,level2_email,level2_mobile,level3_name,level3_email,level3_mobile,office_address';
+
+adminHierarchyRouter.get(
+  '/template.csv',
+  authenticate,
+  authorize({ resource: 'agents', action: 'read' }),
+  async (_req, res) => {
+    const sample = [
+      HIERARCHY_CSV_HEADER,
+      'AG001,Sample Agent,Mumbai,L1 Manager,l1@example.com,9876543210,L2 Manager,l2@example.com,9876543211,L3 Manager,l3@example.com,9876543212,Head Office',
+    ].join('\n');
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="escalation-matrix-template.csv"');
+    res.send(sample);
+  },
+);
+
+adminHierarchyRouter.post(
+  '/import.csv',
+  authenticate,
+  authorize({ resource: 'agents', action: 'update' }),
+  async (req, res, next) => {
+    try {
+      await ensureStaffMessagingSchema();
+      const raw = String(req.body?.csv || req.body?.content || '');
+      if (!raw.trim()) {
+        return res.status(400).json({ error: 'CSV content is required (field: csv)' });
+      }
+      const lines = raw
+        .replace(/^\uFEFF/, '')
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter(Boolean);
+      if (lines.length < 2) {
+        return res.status(400).json({ error: 'CSV must include a header and at least one data row' });
+      }
+
+      const parseRow = (line) => {
+        const cols = [];
+        let cur = '';
+        let inQ = false;
+        for (let i = 0; i < line.length; i += 1) {
+          const ch = line[i];
+          if (ch === '"') {
+            inQ = !inQ;
+            continue;
+          }
+          if (ch === ',' && !inQ) {
+            cols.push(cur.trim());
+            cur = '';
+            continue;
+          }
+          cur += ch;
+        }
+        cols.push(cur.trim());
+        return cols;
+      };
+
+      const header = parseRow(lines[0]).map((h) => h.toLowerCase().replace(/\s+/g, '_'));
+      const idx = (name) => header.indexOf(name);
+      const pool = getPool();
+      const results = { created: 0, updated: 0, skipped: 0, errors: [] };
+
+      const resolveEmployee = async (email, name) => {
+        const em = String(email || '').trim().toLowerCase();
+        if (!em) return null;
+        const [[byEmail]] = await pool.execute(
+          `SELECT id, email FROM user_profiles WHERE LOWER(email) = :email AND role = 'employee' LIMIT 1`,
+          { email: em },
+        );
+        if (byEmail) return byEmail;
+        if (name) {
+          const [[byName]] = await pool.execute(
+            `SELECT id, email FROM user_profiles WHERE LOWER(full_name) = LOWER(:name) AND role = 'employee' LIMIT 1`,
+            { name: String(name).trim() },
+          );
+          return byName || null;
+        }
+        return null;
+      };
+
+      const upsertLevel = async (agentUserId, employee, level, isPrimary, location, officeAddress) => {
+        const [[existing]] = await pool.execute(
+          `SELECT id FROM agent_employee_hierarchy
+           WHERE agent_user_id = :agent AND employee_user_id = :emp LIMIT 1`,
+          { agent: agentUserId, emp: employee.id },
+        );
+        const notes = [location && `Location: ${location}`, officeAddress && `Office: ${officeAddress}`]
+          .filter(Boolean)
+          .join(' | ') || null;
+        if (isPrimary) {
+          await pool.execute(
+            `UPDATE agent_employee_hierarchy SET is_primary = 0 WHERE agent_user_id = :agentId`,
+            { agentId: agentUserId },
+          );
+        }
+        if (existing) {
+          await pool.execute(
+            `UPDATE agent_employee_hierarchy SET
+              communication_email = :email,
+              hierarchy_level = :level,
+              is_primary = :primary,
+              notes = COALESCE(:notes, notes)
+             WHERE id = :id`,
+            {
+              id: existing.id,
+              email: employee.email,
+              level,
+              primary: isPrimary ? 1 : 0,
+              notes,
+            },
+          );
+          results.updated += 1;
+        } else {
+          await pool.execute(
+            `INSERT INTO agent_employee_hierarchy
+             (id, agent_user_id, employee_user_id, communication_email, hierarchy_level, is_primary, notes, created_by)
+             VALUES (:id, :agent, :emp, :email, :level, :primary, :notes, :created_by)`,
+            {
+              id: newId(),
+              agent: agentUserId,
+              emp: employee.id,
+              email: employee.email,
+              level,
+              primary: isPrimary ? 1 : 0,
+              notes,
+              created_by: req.auth.userId,
+            },
+          );
+          results.created += 1;
+        }
+      };
+
+      for (let i = 1; i < lines.length; i += 1) {
+        const cols = parseRow(lines[i]);
+        const get = (name) => {
+          const j = idx(name);
+          return j >= 0 ? cols[j] || '' : '';
+        };
+        const agentCode = get('agent_code');
+        if (!agentCode) {
+          results.skipped += 1;
+          results.errors.push({ row: i + 1, error: 'Missing agent_code' });
+          continue;
+        }
+        const [[agent]] = await pool.execute(
+          `SELECT ao.user_id AS id FROM agent_onboarding ao WHERE UPPER(ao.agent_code) = UPPER(:code) LIMIT 1`,
+          { code: agentCode },
+        );
+        if (!agent?.id) {
+          results.skipped += 1;
+          results.errors.push({ row: i + 1, error: `Unknown agent_code ${agentCode}` });
+          continue;
+        }
+
+        const location = get('location');
+        const officeAddress = get('office_address');
+        const levels = [
+          { level: 1, name: get('level1_name'), email: get('level1_email'), mobile: get('level1_mobile') },
+          { level: 2, name: get('level2_name'), email: get('level2_email'), mobile: get('level2_mobile') },
+          { level: 3, name: get('level3_name'), email: get('level3_email'), mobile: get('level3_mobile') },
+        ];
+
+        let primarySet = false;
+        for (const lv of levels) {
+          if (!lv.email && !lv.name) continue;
+          const emp = await resolveEmployee(lv.email, lv.name);
+          if (!emp) {
+            results.errors.push({
+              row: i + 1,
+              error: `Level ${lv.level} employee not found (${lv.email || lv.name})`,
+            });
+            continue;
+          }
+          await upsertLevel(agent.id, emp, lv.level, !primarySet, location, officeAddress);
+          primarySet = true;
+        }
+        if (!primarySet) {
+          results.skipped += 1;
+          results.errors.push({ row: i + 1, error: 'No valid L1/L2/L3 employees on row' });
+        }
+      }
+
+      res.json(results);
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
 // ——— Portal communication (agent + employee) ———
 
 staffCommunicationRouter.use(authenticate);
@@ -523,6 +716,8 @@ staffCommunicationRouter.get('/context', async (req, res, next) => {
       hierarchy: hierarchyRows.map((r) => ({
         employeeUserId: r.employee_user_id,
         employeeName: r.employee_name,
+        employeeEmail: r.employee_email,
+        employeePhone: r.employee_phone || null,
         communicationEmail: r.communication_email,
         hierarchyLevel: r.hierarchy_level,
         isPrimary: Boolean(r.is_primary),

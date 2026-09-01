@@ -105,12 +105,33 @@ function formatDocumentRow(row) {
         ? row.document_url
         : null;
   const verificationStatus = normalizeDocStatus(row);
+  let ocrPayload = row.ocr_payload;
+  if (typeof ocrPayload === 'string') {
+    try {
+      ocrPayload = JSON.parse(ocrPayload);
+    } catch {
+      ocrPayload = null;
+    }
+  }
   return {
     ...row,
     mime_type: mimeType,
+    mimeType,
     verification_status: verificationStatus,
     status: verificationStatus,
     preview_url: previewUrl,
+    documentType: row.document_type,
+    documentName: row.document_name,
+    ocr_payload: ocrPayload,
+    ocrPayload,
+    ocr_status: row.ocr_status,
+    ocrStatus: row.ocr_status,
+    ocr_suggestion: row.ocr_suggestion,
+    ocrSuggestion: row.ocr_suggestion,
+    ocr_confidence: row.ocr_confidence,
+    ocrConfidence: row.ocr_confidence,
+    ocr_engine: row.ocr_engine,
+    ocrEngine: row.ocr_engine,
   };
 }
 
@@ -598,6 +619,28 @@ const VerifyDocumentSchema = z.object({
   verification_notes: z.string().optional(),
   verificationNotes: z.string().optional(),
 });
+
+documentsRouter.post(
+  '/:id/ocr',
+  authenticate,
+  authorize({ resource: 'documents', action: 'update' }),
+  async (req, res, next) => {
+    try {
+      if (!isStaffRole(req.auth.role) || isAgentRole(req.auth.role)) {
+        const e = new Error('Insufficient permissions');
+        e.status = 403;
+        throw e;
+      }
+      const { runDocumentOcr } = await import('../lib/documentOcr.js');
+      const profile = req.body?.profile || {};
+      const extractedText = req.body?.extractedText || req.body?.text || null;
+      const result = await runDocumentOcr(req.params.id, { profile, extractedText });
+      res.json({ data: result });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
 
 documentsRouter.patch(
   '/:id/verification',

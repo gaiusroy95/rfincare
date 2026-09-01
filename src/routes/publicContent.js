@@ -5,7 +5,6 @@ import multer from 'multer';
 import { z } from 'zod';
 import { getPool } from '../db/pool.js';
 import { newId } from '../lib/ids.js';
-import { calculateEligibility } from '../lib/eligibilityEngine.js';
 import { generateOtp, hashOtp, sendOtpNotification } from '../lib/otp.js';
 import { getSiteContactSettings } from '../lib/siteContactSettings.js';
 import { getHomepageTrustContent } from '../lib/homepageTrustContent.js';
@@ -267,30 +266,11 @@ publicContentRouter.post('/cibil/check', async (req, res, next) => {
   }
 });
 
-publicContentRouter.post('/eligibility/calculate', async (req, res, next) => {
-  try {
-    const EligibilityInputSchema = z.object({
-      loanType: z.string().min(1, 'Loan type is required'),
-      loanAmount: z.coerce.number().positive('Loan amount must be greater than zero').max(1e12),
-      monthlyIncome: z.coerce.number().positive('Monthly income must be greater than zero').max(1e12),
-      employmentType: z.string().min(1, 'Employment type is required'),
-      creditScore: z.string().optional(),
-      creditScoreRange: z.string().optional(),
-      existingLoans: z.coerce.number().min(0).max(1e12).optional().default(0),
-      collateralValue: z.coerce.number().min(0).max(1e12).optional(),
-      propertyValue: z.coerce.number().min(0).max(1e12).optional(),
-      loanPurpose: z.string().optional(),
-    }).refine((data) => data.creditScore || data.creditScoreRange, {
-      message: 'Credit score range is required',
-      path: ['creditScore'],
-    });
-
-    const input = EligibilityInputSchema.parse(req.body);
-    const result = await calculateEligibility(input);
-    res.json(result);
-  } catch (err) {
-    next(err);
-  }
+publicContentRouter.post('/eligibility/calculate', async (req, res) => {
+  res.status(401).json({
+    error: 'Authentication required. Sign in as a customer to view eligibility results.',
+    code: 'ELIGIBILITY_AUTH_REQUIRED',
+  });
 });
 
 const OtpRequestSchema = z.object({

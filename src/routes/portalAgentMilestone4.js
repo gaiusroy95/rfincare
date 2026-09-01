@@ -61,13 +61,14 @@ portalAgentMilestone4Router.get('/commission-report', async (req, res, next) => 
     });
 
     const format = String(req.query.format || 'json').toLowerCase();
-    if (format === 'csv') {
-      res.setHeader('Content-Type', 'text/csv');
+    if (format === 'csv' || format === 'xlsx' || format === 'excel') {
+      const csv = commissionReportToCsv(report);
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
       res.setHeader(
         'Content-Disposition',
         `attachment; filename="commission-report-${Date.now()}.csv"`,
       );
-      return res.send(commissionReportToCsv(report));
+      return res.send(csv);
     }
     if (format === 'pdf') {
       res.setHeader('Content-Type', 'application/pdf');

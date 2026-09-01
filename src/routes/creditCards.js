@@ -59,9 +59,23 @@ function toBool(value) {
   return false;
 }
 
+function parseRewardRules(value) {
+  if (!value) return null;
+  if (typeof value === 'object') return value;
+  if (typeof value === 'string') {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 function formatCardRow(row) {
   const categories = parseCategories(row.categories);
   const rewardPoints = row.reward_points ? String(row.reward_points).trim() : null;
+  const rewardRules = parseRewardRules(row.reward_rules);
   return {
     id: row.id,
     bankId: row.bank_id || null,
@@ -74,6 +88,10 @@ function formatCardRow(row) {
     categories,
     annualFee: row.annual_fee != null ? Number(row.annual_fee) : null,
     joiningFee: row.joining_fee != null ? Number(row.joining_fee) : null,
+    annualFeeWaiverSpendThreshold:
+      row.annual_fee_waiver_spend_threshold != null
+        ? Number(row.annual_fee_waiver_spend_threshold)
+        : rewardRules?.fees?.annual_fee_waiver_spend_threshold ?? null,
     interestRate: row.interest_rate != null ? Number(row.interest_rate) : null,
     latePaymentFee: row.late_payment_fee,
     otherCharges: row.other_charges,
@@ -82,6 +100,7 @@ function formatCardRow(row) {
     benefits: parseJsonList(row.benefits),
     rewardPoints,
     hasRewardPoints: Boolean(rewardPoints),
+    rewardRules,
     loungeAccess: toBool(row.lounge_access),
     loungeAccessDetails: row.lounge_access_details || null,
     fuelSurchargeWaiver: toBool(row.fuel_surcharge_waiver),
@@ -181,6 +200,8 @@ const CardSchema = z.object({
   latePaymentFee: z.string().optional().nullable(),
   otherCharges: z.string().optional().nullable(),
   rewardPoints: z.string().optional().nullable(),
+  annualFeeWaiverSpendThreshold: z.coerce.number().optional().nullable(),
+  rewardRules: z.any().optional().nullable(),
   loungeAccess: z.coerce.boolean().optional(),
   loungeAccessDetails: z.string().optional().nullable(),
   fuelSurchargeWaiver: z.coerce.boolean().optional(),
@@ -218,6 +239,8 @@ function normalizeBody(body) {
     advantages: JSON.stringify(parseJsonList(parsed.advantages)),
     benefits: JSON.stringify(parseJsonList(parsed.benefits)),
     reward_points: parsed.rewardPoints?.trim() || null,
+    annual_fee_waiver_spend_threshold: parsed.annualFeeWaiverSpendThreshold ?? null,
+    reward_rules: parsed.rewardRules != null ? JSON.stringify(parsed.rewardRules) : null,
     lounge_access: parsed.loungeAccess ?? false,
     lounge_access_details: parsed.loungeAccessDetails?.trim() || null,
     fuel_surcharge_waiver: parsed.fuelSurchargeWaiver ?? false,
@@ -404,7 +427,8 @@ creditCardsRouter.post(
           id, bank_id, bank_name, name, slug, description, logo_url, card_network,
           categories, annual_fee, joining_fee, interest_rate, late_payment_fee, other_charges,
           features, advantages, benefits,
-          reward_points, lounge_access, lounge_access_details,
+          reward_points, annual_fee_waiver_spend_threshold, reward_rules,
+          lounge_access, lounge_access_details,
           fuel_surcharge_waiver, movie_benefits, movie_benefits_details,
           dining_benefits, dining_benefits_details, insurance_cover, insurance_cover_details,
           forex_charges, emi_conversion, emi_conversion_details,
@@ -413,7 +437,8 @@ creditCardsRouter.post(
           :id, :bank_id, :bank_name, :name, :slug, :description, :logo_url, :card_network,
           :categories::jsonb, :annual_fee, :joining_fee, :interest_rate, :late_payment_fee, :other_charges,
           :features, :advantages, :benefits,
-          :reward_points, :lounge_access, :lounge_access_details,
+          :reward_points, :annual_fee_waiver_spend_threshold, :reward_rules::jsonb,
+          :lounge_access, :lounge_access_details,
           :fuel_surcharge_waiver, :movie_benefits, :movie_benefits_details,
           :dining_benefits, :dining_benefits_details, :insurance_cover, :insurance_cover_details,
           :forex_charges, :emi_conversion, :emi_conversion_details,
@@ -463,6 +488,8 @@ creditCardsRouter.put(
           advantages = :advantages,
           benefits = :benefits,
           reward_points = :reward_points,
+          annual_fee_waiver_spend_threshold = :annual_fee_waiver_spend_threshold,
+          reward_rules = :reward_rules::jsonb,
           lounge_access = :lounge_access,
           lounge_access_details = :lounge_access_details,
           fuel_surcharge_waiver = :fuel_surcharge_waiver,

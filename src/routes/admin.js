@@ -25,6 +25,7 @@ import {
   updateAgentDetails,
   updateEmployeeDetails,
   resetStaffPassword,
+  terminateEmployee,
 } from '../lib/adminStaffManage.js';
 import { parseCsvToRows } from '../lib/parseCsv.js';
 import { buildFunnelAnalytics, buildProductConversionRows } from '../lib/funnelAnalytics.js';
@@ -552,6 +553,37 @@ adminRouter.patch(
 );
 
 adminRouter.post(
+  '/employees/:id/terminate',
+  authenticate,
+  authorize({ resource: 'employees', action: 'update' }),
+  async (req, res, next) => {
+    try {
+      const reason = req.body?.reason || req.body?.terminationReason;
+      const remarks = req.body?.remarks || req.body?.terminationRemarks || '';
+      const detail = await terminateEmployee(req.params.id, {
+        reason,
+        remarks,
+        terminatedBy: req.auth.userId,
+      });
+      await writeAuditLog({
+        userId: req.auth.userId,
+        actionType: 'update',
+        tableName: 'employee_onboarding',
+        recordId: req.params.id,
+        newValues: {
+          scope: 'admin_employee_terminate',
+          reason,
+          remarks,
+        },
+      });
+      res.json(detail);
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+adminRouter.post(
   '/employees/:id/reset-password',
   authenticate,
   authorize({ resource: 'employees', action: 'update' }),
@@ -802,6 +834,88 @@ adminRouter.patch(
       });
 
       res.json(mapCustomerRow(row));
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+adminRouter.delete(
+  '/customers/:id',
+  authenticate,
+  authorize({ resource: 'customers', action: 'manage' }),
+  async (req, res, next) => {
+    try {
+      await ensureMilestone3Schema();
+      const pool = getPool();
+      const [[before]] = await pool.execute(
+        `SELECT * FROM user_profiles WHERE id = :id AND role = 'customer' LIMIT 1`,
+        { id: req.params.id },
+      );
+      if (!before) {
+        const e = new Error('Customer not found');
+        e.status = 404;
+        throw e;
+      }
+
+      const [[apps]] = await pool.execute(
+        `SELECT COUNT(*)::int AS c FROM loan_applications WHERE customer_id = :id`,
+        { id: req.params.id },
+      );
+      const appCount = Number(apps?.c || 0);
+      const hardDelete = req.query.hard === '1' || req.body?.hard === true;
+
+      if (hardDelete && appCount > 0) {
+        const e = new Error(
+          'Cannot hard-delete a customer with applications. Deactivate/anonymize instead, or archive applications first.',
+        );
+        e.status = 409;
+        throw e;
+      }
+
+      if (hardDelete) {
+        await pool.execute(`DELETE FROM auth_users WHERE id = :id`, { id: req.params.id });
+        await writeAuditLog({
+          userId: req.auth.userId,
+          actionType: 'delete',
+          tableName: 'user_profiles',
+          recordId: req.params.id,
+          oldValues: { email: before.email, full_name: before.full_name, hard: true },
+        });
+        return res.json({ success: true, mode: 'hard_deleted' });
+      }
+
+      const anonEmail = `deleted+${req.params.id.slice(0, 8)}@rfincare.deleted`;
+      await pool.execute(
+        `UPDATE user_profiles SET
+           full_name = 'Deleted Customer',
+           email = :email,
+           phone = NULL,
+           avatar_url = NULL,
+           is_active = FALSE,
+           account_status = 'deleted'
+         WHERE id = :id AND role = 'customer'`,
+        { id: req.params.id, email: anonEmail },
+      );
+      try {
+        await pool.execute(`UPDATE auth_users SET email = :email WHERE id = :id`, {
+          id: req.params.id,
+          email: anonEmail,
+        });
+      } catch {
+        /* ignore */
+      }
+
+      await writeAuditLog({
+        userId: req.auth.userId,
+        actionType: 'delete',
+        tableName: 'user_profiles',
+        recordId: req.params.id,
+        oldValues: { email: before.email, full_name: before.full_name },
+        newValues: { mode: 'anonymized', account_status: 'deleted' },
+      });
+
+      res.json({ success: true, mode: 'anonymized', applicationCount: appCount });
     } catch (err) {
       next(err);
     }

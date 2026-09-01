@@ -823,6 +823,10 @@ const PatchSchema = z.object({
   eligibility_status: z.string().optional(),
   document_stage_status: z.string().optional(),
   bank_approval_status: z.string().optional(),
+  notify_customer: z.boolean().optional(),
+  notifyCustomer: z.boolean().optional(),
+  send_notification: z.boolean().optional(),
+  sendNotification: z.boolean().optional(),
 }).passthrough();
 
 loanApplicationsRouter.patch(
@@ -866,6 +870,16 @@ loanApplicationsRouter.patch(
       }
 
       const input = PatchSchema.parse(req.body);
+      const notifyCustomer =
+        input.notify_customer ??
+        input.notifyCustomer ??
+        input.send_notification ??
+        input.sendNotification;
+      delete input.notify_customer;
+      delete input.notifyCustomer;
+      delete input.send_notification;
+      delete input.sendNotification;
+
       if (!canUpdateAll) {
         delete input.document_stage_status;
         delete input.bank_approval_status;
@@ -1004,6 +1018,28 @@ loanApplicationsRouter.patch(
           extra: {
             title: 'Application stage updated',
             message: `Bank processing stage is now ${bank_approval_status || document_stage_status}.`,
+          },
+        }).catch(() => {});
+      }
+
+      const shouldNotifyCustomer =
+        notifyCustomer !== false
+        && STAFF_ROLES.has(req.auth.role)
+        && (Boolean(statusValue && statusValue !== existing.status) || Boolean(status_notes));
+
+      if (shouldNotifyCustomer) {
+        const notesLine = status_notes || review_notes || rejection_reason || '';
+        dispatchFileUpdateNotification('application_status_update', {
+          applicationId: req.params.id,
+          extra: {
+            title: 'Application status update',
+            message: [
+              `Your loan application ${row.application_number || req.params.id.slice(0, 8)} was updated.`,
+              statusValue ? `Status: ${statusValue}` : null,
+              notesLine ? `Remarks: ${notesLine}` : null,
+            ]
+              .filter(Boolean)
+              .join('\n'),
           },
         }).catch(() => {});
       }
