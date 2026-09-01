@@ -32,6 +32,7 @@ import { interestMatrixRouter } from './routes/interestMatrix.js';
 import { lenderPolicyImportRouter } from './routes/lenderPolicyImport.js';
 import { adminIntegrationsRouter } from './routes/adminIntegrations.js';
 import { adminPolicyConsoleRouter } from './routes/adminPolicyConsole.js';
+import { adminLenderMasterRouter } from './routes/adminLenderMaster.js';
 import { reportsRouter } from './routes/reports.js';
 import { portalDashboardsRouter } from './routes/portalDashboards.js';
 import { documentRequirementsRouter } from './routes/documentRequirements.js';
@@ -124,6 +125,7 @@ export function createApp({ serveStatic = true } = {}) {
   app.use('/admin/lender-policy-import', lenderPolicyImportRouter);
   app.use('/admin/integrations', adminIntegrationsRouter);
   app.use('/admin/policy-console', adminPolicyConsoleRouter);
+  app.use('/admin/lenders', adminLenderMasterRouter);
   app.use('/reports', reportsRouter);
   app.use('/admin/reports', reportsRouter);
   app.use('/portal', portalDashboardsRouter);

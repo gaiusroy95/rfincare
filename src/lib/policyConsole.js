@@ -377,7 +377,7 @@ export async function submitVersion(id, actorId, reason) {
     toStatus: 'submitted',
     actorId,
     reason,
-    extraSets: { submitted_by: actorId, submitted_at: new Date() },
+    extraSets: { submitted_by: actorId, submitted_at: new Date().toISOString() },
   });
 }
 
@@ -387,7 +387,7 @@ export async function approveVersion(id, actorId, reason) {
     toStatus: 'approved',
     actorId,
     reason,
-    extraSets: { approved_by: actorId, approved_at: new Date() },
+    extraSets: { approved_by: actorId, approved_at: new Date().toISOString() },
   });
 }
 
@@ -399,7 +399,7 @@ export async function rejectVersion(id, actorId, reason) {
     reason,
     extraSets: {
       rejected_by: actorId,
-      rejected_at: new Date(),
+      rejected_at: new Date().toISOString(),
       rejection_reason: reason || 'Rejected',
     },
   });
@@ -445,6 +445,7 @@ export async function publishVersion(id, actorId, reason) {
        WHERE id = :id`,
       { id, by: actorId },
     );
+    await activateVersionPolicyData(conn, version);
     await writePolicyAudit({
       versionId: id,
       bankProductId: version.bank_product_id,
@@ -464,6 +465,38 @@ export async function publishVersion(id, actorId, reason) {
     conn.release();
   }
   return getPolicyVersion(id);
+}
+
+/** On publish: only rules/LTV/DSCR/risk rows for this version are live for the lender scope. */
+async function activateVersionPolicyData(conn, version) {
+  const scopeParams = {
+    bank_id: version.bank_id,
+    pid: version.bank_product_id || null,
+    version_id: version.id,
+  };
+  const productClause = version.bank_product_id
+    ? 'AND (bank_product_id = :pid OR bank_product_id IS NULL)'
+    : 'AND bank_product_id IS NULL';
+
+  for (const table of [
+    'eligibility_rules',
+    'property_ltv_rules',
+    'dscr_rules',
+    'risk_exception_rules',
+  ]) {
+    const ts = table === 'eligibility_rules' ? ', updated_at = NOW()' : '';
+    await conn.execute(
+      `UPDATE ${table} SET is_active = FALSE${ts}
+       WHERE bank_id = :bank_id ${productClause}
+         AND version_id IS NOT NULL AND version_id <> :version_id`,
+      scopeParams,
+    );
+    await conn.execute(
+      `UPDATE ${table} SET is_active = TRUE${ts}
+       WHERE version_id = :version_id`,
+      { version_id: version.id },
+    );
+  }
 }
 
 export async function listPolicyAudit({ versionId, limit = 100 } = {}) {
@@ -548,6 +581,60 @@ export async function createEligibilityRule({
     );
   }
   return ruleId;
+}
+
+/**
+ * Rules used by eligibility/matching at runtime.
+ * When a lender has a published policy version, only rules from active versions apply.
+ */
+export async function listEngineEligibilityRules({ bankId } = {}) {
+  await ensurePolicyConsoleSchema();
+  const pool = getPool();
+  const params = {};
+  let bankFilter = '';
+  if (bankId) {
+    bankFilter = 'AND er.bank_id = :bank_id';
+    params.bank_id = bankId;
+  }
+  const [rules] = await pool.query(
+    `SELECT er.* FROM eligibility_rules er
+     LEFT JOIN product_policy_versions ppv ON ppv.id = er.version_id
+     WHERE er.is_active = TRUE
+     ${bankFilter}
+     AND (
+       (er.version_id IS NOT NULL AND ppv.status = 'active')
+       OR (
+         er.version_id IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM product_policy_versions v
+           WHERE v.status = 'active'
+             AND (er.bank_id IS NULL OR v.bank_id = er.bank_id)
+         )
+       )
+     )
+     ORDER BY er.sort_order ASC, er.created_at DESC
+     LIMIT 500`,
+    params,
+  );
+  if (!rules.length) return [];
+  const placeholders = rules.map((_, i) => `:id${i}`).join(',');
+  const p = {};
+  rules.forEach((r, i) => { p[`id${i}`] = r.id; });
+  const [conds] = await pool.query(
+    `SELECT * FROM eligibility_conditions WHERE rule_id IN (${placeholders}) ORDER BY sort_order`,
+    p,
+  );
+  return rules.map((r) => ({
+    ...r,
+    source_row_json: parseJson(r.source_row_json),
+    conditions: conds
+      .filter((c) => c.rule_id === r.id)
+      .map((c) => ({
+        ...c,
+        value_json: parseJson(c.value_json),
+        value_to_json: parseJson(c.value_to_json),
+      })),
+  }));
 }
 
 export async function listEligibilityRules({ bankId, versionId, domain } = {}) {

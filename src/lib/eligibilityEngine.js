@@ -2,7 +2,7 @@ import { getPool } from '../db/pool.js';
 import { ensureMilestone3Schema } from '../db/ensureMilestone3Schema.js';
 import { getMatchingConfig, DEFAULT_MATCHING_WEIGHTS, DEFAULT_DECISION_THRESHOLDS } from './matchingConfig.js';
 import { evaluateRule, summarizeDecision } from './ruleEngine.js';
-import { listEligibilityRules, ensurePolicyConsoleSchema } from './policyConsole.js';
+import { listEngineEligibilityRules, ensurePolicyConsoleSchema } from './policyConsole.js';
 
 const CREDIT_SCORE_MAP = {
   excellent: 780,
@@ -170,7 +170,7 @@ export async function calculateEligibility(input) {
     return age;
   })();
 
-  const versionedRules = await listEligibilityRules({}).catch(() => []);
+  const versionedRules = await listEngineEligibilityRules({}).catch(() => []);
   const rulesByBankVersioned = new Map();
   for (const vr of versionedRules) {
     const key = vr.bank_id || '__global__';
@@ -181,7 +181,20 @@ export async function calculateEligibility(input) {
   let propertyLtvByBank = new Map();
   try {
     const [ltvRows] = await pool.query(
-      `SELECT bank_id, property_type, max_ltv FROM property_ltv_rules WHERE is_active = TRUE`,
+      `SELECT plr.bank_id, plr.property_type, plr.max_ltv
+       FROM property_ltv_rules plr
+       LEFT JOIN product_policy_versions ppv ON ppv.id = plr.version_id
+       WHERE plr.is_active = TRUE
+         AND (
+           (plr.version_id IS NOT NULL AND ppv.status = 'active')
+           OR (
+             plr.version_id IS NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM product_policy_versions v
+               WHERE v.status = 'active' AND v.bank_id = plr.bank_id
+             )
+           )
+         )`,
     );
     for (const row of ltvRows) {
       if (!propertyLtvByBank.has(row.bank_id)) propertyLtvByBank.set(row.bank_id, []);
