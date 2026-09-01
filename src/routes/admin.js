@@ -184,6 +184,14 @@ adminRouter.get(
         `SELECT COUNT(*) AS total FROM marketing_leads`,
       );
 
+      const [[productStats]] = await pool.execute(
+        `SELECT COUNT(*) AS total FROM bank_products WHERE is_active = TRUE`,
+      );
+
+      const [[ruleStats]] = await pool.execute(
+        `SELECT COUNT(*) AS total FROM approval_matrix_rules WHERE is_active = TRUE`,
+      );
+
       const total = Number(appStats?.total || 0);
       const approved = Number(appStats?.approved || 0);
       const approvalRate =
@@ -195,6 +203,8 @@ adminRouter.get(
         active_agents: Number(agentStats?.active_agents || 0),
         approval_rate: approvalRate,
         total_leads: Number(leadStats?.total || 0),
+        loan_products: Number(productStats?.total || 0),
+        approval_rules: Number(ruleStats?.total || 0),
       });
     } catch (err) {
       next(err);

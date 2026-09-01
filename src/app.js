@@ -98,6 +98,17 @@ export function createApp({ serveStatic = true } = {}) {
   app.use('/locations', locationsRouter);
   app.use('/api/locations', locationsRouter);
   app.use('/loan-applications', loanApplicationsRouter);
+  // Specific /admin/* routers must register BEFORE the generic /admin router (otherwise 404).
+  app.use('/admin/interest-matrix', interestMatrixRouter);
+  app.use('/admin/lender-policy-import', lenderPolicyImportRouter);
+  app.use('/admin/integrations', adminIntegrationsRouter);
+  app.use('/admin/policy-console', adminPolicyConsoleRouter);
+  app.use('/admin/lenders', adminLenderMasterRouter);
+  app.use('/admin/reports', reportsRouter);
+  app.use('/admin/agent-learning', adminAgentLearningRouter);
+  app.use('/admin/employee-learning', adminEmployeeLearningRouter);
+  app.use('/admin/milestone4', milestone4AdminRouter);
+  app.use('/admin/document-requirements', documentRequirementsRouter);
   app.use('/admin', adminRouter);
 
   // Backward-compatible /api/* aliases (older clients or proxies)
@@ -121,30 +132,20 @@ export function createApp({ serveStatic = true } = {}) {
   app.use('/loan-products', loanProductCatalogRouter);
   app.use('/api/loan-products', loanProductCatalogRouter);
   app.use('/interest-matrix', interestMatrixRouter);
-  app.use('/admin/interest-matrix', interestMatrixRouter);
-  app.use('/admin/lender-policy-import', lenderPolicyImportRouter);
-  app.use('/admin/integrations', adminIntegrationsRouter);
-  app.use('/admin/policy-console', adminPolicyConsoleRouter);
-  app.use('/admin/lenders', adminLenderMasterRouter);
   app.use('/reports', reportsRouter);
-  app.use('/admin/reports', reportsRouter);
   app.use('/portal', portalDashboardsRouter);
   app.use('/portal/communication', staffCommunicationRouter);
   app.use('/portal/agent', portalAgentApplicationsRouter);
   app.use('/portal/agent/learning', portalAgentLearningRouter);
   app.use('/portal/agent/profile', portalAgentProfileRouter);
-  app.use('/admin/agent-learning', adminAgentLearningRouter);
-  app.use('/admin/employee-learning', adminEmployeeLearningRouter);
   app.use('/portal/employee/learning', portalEmployeeLearningRouter);
   app.use('/portal/employee/profile', portalEmployeeProfileRouter);
   app.use('/portal/admin/profile', portalAdminProfileRouter);
-  app.use('/admin/milestone4', milestone4AdminRouter);
   app.use('/portal/employee/milestone4', portalEmployeeMilestone4Router);
   app.use('/portal/agent/reports', portalAgentMilestone4Router);
   app.use('/portal', portalEligibilityRouter);
   app.use('/api/portal', portalEligibilityRouter);
   app.use('/document-requirements', documentRequirementsRouter);
-  app.use('/admin/document-requirements', documentRequirementsRouter);
   app.use('/partners', partnersRouter);
   app.use('/api/partners', partnersRouter);
   app.use('/credit-cards', creditCardsRouter);

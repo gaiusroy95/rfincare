@@ -1000,12 +1000,51 @@ export async function commitImportJob(jobId, committedBy) {
   }
 }
 
+export function buildPolicyTemplateWorkbook() {
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(
+    wb,
+    XLSX.utils.aoa_to_sheet([
+      ['Rfincare — Loan Advisory Lender Product Bulk Upload'],
+      ['1. Fill Lenders and Products (required).'],
+      ['2. Add optional rule sheets, then Validate → Approve → Publish in admin.'],
+    ]),
+    'README',
+  );
+  XLSX.utils.book_append_sheet(
+    wb,
+    XLSX.utils.json_to_sheet([
+      {
+        Lender_ID: 'LDR001',
+        Lender_Code: 'DEMO_BANK',
+        Lender_Name: 'Demo Bank Ltd',
+        Lender_Type: 'NBFC',
+        Status: 'ACTIVE',
+      },
+    ]),
+    'Lenders',
+  );
+  XLSX.utils.book_append_sheet(
+    wb,
+    XLSX.utils.json_to_sheet([
+      {
+        Product_ID: 'PRD001',
+        Lender_ID: 'LDR001',
+        Product_Code: 'HL_DEMO',
+        Product_Name: 'Demo Home Loan',
+        Product_Category: 'home_loan',
+        Status: 'ACTIVE',
+      },
+    ]),
+    'Products',
+  );
+  return XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+}
+
 export function getTemplateBuffer() {
   const path = resolvePolicyTemplatePath();
-  if (!path) {
-    const e = new Error('Bulk upload template file not found on server');
-    e.status = 404;
-    throw e;
+  if (path) {
+    return { buffer: readFileSync(path), path, generated: false };
   }
-  return { buffer: readFileSync(path), path };
+  return { buffer: buildPolicyTemplateWorkbook(), path: null, generated: true };
 }
