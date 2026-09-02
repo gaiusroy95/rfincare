@@ -234,6 +234,8 @@ export function rankSmartLoanProducts(products, input) {
     savingsInsight = `${winner.name || 'This product'} is your best available match for the selected priorities.`;
   }
 
+  const usedDefaults = scored.some((row) => (row.assumptions || []).length > 0);
+
   return {
     winnerId: winner?.productId || null,
     winner,
@@ -242,6 +244,10 @@ export function rankSmartLoanProducts(products, input) {
     savingsInsight,
     badgeLabel: savingsAmount > 0 ? 'Highest Savings' : 'Best Match for Your Needs',
     ctaLabel: savingsAmount > 0 ? 'Apply – Max Savings' : 'Apply – Best Fit',
+    usedDefaultFees: usedDefaults,
+    feeDisclaimer: usedDefaults
+      ? 'Some products are missing numeric foreclosure/part-payment fees in admin data. Default industry estimates were used for those fields — ask admin to fill Bank Product numeric charges for exact results.'
+      : null,
     input: {
       loanAmount: toNum(input.loanAmount),
       tenureMonths: Math.round(toNum(input.tenureMonths, 60)),
