@@ -164,6 +164,38 @@ locationsRouter.post(
   },
 );
 
+/** Template download — register before /serviceability list route */
+async function sendServiceabilityTemplate(_req, res, next) {
+  try {
+    const buffer = buildServiceabilityTemplateWorkbook();
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    );
+    res.setHeader(
+      'Content-Disposition',
+      'attachment; filename="lender-serviceability-by-pin.xlsx"',
+    );
+    res.send(buffer);
+  } catch (err) {
+    next(err);
+  }
+}
+
+locationsRouter.get(
+  '/serviceability-template',
+  authenticate,
+  authorize({ resource: 'banks', action: 'read' }),
+  sendServiceabilityTemplate,
+);
+
+locationsRouter.get(
+  '/serviceability/template',
+  authenticate,
+  authorize({ resource: 'banks', action: 'read' }),
+  sendServiceabilityTemplate,
+);
+
 locationsRouter.get(
   '/serviceability',
   authenticate,
@@ -198,28 +230,6 @@ locationsRouter.post(
         .parse(req.body || {});
       const id = await upsertServiceability(body, req.auth.userId);
       res.status(201).json({ data: { id } });
-    } catch (err) {
-      next(err);
-    }
-  },
-);
-
-locationsRouter.get(
-  '/serviceability/template',
-  authenticate,
-  authorize({ resource: 'banks', action: 'read' }),
-  async (_req, res, next) => {
-    try {
-      const buffer = buildServiceabilityTemplateWorkbook();
-      res.setHeader(
-        'Content-Type',
-        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-      );
-      res.setHeader(
-        'Content-Disposition',
-        'attachment; filename="lender-serviceability-by-pin.xlsx"',
-      );
-      res.send(buffer);
     } catch (err) {
       next(err);
     }
