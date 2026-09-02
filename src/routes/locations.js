@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
+import multer from 'multer';
 
 import { authenticate } from '../middleware/authenticate.js';
 import { authorize } from '../middleware/authorize.js';
@@ -16,8 +17,39 @@ import {
   upsertServiceability,
   seedDemoGeoIfEmpty,
 } from '../lib/geoHierarchy.js';
+import {
+  buildServiceabilityTemplateWorkbook,
+  parseServiceabilityUpload,
+  importServiceabilityForBank,
+} from '../lib/geoServiceabilityImport.js';
 
 export const locationsRouter = Router();
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const name = String(file.originalname || '').toLowerCase();
+    if (name.endsWith('.xlsx') || name.endsWith('.xls') || name.endsWith('.csv')) {
+      cb(null, true);
+      return;
+    }
+    cb(new Error('Only .xlsx, .xls, or .csv files are accepted'));
+  },
+});
+
+function wrapMulter(mw) {
+  return (req, res, next) => {
+    mw(req, res, (err) => {
+      if (err) {
+        err.status = 400;
+        next(err);
+        return;
+      }
+      next();
+    });
+  };
+}
 
 locationsRouter.get('/states', async (_req, res, next) => {
   try {
@@ -166,6 +198,66 @@ locationsRouter.post(
         .parse(req.body || {});
       const id = await upsertServiceability(body, req.auth.userId);
       res.status(201).json({ data: { id } });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+locationsRouter.get(
+  '/serviceability/template',
+  authenticate,
+  authorize({ resource: 'banks', action: 'read' }),
+  async (_req, res, next) => {
+    try {
+      const buffer = buildServiceabilityTemplateWorkbook();
+      res.setHeader(
+        'Content-Type',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      );
+      res.setHeader(
+        'Content-Disposition',
+        'attachment; filename="lender-serviceability-by-pin.xlsx"',
+      );
+      res.send(buffer);
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+locationsRouter.post(
+  '/serviceability/import',
+  authenticate,
+  authorize({ resource: 'banks', action: 'manage' }),
+  wrapMulter(upload.single('file')),
+  async (req, res, next) => {
+    try {
+      const bankId = String(req.body?.bankId || '').trim();
+      if (!bankId) return res.status(400).json({ error: 'bankId is required' });
+      if (!req.file?.buffer?.length) {
+        return res.status(400).json({ error: 'Excel or CSV file is required (field name: file)' });
+      }
+      const replaceExisting = String(req.body?.replaceExisting || '').toLowerCase() === 'true';
+      const parsed = parseServiceabilityUpload(req.file.buffer, req.file.originalname);
+      if (!parsed.valid) {
+        return res.status(400).json({
+          error: 'Validation failed',
+          errors: parsed.errors,
+          preview: { rowCount: parsed.rows.length },
+        });
+      }
+      const result = await importServiceabilityForBank({
+        bankId,
+        rows: parsed.rows,
+        replaceExisting,
+      });
+      res.json({
+        data: {
+          ...result,
+          message: `Imported ${result.totalRows} PIN rows for ${result.bankName}`,
+        },
+      });
     } catch (err) {
       next(err);
     }
