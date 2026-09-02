@@ -509,6 +509,13 @@ portalDashboardsRouter.get('/agent/dashboard', authenticate, async (req, res, ne
     const lastPaid = paidEntries[0];
     const monthTarget = 150000;
 
+    const submittedApps = apps.filter((a) =>
+      ['submitted', 'under_review', 'documents_pending', 'approved', 'disbursed'].includes(
+        String(a.status || '').toLowerCase(),
+      ),
+    ).length;
+    const disbursedApps = apps.filter((a) => String(a.status || '').toLowerCase() === 'disbursed').length;
+
     const leadsChart = (performanceAnalytics.week || []).map((row) => ({
       name: row.name,
       leads: row.clients,
@@ -617,6 +624,17 @@ portalDashboardsRouter.get('/agent/dashboard', authenticate, async (req, res, ne
           nextPayout: pendingCommission,
           nextPayoutDate: null,
         },
+        submissionVsDisbursement: {
+          submitted: submittedApps,
+          disbursed: disbursedApps,
+          ratePct: submittedApps > 0 ? Math.round((disbursedApps / submittedApps) * 100) : 0,
+        },
+        policyUpdates: (circulars || []).slice(0, 5).map((c) => ({
+          id: c.id,
+          title: c.title || 'Policy update',
+          fileUrl: c.file_url || c.fileUrl,
+          createdAt: c.created_at || c.createdAt,
+        })),
       },
       attribution: {
         agentCode,

@@ -77,6 +77,47 @@ describe('upgrade QC — matching defaults', () => {
   });
 });
 
+describe('upgrade QC — agent journey exports', () => {
+  it('builds true xlsx buffer from commission report', async () => {
+    const { commissionReportToXlsx, summarizeCommissionReport } = await import(
+      '../../src/lib/commissionReportService.js'
+    );
+    const report = {
+      generatedAt: new Date().toISOString(),
+      entries: [
+        {
+          applicationNumber: 'APP-1',
+          customerName: 'Test User',
+          loanType: 'personal_loan',
+          applicationStatus: 'disbursed',
+          commissionStatus: 'paid',
+          disbursedAmount: 100000,
+          disbursedAt: '2026-03-01',
+          commissionRatePercent: 2,
+          grossCommission: 2000,
+          tdsAmount: 200,
+          netPayout: 1800,
+          agentCode: 'AG001',
+          generatedAt: new Date().toISOString(),
+        },
+      ],
+    };
+    const buf = commissionReportToXlsx(report);
+    assert.ok(Buffer.isBuffer(buf));
+    assert.ok(buf.length > 100);
+    assert.equal(buf[0], 0x50);
+    assert.equal(buf[1], 0x4b);
+    const summary = summarizeCommissionReport(report);
+    assert.equal(summary.entryCount, 1);
+    assert.equal(summary.net, 1800);
+  });
+
+  it('loads agent milestone4 routes', async () => {
+    const mod = await import('../../src/routes/portalAgentMilestone4.js');
+    assert.ok(mod.portalAgentMilestone4Router);
+  });
+});
+
 describe('upgrade QC — module imports', () => {
   it('loads policy console, geo, locations route, admin policy route', async () => {
     await import('../../src/lib/policyConsole.js');

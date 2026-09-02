@@ -401,7 +401,20 @@ portalEmployeeMilestone4Router.get('/agents/:id/reports', async (req, res, next)
     });
 
     const format = String(req.query.format || 'json').toLowerCase();
-    if (format === 'csv' || format === 'xlsx' || format === 'excel') {
+    if (format === 'xlsx' || format === 'excel') {
+      const { commissionReportToXlsx } = await import('../lib/commissionReportService.js');
+      const buf = commissionReportToXlsx(report);
+      res.setHeader(
+        'Content-Type',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      );
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="agent-report-${req.params.id.slice(0, 8)}-${Date.now()}.xlsx"`,
+      );
+      return res.send(buf);
+    }
+    if (format === 'csv') {
       const csv = commissionReportToCsv(report);
       res.setHeader('Content-Type', 'text/csv; charset=utf-8');
       res.setHeader(
