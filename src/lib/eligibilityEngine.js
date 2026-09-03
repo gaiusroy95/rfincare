@@ -4,6 +4,12 @@ import { getMatchingConfig, DEFAULT_MATCHING_WEIGHTS, DEFAULT_DECISION_THRESHOLD
 import { evaluateRule, summarizeDecision } from './ruleEngine.js';
 import { listEngineEligibilityRules, ensurePolicyConsoleSchema } from './policyConsole.js';
 import { getApplicantAge } from './applicantAge.js';
+import { ensureGeoSchema } from './geoHierarchy.js';
+import {
+  applyLocationServiceabilityGate,
+  normalizeApplicationPincode,
+  pickServiceabilityRow,
+} from './lenderPinServiceability.js';
 
 const CREDIT_SCORE_MAP = {
   excellent: 780,
@@ -162,6 +168,9 @@ export async function calculateEligibility(input) {
     if (Number.isFinite(fromInput) && fromInput > 0) return fromInput;
     return getApplicantAge(input.dateOfBirth || input.date_of_birth || input.dob);
   })();
+  const applicantPincode = normalizeApplicationPincode(
+    input.pincode || input.pinCode || input.pin_code || input.postal,
+  );
 
   const versionedRules = await listEngineEligibilityRules({}).catch(() => []);
   const rulesByBankVersioned = new Map();
@@ -223,6 +232,37 @@ export async function calculateEligibility(input) {
   for (const r of rules) {
     if (!rulesByBank.has(r.bank_id)) rulesByBank.set(r.bank_id, []);
     rulesByBank.get(r.bank_id).push(r);
+  }
+
+  /** bankId → { hasList, pinRows[] } for applicant PIN */
+  const serviceabilityByBank = new Map();
+  try {
+    await ensureGeoSchema();
+    const [coverageCounts] = await pool.query(
+      `SELECT bank_id, COUNT(*)::int AS c
+       FROM lender_serviceability
+       WHERE level = 'pincode' AND pincode IS NOT NULL AND pincode <> ''
+       GROUP BY bank_id`,
+    );
+    for (const row of coverageCounts) {
+      serviceabilityByBank.set(row.bank_id, { hasList: Number(row.c) > 0, pinRows: [] });
+    }
+    if (applicantPincode) {
+      const [pinRows] = await pool.query(
+        `SELECT bank_id, bank_product_id, pincode, status, notes
+         FROM lender_serviceability
+         WHERE level = 'pincode' AND pincode = :pincode`,
+        { pincode: applicantPincode },
+      );
+      for (const row of pinRows) {
+        if (!serviceabilityByBank.has(row.bank_id)) {
+          serviceabilityByBank.set(row.bank_id, { hasList: true, pinRows: [] });
+        }
+        serviceabilityByBank.get(row.bank_id).pinRows.push(row);
+      }
+    }
+  } catch {
+    serviceabilityByBank.clear();
   }
 
   const bankResults = [];
@@ -391,13 +431,33 @@ export async function calculateEligibility(input) {
       probability,
     });
 
-    bank.bestProbability = probability;
+    const primaryProductId = bank.products?.[0]?.id || null;
+    const svc = serviceabilityByBank.get(bankId) || { hasList: false, pinRows: [] };
+    const svcRow = pickServiceabilityRow(svc.pinRows, {
+      bankId,
+      bankProductId: primaryProductId,
+    });
+    const locationGate = applyLocationServiceabilityGate({
+      pincode: applicantPincode,
+      bankHasCoverageList: Boolean(svc.hasList),
+      row: svcRow,
+      decision: decisionInfo.decision,
+      decisionReason: decisionInfo.reason,
+      probability,
+      eligibleAmount,
+    });
+
+    bank.bestProbability = locationGate.probability;
     bank.loanCategory = loanCategory;
-    bank.eligibleAmount = safeRound(eligibleAmount);
+    bank.eligibleAmount = safeRound(locationGate.eligibleAmount);
     bank.maxMonthlyEmi = safeRound(maxMonthlyEmi);
     bank.estimatedRate = Number(matchedRate.toFixed(2));
-    bank.decision = decisionInfo.decision;
-    bank.decisionReason = decisionInfo.reason;
+    bank.decision = locationGate.decision;
+    bank.decisionReason = locationGate.decisionReason;
+    bank.locationRemark = locationGate.locationRemark;
+    bank.locationCovered = locationGate.locationCovered;
+    bank.locationStatus = locationGate.locationStatus;
+    bank.applicantPincode = applicantPincode;
     bank.ruleTraceCount = ruleTraces.length;
     bankResults.push(bank);
   }
@@ -440,6 +500,7 @@ export async function calculateEligibility(input) {
       employmentType,
       loanType,
       collateralValue,
+      pincode: applicantPincode,
     },
   };
 }
