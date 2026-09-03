@@ -1135,6 +1135,12 @@ loanApplicationsRouter.post(
       }
 
       const selectedBankId = req.body?.selected_bank_id || req.body?.selectedBankId || null;
+      const selectedBankIds = Array.isArray(req.body?.selectedBankIds)
+        ? req.body.selectedBankIds.filter(Boolean)
+        : selectedBankId
+          ? [selectedBankId]
+          : [];
+      const primaryBankId = selectedBankId || selectedBankIds[0] || null;
 
       try {
         await requireSuccessfulCibilForSubmit(req.params.id);
@@ -1154,6 +1160,13 @@ loanApplicationsRouter.post(
         console.warn('[submit] CIBIL check skipped:', cibilErr.message);
       }
 
+      const existingData = parseJson(existing.data) || {};
+      const nextData = {
+        ...existingData,
+        selected_bank_ids: selectedBankIds,
+        preferred_bank_ids: selectedBankIds,
+      };
+
       await pool.execute(
         `UPDATE loan_applications
          SET status = 'submitted',
@@ -1161,9 +1174,14 @@ loanApplicationsRouter.post(
              document_stage_status = COALESCE(document_stage_status, 'documents_pending'),
              bank_approval_status = 'submitted_to_bank',
              submitted_at = NOW(),
-             selected_bank_id = COALESCE(:selected_bank_id, selected_bank_id)
+             selected_bank_id = COALESCE(:selected_bank_id, selected_bank_id),
+             data = :data::jsonb
          WHERE id = :id`,
-        { id: req.params.id, selected_bank_id: selectedBankId },
+        {
+          id: req.params.id,
+          selected_bank_id: primaryBankId,
+          data: JSON.stringify(nextData),
+        },
       );
 
       await pool.execute(

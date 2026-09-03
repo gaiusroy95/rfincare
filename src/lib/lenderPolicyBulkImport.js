@@ -72,6 +72,134 @@ const PRODUCT_REQUIRED = [
   'Product_Category',
 ];
 
+/** Operators allowed on Rule_Conditions (and optional Operator columns on rule sheets). */
+export const ALLOWED_RULE_OPERATORS = [
+  '=',
+  '!=',
+  '>',
+  '<',
+  '>=',
+  '<=',
+  'IN',
+  'BETWEEN',
+  'CONTAINS',
+];
+
+const PRODUCT_FK_SHEETS = [
+  'Pricing_Rules',
+  'Document_Rules',
+  'Fees',
+  'Obligation_Rules',
+  'Applicant_Rules',
+  'Income_Rules',
+  'Employment_Rules',
+  'Business_Rules',
+  'Credit_Rules',
+  'Banking_Rules',
+  'LTV_Rules',
+  'Matching_Rules',
+  'Risk_Rules',
+  'Exceptions',
+  'Policy_Versions',
+  'Tenure_Rules',
+  'Property_Rules',
+  'Legal_Rules',
+  'Location_Rules',
+];
+
+const SHEET_HEADER_SAMPLES = {
+  Lenders: [
+    {
+      Lender_ID: 'LDR001',
+      Lender_Code: 'DEMO_BANK',
+      Lender_Name: 'Demo Bank Ltd',
+      Lender_Type: 'NBFC',
+      Status: 'ACTIVE',
+    },
+  ],
+  Products: [
+    {
+      Product_ID: 'PRD001',
+      Lender_ID: 'LDR001',
+      Product_Code: 'HL_DEMO',
+      Product_Name: 'Demo Home Loan',
+      Product_Category: 'home_loan',
+      Status: 'ACTIVE',
+      Minimum_Loan_Amount: 500000,
+      Maximum_Loan_Amount: 50000000,
+      Minimum_Tenure_Months: 12,
+      Maximum_Tenure_Months: 360,
+      Interest_Rate_From: 8.5,
+      Interest_Rate_To: 11.5,
+    },
+  ],
+  Applicant_Rules: [{ Rule_ID: 'APP001', Product_ID: 'PRD001', Minimum_Age: 21, Maximum_Age: 65 }],
+  Income_Rules: [{ Rule_ID: 'INC001', Product_ID: 'PRD001', Minimum_Income: 25000 }],
+  Employment_Rules: [{ Rule_ID: 'EMP001', Product_ID: 'PRD001', Minimum_Years_Employed: 1 }],
+  Business_Rules: [{ Rule_ID: 'BUS001', Product_ID: 'PRD001', Minimum_Years_In_Business: 2 }],
+  Credit_Rules: [{ Rule_ID: 'CR001', Product_ID: 'PRD001', Minimum_CIBIL: 650, Maximum_CIBIL: 900 }],
+  Banking_Rules: [{ Rule_ID: 'BNK001', Product_ID: 'PRD001', Minimum_Average_Balance: 10000 }],
+  Obligation_Rules: [{ Rule_ID: 'OBL001', Product_ID: 'PRD001', Maximum_FOIR_Percentage: 55 }],
+  Property_Rules: [{ Rule_ID: 'PROP001', Product_ID: 'PRD001', Property_Type: 'residential' }],
+  Legal_Rules: [{ Rule_ID: 'LEG001', Product_ID: 'PRD001', Title_Clear: 'YES' }],
+  Location_Rules: [{ Rule_ID: 'LOC001', Product_ID: 'PRD001', Serviceable_PIN: '110001' }],
+  LTV_Rules: [{ Rule_ID: 'LTV001', Product_ID: 'PRD001', Property_Type: 'residential', Maximum_LTV: 0.8 }],
+  Tenure_Rules: [{ Rule_ID: 'TEN001', Product_ID: 'PRD001', Minimum_Tenure_Months: 12, Maximum_Tenure_Months: 360 }],
+  Pricing_Rules: [
+    {
+      Rule_ID: 'PRC001',
+      Product_ID: 'PRD001',
+      Minimum_CIBIL: 650,
+      Maximum_CIBIL: 900,
+      Interest_Rate_From: 8.5,
+      Interest_Rate_To: 11.5,
+      Risk_Grade: 'A',
+    },
+  ],
+  Document_Rules: [
+    {
+      Rule_ID: 'DOC001',
+      Product_ID: 'PRD001',
+      Document_Code: 'PAN',
+      Document_Name: 'PAN Card',
+      Requirement_Status: 'MANDATORY',
+    },
+  ],
+  Risk_Rules: [{ Rule_ID: 'RSK001', Product_ID: 'PRD001', Severity: 'soft', Description: 'Demo risk' }],
+  Exceptions: [{ Exception_ID: 'EX001', Product_ID: 'PRD001', Description: 'Demo exception' }],
+  Fees: [
+    {
+      Fee_ID: 'FEE001',
+      Product_ID: 'PRD001',
+      Fee_Type: 'Processing',
+      Calculation_Method: 'PERCENTAGE',
+      Value: 1,
+    },
+  ],
+  Location_Master: [{ PIN_Code: '110001', City: 'New Delhi', State: 'Delhi' }],
+  Property_Master: [{ Property_Type: 'residential', Description: 'Flat / apartment' }],
+  Policy_Versions: [
+    {
+      Product_ID: 'PRD001',
+      Version_Label: 'v1',
+      Policy_Version: 'v1',
+      Change_Reason: 'Initial bulk template',
+      Effective_From: '2026-01-01',
+    },
+  ],
+  Rule_Conditions: [
+    {
+      Condition_ID: 'COND001',
+      Rule_ID: 'APP001',
+      Field_Name: 'age',
+      Operator: 'BETWEEN',
+      Value: 21,
+      Max_Value: 65,
+    },
+  ],
+  Matching_Rules: [{ Factor: 'interest_rate', Weight_Key: 'interest_rate', Weight: 40 }],
+};
+
 function normalizeKey(key) {
   return String(key || '')
     .trim()
@@ -233,15 +361,7 @@ export function buildImportPreview(parsed) {
   });
 
   // Cross-sheet FK checks for known rule sheets
-  for (const sheet of [
-    'Pricing_Rules',
-    'Document_Rules',
-    'Fees',
-    'Obligation_Rules',
-    'Applicant_Rules',
-    'Credit_Rules',
-    'Matching_Rules',
-  ]) {
+  for (const sheet of PRODUCT_FK_SHEETS) {
     (sheets[sheet] || []).forEach((row, idx) => {
       if (row.Product_ID && !productIds.has(row.Product_ID)) {
         errors.push({
@@ -253,9 +373,56 @@ export function buildImportPreview(parsed) {
     });
   }
 
+  const allowedOps = new Set(ALLOWED_RULE_OPERATORS.map((o) => o.toUpperCase()));
+  (sheets.Rule_Conditions || []).forEach((row, idx) => {
+    const op = String(row.Operator || '').trim().toUpperCase();
+    if (!op) {
+      errors.push({
+        sheet: 'Rule_Conditions',
+        row: idx + 2,
+        message: 'Operator is required',
+      });
+      return;
+    }
+    if (!allowedOps.has(op)) {
+      errors.push({
+        sheet: 'Rule_Conditions',
+        row: idx + 2,
+        message: `Invalid Operator "${row.Operator}". Allowed: ${ALLOWED_RULE_OPERATORS.join(', ')}`,
+      });
+    }
+    if (op === 'BETWEEN' && (row.Value === '' || row.Value == null) && (row.Min_Value === '' || row.Min_Value == null)) {
+      warnings.push({
+        sheet: 'Rule_Conditions',
+        row: idx + 2,
+        message: 'BETWEEN typically needs Value/Min_Value and Max_Value',
+      });
+    }
+  });
+
+  const decisionAllowed = new Set(['PASS', 'REVIEW', 'FAIL']);
+  for (const sheet of ['Applicant_Rules', 'Credit_Rules', 'Risk_Rules', 'Exceptions']) {
+    (sheets[sheet] || []).forEach((row, idx) => {
+      const action = String(row.Decision_Action || row.Action || '').trim().toUpperCase();
+      if (action && !decisionAllowed.has(action)) {
+        warnings.push({
+          sheet,
+          row: idx + 2,
+          message: `Unrecognized Decision_Action "${row.Decision_Action || row.Action}" (expected PASS / REVIEW / FAIL)`,
+        });
+      }
+    });
+  }
+
   const unsupportedSheets = sheetNames.filter(
     (n) => n !== 'README' && !SUPPORTED_COMMIT_SHEETS.includes(n),
   );
+  if (unsupportedSheets.length) {
+    warnings.push({
+      sheet: 'workbook',
+      message: `Sheets stored on job but not dual-written on publish: ${unsupportedSheets.join(', ')}`,
+    });
+  }
 
   const sheetCounts = Object.fromEntries(
     sheetNames.map((n) => [n, (sheets[n] || []).length]),
@@ -1006,39 +1173,35 @@ export function buildPolicyTemplateWorkbook() {
     wb,
     XLSX.utils.aoa_to_sheet([
       ['Rfincare — Loan Advisory Lender Product Bulk Upload'],
+      ['Workflow: Upload → Validate → Preview → Approve → Publish'],
       ['1. Fill Lenders and Products (required).'],
-      ['2. Add optional rule sheets, then Validate → Approve → Publish in admin.'],
+      ['2. Optional: Pricing_Rules, Document_Rules, Fees, Obligation_Rules, eligibility rule sheets, Policy_Versions, Matching_Rules, LTV/Risk/Exceptions.'],
+      [`3. Operators on Rule_Conditions: ${ALLOWED_RULE_OPERATORS.join(', ')}`],
+      ['4. Decision actions: PASS / REVIEW / FAIL'],
     ]),
     'README',
   );
-  XLSX.utils.book_append_sheet(
-    wb,
-    XLSX.utils.json_to_sheet([
-      {
-        Lender_ID: 'LDR001',
-        Lender_Code: 'DEMO_BANK',
-        Lender_Name: 'Demo Bank Ltd',
-        Lender_Type: 'NBFC',
-        Status: 'ACTIVE',
-      },
-    ]),
-    'Lenders',
-  );
-  XLSX.utils.book_append_sheet(
-    wb,
-    XLSX.utils.json_to_sheet([
-      {
-        Product_ID: 'PRD001',
-        Lender_ID: 'LDR001',
-        Product_Code: 'HL_DEMO',
-        Product_Name: 'Demo Home Loan',
-        Product_Category: 'home_loan',
-        Status: 'ACTIVE',
-      },
-    ]),
-    'Products',
-  );
+  for (const name of EXPECTED_SHEETS) {
+    if (name === 'README') continue;
+    const sample = SHEET_HEADER_SAMPLES[name] || [{ Note: 'Add rows matching the workbook contract' }];
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(sample), name);
+  }
   return XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+}
+
+/** Build a downloadable CSV error/warning report for a saved preview. */
+export function buildErrorReportCsv(errorReport) {
+  const errors = errorReport?.errors || [];
+  const warnings = errorReport?.warnings || [];
+  const lines = ['Type,Sheet,Row,Message'];
+  const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  for (const e of errors) {
+    lines.push(['error', e.sheet, e.row ?? '', e.message].map(esc).join(','));
+  }
+  for (const w of warnings) {
+    lines.push(['warning', w.sheet, w.row ?? '', w.message].map(esc).join(','));
+  }
+  return `${lines.join('\n')}\n`;
 }
 
 export function getTemplateBuffer() {

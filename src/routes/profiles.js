@@ -8,6 +8,8 @@ import { ensurePushNotificationSchema } from '../db/ensurePushNotificationSchema
 import { saveUserNotificationPreferences } from '../lib/expoPushService.js';
 import { newId } from '../lib/ids.js';
 import { generateOtp, hashOtp, sendOtpNotification } from '../lib/otp.js';
+import { createUploadMiddleware, spreadUpload } from '../lib/multerUpload.js';
+import { toStoredPath } from '../lib/storage/keys.js';
 
 export const profilesRouter = Router();
 
@@ -33,6 +35,15 @@ const UpdateMeSchema = z.object({
     .optional(),
 }).passthrough();
 
+const avatarUpload = createUploadMiddleware({
+  subfolder: 'avatars',
+  maxBytes: 5 * 1024 * 1024,
+  fileFilter: (_req, file, cb) => {
+    const ok = /^image\/(jpeg|png|webp)$/i.test(file.mimetype || '');
+    cb(ok ? null : new Error('Photo must be JPG, PNG, or WEBP'), ok);
+  },
+});
+
 profilesRouter.patch(
   '/me',
   authenticate,
@@ -50,16 +61,26 @@ profilesRouter.patch(
         );
       }
 
+      const avatarUrl = Object.prototype.hasOwnProperty.call(input, 'avatar_url')
+        ? input.avatar_url
+        : undefined;
+      const clearAvatar = avatarUrl === '';
+
       await pool.execute(
         `UPDATE user_profiles
          SET full_name = COALESCE(:full_name, full_name),
              phone = COALESCE(:phone, phone),
-             avatar_url = COALESCE(NULLIF(:avatar_url, ''), avatar_url)
+             avatar_url = CASE
+               WHEN CAST(:clear_avatar AS TEXT) IN ('1', 'true', 't') THEN NULL
+               WHEN :avatar_url IS NOT NULL AND CAST(:avatar_url AS TEXT) <> '' THEN :avatar_url
+               ELSE avatar_url
+             END
          WHERE id = :id`,
         {
           full_name: input.full_name ?? null,
           phone: input.phone ?? null,
-          avatar_url: input.avatar_url ?? null,
+          avatar_url: avatarUrl || null,
+          clear_avatar: clearAvatar ? 1 : 0,
           id: req.auth.userId,
         },
       );
@@ -69,6 +90,42 @@ profilesRouter.patch(
       });
 
       res.json({ profile });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+profilesRouter.post(
+  '/me/avatar',
+  authenticate,
+  authorize({ resource: 'profile', action: 'update', getOwnerId: (req) => req.auth.userId }),
+  ...spreadUpload(avatarUpload, 'single', 'file'),
+  async (req, res, next) => {
+    try {
+      const file = req.file;
+      if (!file) {
+        const e = new Error('Choose a photo to upload');
+        e.status = 400;
+        throw e;
+      }
+      const stored =
+        toStoredPath(file.filename || file.key || file.path) ||
+        (file.filename ? `/uploads/${file.filename}` : null);
+      if (!stored) {
+        const e = new Error('Could not store photo');
+        e.status = 500;
+        throw e;
+      }
+      const pool = getPool();
+      await pool.execute(`UPDATE user_profiles SET avatar_url = :url WHERE id = :id`, {
+        url: stored,
+        id: req.auth.userId,
+      });
+      const [[profile]] = await pool.execute(`SELECT * FROM user_profiles WHERE id = :id LIMIT 1`, {
+        id: req.auth.userId,
+      });
+      res.json({ profile, avatarUrl: stored });
     } catch (err) {
       next(err);
     }

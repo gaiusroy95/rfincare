@@ -3,6 +3,7 @@ import { ensureMilestone3Schema } from '../db/ensureMilestone3Schema.js';
 import { getMatchingConfig, DEFAULT_MATCHING_WEIGHTS, DEFAULT_DECISION_THRESHOLDS } from './matchingConfig.js';
 import { evaluateRule, summarizeDecision } from './ruleEngine.js';
 import { listEngineEligibilityRules, ensurePolicyConsoleSchema } from './policyConsole.js';
+import { getApplicantAge } from './applicantAge.js';
 
 const CREDIT_SCORE_MAP = {
   excellent: 780,
@@ -159,15 +160,7 @@ export async function calculateEligibility(input) {
   const applicantAge = (() => {
     const fromInput = Number(input.age);
     if (Number.isFinite(fromInput) && fromInput > 0) return fromInput;
-    const dobRaw = input.dateOfBirth || input.date_of_birth || input.dob;
-    if (!dobRaw) return null;
-    const dob = new Date(dobRaw);
-    if (Number.isNaN(dob.getTime())) return null;
-    const today = new Date();
-    let age = today.getFullYear() - dob.getFullYear();
-    const m = today.getMonth() - dob.getMonth();
-    if (m < 0 || (m === 0 && today.getDate() < dob.getDate())) age -= 1;
-    return age;
+    return getApplicantAge(input.dateOfBirth || input.date_of_birth || input.dob);
   })();
 
   const versionedRules = await listEngineEligibilityRules({}).catch(() => []);

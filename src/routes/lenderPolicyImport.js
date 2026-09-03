@@ -11,6 +11,7 @@ import {
   listImportJobs,
   getImportJob,
   getTemplateBuffer,
+  buildErrorReportCsv,
 } from '../lib/lenderPolicyBulkImport.js';
 
 export const lenderPolicyImportRouter = Router();
@@ -153,6 +154,33 @@ lenderPolicyImportRouter.post(
   },
 );
 
+lenderPolicyImportRouter.get(
+  '/jobs/:id/error-report',
+  authenticate,
+  authorize({ resource: 'banks', action: 'read' }),
+  async (req, res, next) => {
+    try {
+      const row = await getImportJob(req.params.id);
+      if (!row) return res.status(404).json({ error: 'Import job not found' });
+      const parse = (v) => (typeof v === 'string' ? JSON.parse(v) : v);
+      const errorReport = parse(row.error_report_json) || { errors: [], warnings: [] };
+      const format = String(req.query.format || 'csv').toLowerCase();
+      if (format === 'json') {
+        return res.json(errorReport);
+      }
+      const csv = buildErrorReportCsv(errorReport);
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="lender-policy-import-${req.params.id.slice(0, 8)}-errors.csv"`,
+      );
+      res.send(csv);
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
 lenderPolicyImportRouter.post(
   '/jobs/:id/approve',
   authenticate,
@@ -190,13 +218,15 @@ lenderPolicyImportRouter.post(
     try {
       const job = await getImportJob(req.params.id);
       if (!job) return res.status(404).json({ error: 'Import job not found' });
-      if (job.status === 'validated' && req.body?.requireApproval !== false) {
-        // Soft gate: prefer approve first; allow force via requireApproval=false
-        if (req.query.force !== '1' && req.body?.force !== true) {
-          return res.status(400).json({
-            error: 'Approve the import before publishing (or pass force=true to skip).',
-          });
-        }
+      if (job.status === 'validated') {
+        return res.status(400).json({
+          error: 'Approve the import before publishing (Upload → Validate → Preview → Approve → Publish).',
+        });
+      }
+      if (job.status !== 'approved' && job.status !== 'committed') {
+        return res.status(400).json({
+          error: `Cannot publish import in status "${job.status}". Approve a valid import first.`,
+        });
       }
       const result = await commitImportJob(req.params.id, req.auth.userId);
       res.json({ success: true, result });
