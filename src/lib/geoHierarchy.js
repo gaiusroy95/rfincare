@@ -245,16 +245,56 @@ export async function listServiceability({ bankId } = {}) {
 export async function upsertServiceability(row, actorId = null) {
   await ensureGeoSchema();
   const pool = getPool();
-  const id = row.id || newId();
+  const status = row.status || 'serviceable';
+  const notes = row.notes || null;
+  const bankId = row.bankId || row.bank_id;
+  const pincode = row.pincode || null;
+  const bankProductId = row.bankProductId || row.bank_product_id || null;
+  const level = row.level || 'pincode';
+
   if (row.id) {
     await pool.execute(
       `UPDATE lender_serviceability SET
          status = :status, notes = :notes, updated_at = NOW()
        WHERE id = :id`,
-      { id: row.id, status: row.status || 'serviceable', notes: row.notes || null },
+      { id: row.id, status, notes },
     );
     return row.id;
   }
+
+  if (bankId && pincode && level === 'pincode') {
+    let existing = null;
+    if (bankProductId) {
+      const [[found]] = await pool.query(
+        `SELECT id FROM lender_serviceability
+         WHERE bank_id = :bank_id AND pincode = :pincode AND level = 'pincode'
+           AND bank_product_id = :bank_product_id
+         LIMIT 1`,
+        { bank_id: bankId, pincode, bank_product_id: bankProductId },
+      );
+      existing = found;
+    } else {
+      const [[found]] = await pool.query(
+        `SELECT id FROM lender_serviceability
+         WHERE bank_id = :bank_id AND pincode = :pincode AND level = 'pincode'
+           AND bank_product_id IS NULL
+         LIMIT 1`,
+        { bank_id: bankId, pincode },
+      );
+      existing = found;
+    }
+    if (existing?.id) {
+      await pool.execute(
+        `UPDATE lender_serviceability SET
+           status = :status, notes = :notes, updated_at = NOW()
+         WHERE id = :id`,
+        { id: existing.id, status, notes },
+      );
+      return existing.id;
+    }
+  }
+
+  const id = newId();
   await pool.execute(
     `INSERT INTO lender_serviceability (
        id, bank_id, bank_product_id, level, ref_id, pincode,
@@ -265,16 +305,16 @@ export async function upsertServiceability(row, actorId = null) {
      )`,
     {
       id,
-      bank_id: row.bankId,
-      bank_product_id: row.bankProductId || null,
-      level: row.level || 'pincode',
+      bank_id: bankId,
+      bank_product_id: bankProductId,
+      level,
       ref_id: row.refId || null,
-      pincode: row.pincode || null,
+      pincode,
       state_id: row.stateId || null,
       district_id: row.districtId || null,
       city_id: row.cityId || null,
-      status: row.status || 'serviceable',
-      notes: row.notes || null,
+      status,
+      notes,
     },
   );
   return id;

@@ -217,6 +217,7 @@ locationsRouter.post(
     try {
       const body = z
         .object({
+          id: z.string().optional(),
           bankId: z.string().min(1),
           bankProductId: z.string().optional().nullable(),
           level: z.string().default('pincode'),
