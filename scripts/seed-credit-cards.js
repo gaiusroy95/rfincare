@@ -1,6 +1,7 @@
 /**
  * Seed sample credit cards for marketplace demo.
  * Idempotent: skips cards that already exist by slug.
+ * Backfills CredLaxmi reward_rules when a seeded card has none.
  *
  * Usage (from backend/):
  *   npm run seed:credit-cards
@@ -10,6 +11,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import dotenv from 'dotenv';
+import { ensureCreditCardSchema } from '../src/db/ensureCreditCardSchema.js';
 import { getPool } from '../src/db/pool.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -253,16 +255,184 @@ const SAMPLE_CARDS = [
   },
 ];
 
+function earn(categoryCode, pointsEarned, extra = {}) {
+  return {
+    category_code: categoryCode,
+    points_earned: pointsEarned,
+    spend_unit_inr: 100,
+    ...extra,
+  };
+}
+
+function cashbackRules({
+  rates,
+  annualFeeWaiverSpendThreshold = null,
+  welcomeBenefitInr = 0,
+  milestoneThreshold = 0,
+  milestoneBonus = 0,
+  loungeVisitsPerYear = 0,
+  loungeVisitValueInr = 0,
+  redemptionValueInr = 1,
+}) {
+  return {
+    fees: {
+      annual_fee_waiver_spend_threshold: annualFeeWaiverSpendThreshold,
+    },
+    reward_currency: {
+      type: redemptionValueInr === 1 ? 'cashback' : 'points',
+      redemption_value_inr: redemptionValueInr,
+    },
+    earn_rates: rates,
+    welcome_benefits: welcomeBenefitInr > 0 ? [{ value_inr: welcomeBenefitInr }] : [],
+    milestone_benefits:
+      milestoneThreshold > 0 && milestoneBonus > 0
+        ? [{ spend_threshold: milestoneThreshold, bonus_inr: milestoneBonus, frequency: 'annual' }]
+        : [],
+    additional_benefits: {
+      lounge_visits_per_year: loungeVisitsPerYear,
+      lounge_visit_value_inr: loungeVisitValueInr,
+    },
+  };
+}
+
+/** Distinct CredLaxmi rules so compare ranking is spend-driven, not 1% default. */
+const REWARD_RULES_BY_SLUG = {
+  'hdfc-millennia': cashbackRules({
+    rates: [
+      earn('ONLINE_SHOPPING', 5),
+      earn('DINING_FOOD', 2.5),
+      earn('GROCERIES', 1),
+      earn('MISC_BASE', 1),
+    ],
+    annualFeeWaiverSpendThreshold: 100000,
+  }),
+  'sbi-simplyclick': cashbackRules({
+    rates: [
+      earn('ONLINE_SHOPPING', 5),
+      earn('DINING_FOOD', 2),
+      earn('MISC_BASE', 1),
+    ],
+    annualFeeWaiverSpendThreshold: 100000,
+  }),
+  'axis-ace': cashbackRules({
+    rates: [
+      earn('UTILITIES_BILLS', 5),
+      earn('GROCERIES', 2),
+      earn('MISC_BASE', 1.5),
+    ],
+  }),
+  'icici-amazon-pay': cashbackRules({
+    rates: [
+      earn('ONLINE_SHOPPING', 5),
+      earn('UTILITIES_BILLS', 2),
+      earn('MISC_BASE', 1),
+    ],
+  }),
+  'hdfc-regalia-gold': cashbackRules({
+    redemptionValueInr: 0.25,
+    rates: [
+      earn('TRAVEL_FLIGHTS', 8),
+      earn('DINING_FOOD', 4),
+      earn('MISC_BASE', 2),
+    ],
+    annualFeeWaiverSpendThreshold: 300000,
+    welcomeBenefitInr: 2500,
+    milestoneThreshold: 400000,
+    milestoneBonus: 1500,
+    loungeVisitsPerYear: 12,
+    loungeVisitValueInr: 1500,
+  }),
+  'axis-magnus': cashbackRules({
+    redemptionValueInr: 0.25,
+    rates: [
+      earn('TRAVEL_FLIGHTS', 12),
+      earn('TRAVEL_LODGING', 8),
+      earn('MISC_BASE', 2),
+    ],
+    annualFeeWaiverSpendThreshold: 1500000,
+    welcomeBenefitInr: 10000,
+    loungeVisitsPerYear: 8,
+    loungeVisitValueInr: 2000,
+  }),
+  'iob-rupay': cashbackRules({
+    rates: [earn('FUEL', 1), earn('MISC_BASE', 1)],
+  }),
+  'sbi-bpcl': cashbackRules({
+    rates: [earn('FUEL', 4.25), earn('MISC_BASE', 1)],
+    annualFeeWaiverSpendThreshold: 50000,
+  }),
+  'idfc-first-wow': cashbackRules({
+    rates: [earn('MISC_BASE', 1), earn('ONLINE_SHOPPING', 1)],
+  }),
+  'amex-platinum-travel': cashbackRules({
+    redemptionValueInr: 0.4,
+    rates: [
+      earn('TRAVEL_FLIGHTS', 5),
+      earn('DINING_FOOD', 3),
+      earn('MISC_BASE', 1),
+    ],
+    annualFeeWaiverSpendThreshold: 400000,
+    loungeVisitsPerYear: 4,
+    loungeVisitValueInr: 1500,
+  }),
+  'kotak-business': cashbackRules({
+    rates: [
+      earn('VENDOR_PAYMENTS', 3),
+      earn('OFFICE_SUPPLIES', 2),
+      earn('ADVERTISING_SOFTWARE', 2),
+      earn('CLIENT_ENTERTAINMENT', 2),
+      earn('TRAVEL_LODGING', 2),
+      earn('MISC_BASE', 1),
+    ],
+    annualFeeWaiverSpendThreshold: 200000,
+    loungeVisitsPerYear: 8,
+    loungeVisitValueInr: 1500,
+  }),
+};
+
+function hasEarnRates(raw) {
+  if (!raw) return false;
+  try {
+    const obj = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    const rates = obj?.earn_rates || obj?.earnRates || [];
+    return Array.isArray(rates) && rates.length > 0;
+  } catch {
+    return false;
+  }
+}
+
 async function seed() {
+  await ensureCreditCardSchema();
   const pool = getPool();
+  let inserted = 0;
+  let backfilled = 0;
 
   for (const card of SAMPLE_CARDS) {
+    const rules = REWARD_RULES_BY_SLUG[card.slug] || null;
+    const waiver = rules?.fees?.annual_fee_waiver_spend_threshold ?? null;
     const [[existing]] = await pool.execute(
-      `SELECT id FROM credit_cards WHERE slug = :slug LIMIT 1`,
+      `SELECT id, reward_rules FROM credit_cards WHERE slug = :slug LIMIT 1`,
       { slug: card.slug },
     );
+
     if (existing) {
-      console.log(`  ↷ Skipped (exists): ${card.name}`);
+      if (rules && !hasEarnRates(existing.reward_rules)) {
+        await pool.execute(
+          `UPDATE credit_cards
+           SET reward_rules = :rewardRules::jsonb,
+               annual_fee_waiver_spend_threshold = :waiver
+           WHERE id = :id`,
+          {
+            id: existing.id,
+            rewardRules: JSON.stringify(rules),
+            waiver,
+          },
+        );
+        backfilled += 1;
+        console.log(`  ↻ Backfilled CredLaxmi rules: ${card.name}`);
+      } else {
+        console.log(`  ↷ Skipped (exists): ${card.name}`);
+      }
       continue;
     }
 
@@ -272,7 +442,8 @@ async function seed() {
         id, bank_id, bank_name, name, slug, description, logo_url, card_network,
         categories, annual_fee, joining_fee, interest_rate, late_payment_fee, other_charges,
         features, advantages, benefits,
-        reward_points, lounge_access, lounge_access_details,
+        reward_points, annual_fee_waiver_spend_threshold, reward_rules,
+        lounge_access, lounge_access_details,
         fuel_surcharge_waiver, movie_benefits, movie_benefits_details,
         dining_benefits, dining_benefits_details, insurance_cover, insurance_cover_details,
         forex_charges, emi_conversion, emi_conversion_details,
@@ -281,7 +452,8 @@ async function seed() {
         :id, NULL, :bankName, :name, :slug, NULL, NULL, :cardNetwork,
         :categories::jsonb, :annualFee, :joiningFee, NULL, NULL, NULL,
         :features, '[]', '[]',
-        :rewardPoints, :loungeAccess, :loungeAccessDetails,
+        :rewardPoints, :waiver, :rewardRules::jsonb,
+        :loungeAccess, :loungeAccessDetails,
         :fuelSurchargeWaiver, :movieBenefits, :movieBenefitsDetails,
         :diningBenefits, :diningBenefitsDetails, :insuranceCover, :insuranceCoverDetails,
         :forexCharges, :emiConversion, :emiConversionDetails,
@@ -298,6 +470,8 @@ async function seed() {
         joiningFee: card.joiningFee,
         features: JSON.stringify(card.features),
         rewardPoints: card.rewardPoints,
+        waiver,
+        rewardRules: rules ? JSON.stringify(rules) : null,
         loungeAccess: card.loungeAccess,
         loungeAccessDetails: card.loungeAccessDetails || null,
         fuelSurchargeWaiver: card.fuelSurchargeWaiver,
@@ -314,10 +488,13 @@ async function seed() {
         displayPriority: card.displayPriority,
       },
     );
+    inserted += 1;
     console.log(`  ✓ Created: ${card.name}`);
   }
 
-  console.log('\nDone seeding credit cards.');
+  console.log(
+    `\nDone seeding credit cards. Created ${inserted}; backfilled CredLaxmi rules on ${backfilled}.`,
+  );
   process.exit(0);
 }
 

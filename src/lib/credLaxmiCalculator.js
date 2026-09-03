@@ -197,11 +197,19 @@ export function scoreCredLaxmiCard(card, spendProfile = []) {
       overflowMonthlyPoints = Math.max(0, rawMonthlyPoints - rate.monthlyPointsCap);
     }
 
-    const baseRate = findRate(rules, BASE_CATEGORY);
+    const baseRate = rules.earnRates.find((r) => r.categoryCode === BASE_CATEGORY);
     let overflowInr = 0;
-    if (overflowMonthlyPoints > 0 && baseRate && baseRate.categoryCode === BASE_CATEGORY) {
-      // Overflow earns at base rate value
-      overflowInr = round2(overflowMonthlyPoints * redemption * 12);
+    if (
+      overflowMonthlyPoints > 0 &&
+      baseRate &&
+      baseRate.spendUnitInr > 0 &&
+      rate.pointsEarned > 0
+    ) {
+      // Convert capped-out category points back to spend, then earn at MISC_BASE.
+      const overflowMonthlySpend = (overflowMonthlyPoints / rate.pointsEarned) * rate.spendUnitInr;
+      const overflowMonthlyBasePoints =
+        (overflowMonthlySpend / baseRate.spendUnitInr) * baseRate.pointsEarned;
+      overflowInr = round2(overflowMonthlyBasePoints * redemption * 12);
       cappedOverflowInr = round2(cappedOverflowInr + overflowInr);
     }
 
@@ -307,6 +315,7 @@ export function rankCredLaxmiCards(cards, spendProfile) {
   }
 
   const projectedAnnualSavings = winner ? Math.max(0, winner.netAnnualValue) : 0;
+  const usedDefaultRules = scored.some((row) => row.usedDefaultRules);
 
   return {
     winnerId: winner?.cardId || null,
@@ -317,6 +326,10 @@ export function rankCredLaxmiCards(cards, spendProfile) {
     projectedAnnualSavings,
     badgeLabel: savingsAmount > 0 ? 'Highest Savings' : 'Best Value',
     ctaLabel: savingsAmount > 0 ? 'Apply – Highest Savings' : 'Apply – Best Value',
+    usedDefaultRules,
+    defaultRulesDisclaimer: usedDefaultRules
+      ? 'One or more cards have no structured reward rules. A conservative 1% base cashback estimate was used. Actual issuer rewards may differ.'
+      : null,
     disclaimer:
       'Projected annual savings are estimates based on your spend inputs and card reward rules. Actual rewards may vary by issuer terms.',
   };
