@@ -12,6 +12,7 @@ import {
   writePolicyAudit,
 } from './policyConsole.js';
 import { saveMatchingConfig } from './matchingConfig.js';
+import { createGeoVersionFromSheetRows, ensureLenderGeoPolicySchema } from './lenderGeoPolicy.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -33,6 +34,8 @@ export const SUPPORTED_COMMIT_SHEETS = [
   'Matching_Rules',
   'Risk_Rules',
   'Exceptions',
+  'Geo_Coverage',
+  'Location_Rules',
 ];
 
 export const EXPECTED_SHEETS = [
@@ -58,6 +61,7 @@ export const EXPECTED_SHEETS = [
   'Fees',
   'Location_Master',
   'Property_Master',
+  'Geo_Coverage',
   'Policy_Versions',
   'Rule_Conditions',
   'Matching_Rules',
@@ -142,7 +146,42 @@ const SHEET_HEADER_SAMPLES = {
   Obligation_Rules: [{ Rule_ID: 'OBL001', Product_ID: 'PRD001', Maximum_FOIR_Percentage: 55 }],
   Property_Rules: [{ Rule_ID: 'PROP001', Product_ID: 'PRD001', Property_Type: 'residential' }],
   Legal_Rules: [{ Rule_ID: 'LEG001', Product_ID: 'PRD001', Title_Clear: 'YES' }],
-  Location_Rules: [{ Rule_ID: 'LOC001', Product_ID: 'PRD001', Serviceable_PIN: '110001' }],
+  Location_Rules: [
+    {
+      Lender_Code: 'DEMO_BANK',
+      PIN_Code: '110001',
+      Coverage_Type: 'INCLUDE',
+      State: 'Delhi',
+      District: 'New Delhi',
+      Remarks: 'Legacy Location_Rules alias — prefer Geo_Coverage',
+    },
+  ],
+  Geo_Coverage: [
+    {
+      Lender_Code: 'DEMO_BANK',
+      State: 'Rajasthan',
+      District: 'Bikaner',
+      Tehsil: 'Bikaner',
+      PIN_Code: '334001',
+      Coverage_Type: 'INCLUDE',
+      Branch_Code: '',
+      Radius_KM: '',
+      Effective_From: '2026-09-01',
+      Effective_To: '',
+      Remarks: 'Standard coverage',
+      Change_Reason: 'Initial geo upload',
+    },
+    {
+      Lender_Code: 'DEMO_BANK',
+      State: 'Rajasthan',
+      District: 'Bikaner',
+      Tehsil: 'Bikaner',
+      PIN_Code: '334009',
+      Coverage_Type: 'EXCLUDE',
+      Remarks: 'Negative PIN',
+      Change_Reason: 'Initial geo upload',
+    },
+  ],
   LTV_Rules: [{ Rule_ID: 'LTV001', Product_ID: 'PRD001', Property_Type: 'residential', Maximum_LTV: 0.8 }],
   Tenure_Rules: [{ Rule_ID: 'TEN001', Product_ID: 'PRD001', Minimum_Tenure_Months: 12, Maximum_Tenure_Months: 360 }],
   Pricing_Rules: [
@@ -1142,6 +1181,61 @@ export async function commitImportJob(jobId, committedBy) {
       result.policyPackError = err.message;
     }
 
+    try {
+      await ensureLenderGeoPolicySchema(conn);
+      const geoRows = [
+        ...(sheets.Geo_Coverage || []),
+        ...(sheets.Location_Rules || []).map((r) => ({
+          Lender_Code: r.Lender_Code || r.Lender_ID,
+          PIN_Code: r.PIN_Code || r.Serviceable_PIN || r.Pincode,
+          Coverage_Type: r.Coverage_Type || r.Coverage || (r.Serviceable_PIN ? 'INCLUDE' : 'INCLUDE'),
+          State: r.State,
+          District: r.District,
+          Tehsil: r.Tehsil,
+          Remarks: r.Remarks || r.Rule_ID || null,
+          Change_Reason: r.Change_Reason || 'Location_Rules import',
+          Branch_Code: r.Branch_ID || r.Branch_Code,
+          Radius_KM: r.Radius_KM,
+        })),
+      ];
+      if (geoRows.length) {
+        const lenderIdMap = {};
+        for (const [key, val] of Object.entries(idMap.lenders || {})) {
+          const bankId = typeof val === 'string' ? val : val?.bankId;
+          if (!bankId) continue;
+          lenderIdMap[key] = bankId;
+          lenderIdMap[String(key).toUpperCase()] = bankId;
+        }
+        for (const row of sheets.Lenders || []) {
+          const bankId = lenderIdMap[row.Lender_ID];
+          if (bankId && row.Lender_Code) {
+            lenderIdMap[row.Lender_Code] = bankId;
+            lenderIdMap[String(row.Lender_Code).toUpperCase()] = bankId;
+          }
+        }
+        const geo = await createGeoVersionFromSheetRows({
+          rows: geoRows,
+          uploadedBy: committedBy,
+          sourceJobId: jobId,
+          changeReason:
+            geoRows.find((r) => r.Change_Reason)?.Change_Reason ||
+            'Bulk upload Geo_Coverage / Location_Rules',
+          effectiveFrom: geoRows.find((r) => r.Effective_From)?.Effective_From || null,
+          effectiveTo: geoRows.find((r) => r.Effective_To)?.Effective_To || null,
+          versionLabel: `bulk-geo-${jobId.slice(0, 8)}`,
+          lenderIdMap,
+          conn,
+        });
+        result.geoVersionId = geo.versionId;
+        result.geoRowsInserted = geo.inserted;
+        result.geoStatus = geo.status;
+        result.geoNote =
+          'Geo version created as pending_approval — Super Admin must approve before live eligibility uses it.';
+      }
+    } catch (err) {
+      result.geoError = err.message;
+    }
+
     await conn.execute(
       `UPDATE lender_policy_import_jobs SET
          status = 'committed',
@@ -1176,8 +1270,11 @@ export function buildPolicyTemplateWorkbook() {
       ['Workflow: Upload → Validate → Preview → Approve → Publish'],
       ['1. Fill Lenders and Products (required).'],
       ['2. Optional: Pricing_Rules, Document_Rules, Fees, Obligation_Rules, eligibility rule sheets, Policy_Versions, Matching_Rules, LTV/Risk/Exceptions.'],
+      ['2b. Geo_Coverage (bank-level PIN/district INCLUDE|EXCLUDE|CONDITIONAL|BRANCH_DEPENDENT). Location_Rules also accepted.'],
+      ['2c. After Publish, Super Admin must Approve geo version under Admin → Lender geo policy before live eligibility uses it.'],
       [`3. Operators on Rule_Conditions: ${ALLOWED_RULE_OPERATORS.join(', ')}`],
       ['4. Decision actions: PASS / REVIEW / FAIL'],
+      ['5. Geo runs after FOIR/LTV/credit — not inside product rules.'],
     ]),
     'README',
   );

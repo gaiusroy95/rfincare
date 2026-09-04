@@ -30,6 +30,7 @@ import { eligibilityAssessmentsRouter } from './routes/eligibilityAssessments.js
 import { loanProductCatalogRouter } from './routes/loanProductCatalog.js';
 import { interestMatrixRouter } from './routes/interestMatrix.js';
 import { lenderPolicyImportRouter } from './routes/lenderPolicyImport.js';
+import { lenderGeoPolicyRouter } from './routes/lenderGeoPolicy.js';
 import { adminIntegrationsRouter } from './routes/adminIntegrations.js';
 import { adminPolicyConsoleRouter } from './routes/adminPolicyConsole.js';
 import { adminLenderMasterRouter } from './routes/adminLenderMaster.js';
@@ -101,6 +102,7 @@ export function createApp({ serveStatic = true } = {}) {
   // Specific /admin/* routers must register BEFORE the generic /admin router (otherwise 404).
   app.use('/admin/interest-matrix', interestMatrixRouter);
   app.use('/admin/lender-policy-import', lenderPolicyImportRouter);
+  app.use('/admin/lender-geo-policy', lenderGeoPolicyRouter);
   app.use('/admin/integrations', adminIntegrationsRouter);
   app.use('/admin/policy-console', adminPolicyConsoleRouter);
   app.use('/admin/lenders', adminLenderMasterRouter);
