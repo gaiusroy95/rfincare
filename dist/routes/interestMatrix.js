@@ -262,8 +262,42 @@ interestMatrixRouter.delete(
       const [result] = await pool.execute(`DELETE FROM interest_matrix_rates WHERE id = :id`, {
         id: req.params.id
       });
-      if (!result.affectedRows) return res.status(404).json({ error: "Rate not found" });
-      res.json({ ok: true });
+      if (!result.affectedRows && !result.rowCount) {
+        return res.status(404).json({ error: "Rate not found" });
+      }
+      res.json({ ok: true, deleted: 1 });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+interestMatrixRouter.post(
+  "/bulk-delete",
+  authenticate,
+  authorize({ resource: "interest_matrix", action: "manage" }),
+  async (req, res, next) => {
+    try {
+      const body = z.object({
+        ids: z.array(z.string().min(1)).min(1)
+      }).parse(req.body || {});
+      await ensureMilestone3Schema();
+      const pool = getPool();
+      const ids = [...new Set(body.ids.filter(Boolean))];
+      if (!ids.length) {
+        return res.status(400).json({ error: "No rate ids provided" });
+      }
+      const params = {};
+      const placeholders = ids.map((id, i) => {
+        const key = `id_${i}`;
+        params[key] = id;
+        return `:${key}`;
+      });
+      const [result] = await pool.execute(
+        `DELETE FROM interest_matrix_rates WHERE id IN (${placeholders.join(", ")})`,
+        params
+      );
+      const deleted = Number(result?.affectedRows ?? result?.rowCount ?? ids.length);
+      res.json({ ok: true, deleted, ids });
     } catch (err) {
       next(err);
     }

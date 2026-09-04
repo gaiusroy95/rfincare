@@ -59,6 +59,7 @@ async function upsertMarketingLead(pool, {
          phone = ${sqlCastParam("phone")},
          loan_type = ${sqlCoalescePatch("loan_type", "loan_type")},
          source = ${sqlCoalescePatch("source", "source")},
+         ${sqlCoalescePatch("status", "status")},
          consent_accepted = consent_accepted OR :consent,
          session_key = ${sqlCoalescePatch("session_key", "session_key")},
          application_id = ${sqlCoalescePatch("application_id", "application_id")},
@@ -72,6 +73,7 @@ async function upsertMarketingLead(pool, {
         phone: normalizedPhone,
         loan_type: loanType || null,
         source: source || null,
+        status: status || null,
         consent,
         session_key: sessionKey || null,
         application_id: applicationId || null

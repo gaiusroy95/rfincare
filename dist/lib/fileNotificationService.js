@@ -11,6 +11,7 @@ const DEFAULT_SETTINGS = {
   events: {
     customer_document_upload: { customer: false, employee: true, agent: "optional" },
     employee_document_decision: { customer: true, employee: false, agent: "optional" },
+    application_status_update: { customer: true, employee: false, agent: "optional" },
     application_stage_after_bank: { customer: true, employee: true, agent: "if_sourced" }
   }
 };
@@ -104,7 +105,17 @@ async function loadApplicationContext(pool, applicationId) {
 }
 async function dispatchFileUpdateNotification(eventKey, { applicationId, extra = {} }) {
   await ensureMilestone4Schema();
-  const settings = await getFileNotificationSettings();
+  let settings = await getFileNotificationSettings();
+  if (eventKey === "employee_document_decision" || eventKey === "application_status_update") {
+    settings = {
+      ...settings,
+      channels: { ...settings.channels, email: true, sms: true },
+      events: {
+        ...settings.events,
+        [eventKey]: { customer: true, employee: false, agent: settings.events?.[eventKey]?.agent || "optional" }
+      }
+    };
+  }
   const rule = settings.events?.[eventKey];
   if (!rule) return { skipped: true };
   const pool = getPool();

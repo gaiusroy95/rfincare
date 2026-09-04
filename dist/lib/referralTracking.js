@@ -3,7 +3,6 @@ import { getPool, isDuplicateColumnError, isIgnorableMigrationError } from "../d
 import { newId } from "./ids.js";
 import { ensureAgentCodeForUser } from "./agentCode.js";
 import { assignUniqueCustomerCode } from "./customerCode.js";
-import { sqlCastParam } from "./sqlCollation.js";
 const PROGRAMS = /* @__PURE__ */ new Set(["agent", "customer"]);
 function normalizeReferralCode(value) {
   if (!value) return null;
@@ -53,6 +52,11 @@ async function ensureReferralSchema(pool = getPool()) {
       await pool.execute(`ALTER TABLE marketing_leads ADD COLUMN IF NOT EXISTS referral_code VARCHAR(64) NULL`);
       await pool.execute(`ALTER TABLE marketing_leads ADD COLUMN IF NOT EXISTS referral_program VARCHAR(16) NULL`);
       await pool.execute(`ALTER TABLE marketing_leads ADD COLUMN IF NOT EXISTS referred_by_user_id CHAR(36) NULL`);
+      await pool.execute(`ALTER TABLE marketing_leads ADD COLUMN IF NOT EXISTS sourced_agent_code VARCHAR(32) NULL`);
+      await pool.execute(
+        `CREATE INDEX IF NOT EXISTS idx_marketing_leads_sourced_agent
+         ON marketing_leads (sourced_agent_code, created_at DESC)`
+      );
     } catch (err) {
       if (!isDuplicateColumnError(err) && !isIgnorableMigrationError(err)) throw err;
     }
@@ -80,7 +84,7 @@ async function insertReferralCode(pool, { ownerUserId, ownerRole, program, code 
   const id = newId();
   await pool.execute(
     `INSERT INTO referral_codes (id, owner_user_id, owner_role, program, code)
-     VALUES (:id, :owner_user_id, :owner_role, :program, ${sqlCastParam("code")})`,
+     VALUES (:id, :owner_user_id, :owner_role, :program, CAST(:code AS TEXT))`,
     {
       id,
       owner_user_id: ownerUserId,
@@ -225,10 +229,13 @@ async function applyReferralToLead(pool, leadId, body = {}) {
   if (!leadId) return null;
   await ensureReferralSchema(pool);
   const programHint = normalizeReferralProgram(body.referralProgram || body.referral_program);
-  const rawCode = body.referralCode || body.referral_code || (programHint === "agent" ? null : body.sourcedAgentCode || body.sourced_agent_code || body.agentCode);
+  const explicitAgentCode = normalizeReferralCode(
+    body.sourcedAgentCode || body.sourced_agent_code || body.agentCode
+  );
+  const rawCode = body.referralCode || body.referral_code || (programHint === "agent" ? null : explicitAgentCode);
   const resolved = await resolveReferralCode(pool, rawCode);
   if (!resolved) {
-    const agentCode = normalizeReferralCode(body.sourcedAgentCode || body.sourced_agent_code || body.agentCode);
+    const agentCode = explicitAgentCode;
     if (!agentCode) return null;
     try {
       await pool.execute(
@@ -237,10 +244,10 @@ async function applyReferralToLead(pool, leadId, body = {}) {
       );
     } catch {
     }
-    return { referralCode: agentCode, referralProgram: "customer" };
+    return { referralCode: agentCode, referralProgram: "customer", sourcedAgentCode: agentCode };
   }
   const program = programHint || resolved.program || "customer";
-  const sourcedAgentCode = program === "customer" && resolved.ownerRole === "agent" ? resolved.code : null;
+  const sourcedAgentCode = explicitAgentCode || (program === "customer" && resolved.ownerRole === "agent" ? normalizeReferralCode(resolved.code) : null) || (resolved.ownerRole === "agent" && /^RFA([-\s]|$)/i.test(String(resolved.code || "")) ? normalizeReferralCode(resolved.code) : null);
   try {
     await pool.execute(
       `UPDATE marketing_leads SET

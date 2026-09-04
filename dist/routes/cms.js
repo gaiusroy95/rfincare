@@ -28,6 +28,17 @@ import {
   getMarketplaceVisibility,
   updateMarketplaceVisibility
 } from "../lib/marketplaceVisibility.js";
+import {
+  ensureLegalPages,
+  getLegalPageBySlug,
+  listCatalogLegalPages,
+  upsertLegalPage
+} from "../lib/legalPages.js";
+import {
+  mapHomepageNewsRow,
+  mapHomepageVideoRow,
+  mapSuccessStoryRow
+} from "../lib/cmsContentMap.js";
 import { normalizeYoutubeWatchUrl } from "../lib/youtube.js";
 import { authenticate } from "../middleware/authenticate.js";
 import { requireRoles } from "../middleware/requireRoles.js";
@@ -37,7 +48,18 @@ cmsRouter.use(requireRoles("admin", "super_admin", "employee"));
 const NewsSchema = z.object({
   title: z.string().min(1),
   excerpt: z.string().optional(),
-  blogUrl: z.string().url().optional().or(z.literal("")),
+  blogUrl: z.string().optional().or(z.literal("")).transform((value) => {
+    const trimmed = String(value || "").trim();
+    if (!trimmed) return "";
+    try {
+      if (/^https?:\/\//i.test(trimmed)) {
+        new URL(trimmed);
+      }
+      return trimmed;
+    } catch {
+      return "";
+    }
+  }),
   imageUrl: z.string().optional(),
   imageAlt: z.string().optional(),
   category: z.string().optional(),
@@ -136,6 +158,10 @@ const OtpProviderSettingsSchema = z.object({
     msg91OtpTemplateId: z.string().optional(),
     msg91FlowTemplateId: z.string().optional(),
     msg91WhatsappTemplateId: z.string().optional(),
+    msg91WhatsappNamespace: z.string().optional(),
+    msg91WhatsappIntegratedNumber: z.string().optional(),
+    msg91WhatsappLanguage: z.string().optional(),
+    msg91WhatsappIncludeButton: z.union([z.boolean(), z.string()]).optional(),
     msg91EmailDomain: z.string().optional(),
     msg91EmailFromEmail: z.string().optional(),
     msg91EmailFromName: z.string().optional(),
@@ -160,7 +186,9 @@ const MarketplaceVisibilitySchema = z.object({
   fixedIncomeMarketplace: z.boolean(),
   postOfficeMarketplace: z.boolean(),
   governmentSchemesMarketplace: z.boolean(),
-  investmentMarketplace: z.boolean()
+  investmentMarketplace: z.boolean(),
+  retirementPlanning: z.boolean().optional().default(true),
+  wealthManagement: z.boolean().optional().default(true)
 });
 cmsRouter.get("/site-contact", async (req, res, next) => {
   try {
@@ -240,7 +268,7 @@ cmsRouter.get("/otp-settings", async (_req, res, next) => {
     const settings = await getOtpProviderSettings();
     res.json({
       ...settings,
-      infrastructure: getOtpInfrastructureStatus()
+      infrastructure: getOtpInfrastructureStatus(settings.providerConfig)
     });
   } catch (err) {
     next(err);
@@ -251,7 +279,7 @@ cmsRouter.get("/otp-settings/status", async (_req, res, next) => {
     const settings = await getOtpProviderSettings();
     const msg91Status = await testMsg91Connection(settings.providerConfig);
     res.json({
-      infrastructure: getOtpInfrastructureStatus(),
+      infrastructure: getOtpInfrastructureStatus(settings.providerConfig),
       activeSettings: {
         smsProvider: settings.smsProvider,
         emailProvider: settings.emailProvider,
@@ -281,12 +309,15 @@ cmsRouter.post("/otp-settings/test", async (req, res, next) => {
         email: body.email,
         otp,
         channel: "email",
-        settings: { ...settings, emailProvider: "msg91" }
+        settings
       });
       return res.json({
         success: true,
         channel,
-        ...process.env.LOG_OTP === "true" ? { devOtp: otp } : {},
+        delivered: result2?.email?.delivered !== false && result2?.email?.sent !== false,
+        provider: result2?.email?.provider || settings.emailProvider,
+        warning: result2?.email?.warning,
+        ...process.env.LOG_OTP === "true" || settings.emailProvider === "console" ? { devOtp: otp } : {},
         result: result2
       });
     }
@@ -299,10 +330,15 @@ cmsRouter.post("/otp-settings/test", async (req, res, next) => {
       channel,
       settings
     });
+    const channelResult = result?.[channel] || result?.sms || result?.whatsapp;
     res.json({
       success: true,
       channel,
-      ...process.env.LOG_OTP === "true" ? { devOtp: otp } : {},
+      delivered: channelResult?.sent !== false && channelResult?.delivered !== false,
+      provider: channelResult?.provider || (channel === "whatsapp" ? settings.whatsappProvider : settings.smsProvider),
+      warning: channelResult?.warning,
+      requestId: channelResult?.requestId || null,
+      ...process.env.LOG_OTP === "true" || channel === "sms" && settings.smsProvider === "console" || channel === "whatsapp" && settings.whatsappProvider === "console" ? { devOtp: otp } : {},
       result
     });
   } catch (err) {
@@ -315,7 +351,7 @@ cmsRouter.put("/otp-settings", async (req, res, next) => {
     const updated = await updateOtpProviderSettings(input, req.auth.userId);
     res.json({
       ...updated,
-      infrastructure: getOtpInfrastructureStatus()
+      infrastructure: getOtpInfrastructureStatus(updated.providerConfig)
     });
   } catch (err) {
     next(err);
@@ -333,9 +369,11 @@ cmsRouter.put("/about-content", async (req, res, next) => {
 cmsRouter.get("/news", async (req, res, next) => {
   try {
     const [rows] = await getPool().query(
-      `SELECT * FROM homepage_news ORDER BY sort_order DESC, created_at DESC`
+      `SELECT id, title, excerpt, blog_url, image_url, image_alt, category,
+              published_at, is_published, sort_order, created_at
+       FROM homepage_news ORDER BY sort_order DESC, created_at DESC`
     );
-    res.json(rows);
+    res.json((rows || []).map(mapHomepageNewsRow).filter(Boolean));
   } catch (err) {
     next(err);
   }
@@ -356,12 +394,18 @@ cmsRouter.post("/news", async (req, res, next) => {
         imageAlt: input.imageAlt ?? null,
         category: input.category ?? null,
         pubAt: input.publishedAt ? new Date(input.publishedAt) : /* @__PURE__ */ new Date(),
-        pub: input.isPublished ? true : false,
+        pub: input.isPublished !== false,
         sort: input.sortOrder ?? 0,
         by: req.auth.userId
       }
     );
-    res.status(201).json({ id });
+    const [[row]] = await getPool().query(
+      `SELECT id, title, excerpt, blog_url, image_url, image_alt, category,
+              published_at, is_published, sort_order, created_at
+       FROM homepage_news WHERE id = :id`,
+      { id }
+    );
+    res.status(201).json(mapHomepageNewsRow(row) || { id });
   } catch (err) {
     next(err);
   }
@@ -378,7 +422,8 @@ cmsRouter.put("/news/:id", async (req, res, next) => {
         image_alt = COALESCE(:imageAlt, image_alt),
         category = COALESCE(:category, category),
         is_published = COALESCE(:pub, is_published),
-        sort_order = COALESCE(:sort, sort_order)
+        sort_order = COALESCE(:sort, sort_order),
+        updated_at = NOW()
        WHERE id = :id`,
       {
         id: req.params.id,
@@ -392,7 +437,13 @@ cmsRouter.put("/news/:id", async (req, res, next) => {
         sort: input.sortOrder ?? null
       }
     );
-    res.json({ ok: true });
+    const [[row]] = await getPool().query(
+      `SELECT id, title, excerpt, blog_url, image_url, image_alt, category,
+              published_at, is_published, sort_order, created_at
+       FROM homepage_news WHERE id = :id`,
+      { id: req.params.id }
+    );
+    res.json(mapHomepageNewsRow(row) || { ok: true, id: req.params.id });
   } catch (err) {
     next(err);
   }
@@ -408,12 +459,11 @@ cmsRouter.delete("/news/:id", async (req, res, next) => {
 cmsRouter.get("/videos", async (req, res, next) => {
   try {
     const [rows] = await getPool().query(
-      `SELECT id, title, description, youtube_url AS "youtubeUrl", thumbnail_url AS "thumbnailUrl",
-              thumbnail_alt AS "thumbnailAlt", duration_label AS "durationLabel",
-              is_published AS "isPublished", sort_order AS "sortOrder"
+      `SELECT id, title, description, youtube_url, thumbnail_url, thumbnail_alt,
+              duration_label, is_published, sort_order
        FROM homepage_videos ORDER BY sort_order DESC`
     );
-    res.json(rows);
+    res.json((rows || []).map(mapHomepageVideoRow).filter(Boolean));
   } catch (err) {
     next(err);
   }
@@ -433,12 +483,18 @@ cmsRouter.post("/videos", async (req, res, next) => {
         thumb: input.thumbnailUrl ?? null,
         thumbAlt: input.thumbnailAlt ?? null,
         dur: input.durationLabel ?? null,
-        pub: input.isPublished ? true : false,
+        pub: input.isPublished !== false,
         sort: input.sortOrder ?? 0,
         by: req.auth.userId
       }
     );
-    res.status(201).json({ id });
+    const [[row]] = await getPool().query(
+      `SELECT id, title, description, youtube_url, thumbnail_url, thumbnail_alt,
+              duration_label, is_published, sort_order
+       FROM homepage_videos WHERE id = :id`,
+      { id }
+    );
+    res.status(201).json(mapHomepageVideoRow(row) || { id });
   } catch (err) {
     next(err);
   }
@@ -453,7 +509,8 @@ cmsRouter.put("/videos/:id", async (req, res, next) => {
         youtube_url = COALESCE(:url, youtube_url),
         thumbnail_url = COALESCE(:thumb, thumbnail_url),
         is_published = COALESCE(:pub, is_published),
-        sort_order = COALESCE(:sort, sort_order)
+        sort_order = COALESCE(:sort, sort_order),
+        updated_at = NOW()
        WHERE id = :id`,
       {
         id: req.params.id,
@@ -465,7 +522,13 @@ cmsRouter.put("/videos/:id", async (req, res, next) => {
         sort: input.sortOrder ?? null
       }
     );
-    res.json({ ok: true });
+    const [[row]] = await getPool().query(
+      `SELECT id, title, description, youtube_url, thumbnail_url, thumbnail_alt,
+              duration_label, is_published, sort_order
+       FROM homepage_videos WHERE id = :id`,
+      { id: req.params.id }
+    );
+    res.json(mapHomepageVideoRow(row) || { ok: true, id: req.params.id });
   } catch (err) {
     next(err);
   }
@@ -480,8 +543,36 @@ cmsRouter.delete("/videos/:id", async (req, res, next) => {
 });
 cmsRouter.get("/legal", async (req, res, next) => {
   try {
-    const [rows] = await getPool().query(`SELECT slug, title, updated_at FROM legal_pages ORDER BY slug`);
-    res.json(rows);
+    const pool = getPool();
+    await ensureLegalPages(pool);
+    const [rows] = await pool.query(
+      `SELECT slug, title, updated_at FROM legal_pages ORDER BY slug`
+    );
+    const bySlug = new Map(
+      (rows || []).map((row) => [
+        row.slug,
+        {
+          slug: row.slug,
+          title: row.title,
+          updatedAt: row.updated_at ?? row.updatedat ?? row.updatedAt ?? null
+        }
+      ])
+    );
+    const ordered = listCatalogLegalPages().map((page) => bySlug.get(page.slug) || {
+      slug: page.slug,
+      title: page.title,
+      updatedAt: null
+    });
+    res.json(ordered);
+  } catch (err) {
+    next(err);
+  }
+});
+cmsRouter.get("/legal/:slug", async (req, res, next) => {
+  try {
+    const page = await getLegalPageBySlug(getPool(), req.params.slug, { createIfMissing: true });
+    if (!page) return res.status(404).json({ error: "Not found" });
+    res.json(page);
   } catch (err) {
     next(err);
   }
@@ -489,14 +580,19 @@ cmsRouter.get("/legal", async (req, res, next) => {
 cmsRouter.put("/legal/:slug", async (req, res, next) => {
   try {
     const { title, bodyHtml } = z.object({ title: z.string(), bodyHtml: z.string() }).parse(req.body);
-    await getPool().execute(
-      `INSERT INTO legal_pages (slug, title, body_html, updated_by)
-       VALUES (:slug, :title, :body, :by) ON CONFLICT (slug) DO UPDATE SET title = EXCLUDED.title,
-         body_html = EXCLUDED.body_html,
-         updated_by = EXCLUDED.updated_by`,
-      { slug: req.params.slug, title, body: bodyHtml, by: req.auth.userId }
-    );
-    res.json({ ok: true });
+    const catalog = listCatalogLegalPages().find((p) => p.slug === req.params.slug);
+    if (!catalog) {
+      return res.status(400).json({
+        error: `Unknown legal page slug "${req.params.slug}". Use a slug from the Policies & Disclosures catalog.`
+      });
+    }
+    const page = await upsertLegalPage(getPool(), {
+      slug: req.params.slug,
+      title,
+      bodyHtml,
+      updatedBy: req.auth.userId
+    });
+    res.json({ ok: true, ...page });
   } catch (err) {
     next(err);
   }
@@ -505,10 +601,12 @@ cmsRouter.get("/success-stories", async (req, res, next) => {
   try {
     const status = req.query.status || "pending";
     const [rows] = await getPool().query(
-      `SELECT * FROM success_stories WHERE moderation_status = :status ORDER BY created_at DESC`,
+      `SELECT id, submitter_name, submitter_email, submitter_phone, story_type, story_text,
+              location, loan_amount, photo_url, moderation_status, created_at
+       FROM success_stories WHERE moderation_status = :status ORDER BY created_at DESC`,
       { status }
     );
-    res.json(rows);
+    res.json((rows || []).map(mapSuccessStoryRow).filter(Boolean));
   } catch (err) {
     next(err);
   }

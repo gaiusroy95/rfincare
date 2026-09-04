@@ -24,7 +24,11 @@ const CreateAgentSchema = z.object({
 const CreateEmployeeSchema = z.object({
   ...baseStaffFields,
   employeeName: z.string().min(1),
-  employeeCode: z.string().min(1).max(64)
+  employeeCode: z.string().min(1).max(64),
+  panNumber: z.union([
+    z.literal(""),
+    z.string().regex(/^[A-Z]{5}[0-9]{4}[A-Z]$/i, "Enter a valid PAN number")
+  ]).optional()
 }).passthrough();
 function normalizeBody(body = {}) {
   return {
@@ -38,7 +42,9 @@ function normalizeBody(body = {}) {
     agentName: body.agentName ?? body.agent_name,
     agentCode: body.agentCode ?? body.agent_code,
     employeeName: body.employeeName ?? body.employee_name,
-    employeeCode: body.employeeCode ?? body.employee_code
+    employeeCode: body.employeeCode ?? body.employee_code,
+    panNumber: body.panNumber ?? body.pan_number,
+    photoDataUrl: body.photoDataUrl ?? body.photo_data_url
   };
 }
 async function createAgentAccount(input, createdByUserId, options = {}) {
@@ -134,6 +140,27 @@ async function createEmployeeAccount(input, createdByUserId) {
   const userId = newId();
   const onboardingId = newId();
   const passwordHash = await bcrypt.hash(data.password, 12);
+  const panNumber = data.panNumber ? String(data.panNumber).trim().toUpperCase() : null;
+  let avatarUrl = null;
+  const photoDataUrl = input.photoDataUrl ?? input.photo_data_url ?? null;
+  if (photoDataUrl && String(photoDataUrl).startsWith("data:image/")) {
+    try {
+      const { writeFile, mkdir } = await import("node:fs/promises");
+      const { resolve } = await import("node:path");
+      const { getUploadDir } = await import("./uploadPaths.js");
+      const match = String(photoDataUrl).match(/^data:image\/(\w+);base64,(.+)$/);
+      if (match) {
+        const ext = match[1] === "jpeg" ? "jpg" : match[1];
+        const dir = resolve(getUploadDir(), "employee-avatars");
+        await mkdir(dir, { recursive: true });
+        const fileName = `${userId}-${Date.now()}.${ext}`;
+        await writeFile(resolve(dir, fileName), Buffer.from(match[2], "base64"));
+        avatarUrl = `/uploads/employee-avatars/${fileName}`;
+      }
+    } catch (err) {
+      console.warn("[employee-photo]", err.message);
+    }
+  }
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
@@ -143,24 +170,25 @@ async function createEmployeeAccount(input, createdByUserId) {
     );
     await conn.execute(
       `INSERT INTO user_profiles (
-         id, email, full_name, phone, role, account_status, is_active, onboarding_status
+         id, email, full_name, phone, role, account_status, is_active, onboarding_status, avatar_url
        ) VALUES (
-         :id, :email, :fullName, :phone, 'employee', 'active', TRUE, 'active'
+         :id, :email, :fullName, :phone, 'employee', 'active', TRUE, 'active', :avatar_url
        )`,
       {
         id: userId,
         email: data.email,
         fullName: data.employeeName,
-        phone: data.mobileNumber
+        phone: data.mobileNumber,
+        avatar_url: avatarUrl
       }
     );
     await conn.execute(
       `INSERT INTO employee_onboarding (
          id, user_id, username, employee_name, employee_code, email, mobile_number,
-         account_number, bank_name, ifsc_code, onboarding_status, created_by
+         account_number, bank_name, ifsc_code, pan_number, onboarding_status, created_by
        ) VALUES (
          :id, :user_id, :username, :employee_name, :employee_code, :email, :mobile_number,
-         :account_number, :bank_name, :ifsc_code, 'active', :created_by
+         :account_number, :bank_name, :ifsc_code, :pan_number, 'active', :created_by
        )`,
       {
         id: onboardingId,
@@ -173,12 +201,13 @@ async function createEmployeeAccount(input, createdByUserId) {
         account_number: data.accountNumber,
         bank_name: data.bankName,
         ifsc_code: data.ifscCode.toUpperCase(),
+        pan_number: panNumber,
         created_by: createdByUserId
       }
     );
     await conn.commit();
     const [[row]] = await pool.execute(
-      `SELECT up.*, eo.employee_code, eo.username, eo.onboarding_status AS eo_status
+      `SELECT up.*, eo.employee_code, eo.username, eo.onboarding_status AS eo_status, eo.pan_number
        FROM user_profiles up
        LEFT JOIN employee_onboarding eo ON eo.user_id = up.id
        WHERE up.id = :id LIMIT 1`,
@@ -197,6 +226,11 @@ async function createEmployeeAccount(input, createdByUserId) {
     if (isDuplicateEntryError(err)) {
       const e = new Error("Username, employee code, or email already exists");
       e.status = 409;
+      throw e;
+    }
+    if (String(err?.message || "").includes("pan_number")) {
+      const e = new Error("Database missing pan_number column. Run: npm run db:migrate");
+      e.status = 500;
       throw e;
     }
     throw err;

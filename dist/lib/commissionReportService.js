@@ -1,3 +1,4 @@
+import * as XLSX from "xlsx";
 import { getPool } from "../db/pool.js";
 import { buildSimpleTextPdf } from "./simplePdf.js";
 import { ensureMilestone4Schema } from "../db/ensureMilestone4Schema.js";
@@ -152,8 +153,38 @@ function commissionReportToPdf(report) {
   ];
   return buildSimpleTextPdf(lines);
 }
+function commissionReportToXlsx(report) {
+  const rows = (report.entries || []).map((e) => ({
+    application_number: e.applicationNumber,
+    customer_name: e.customerName,
+    loan_type: e.loanType,
+    application_status: e.applicationStatus,
+    commission_status: e.commissionStatus,
+    disbursed_amount: e.disbursedAmount,
+    disbursed_at: e.disbursedAt || "",
+    commission_rate_percent: e.commissionRatePercent,
+    gross_commission: e.grossCommission,
+    tds_amount: e.tdsAmount,
+    net_payout: e.netPayout,
+    agent_code: e.agentCode,
+    generated_at: e.generatedAt
+  }));
+  const ws = XLSX.utils.json_to_sheet(rows);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Commission");
+  return XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+}
+function summarizeCommissionReport(report) {
+  const entries = report.entries || [];
+  const gross = entries.reduce((sum, e) => sum + Number(e.grossCommission || 0), 0);
+  const tds = entries.reduce((sum, e) => sum + Number(e.tdsAmount || 0), 0);
+  const net = entries.reduce((sum, e) => sum + Number(e.netPayout || 0), 0);
+  return { entryCount: entries.length, gross, tds, net };
+}
 export {
   buildAgentCommissionReport,
   commissionReportToCsv,
-  commissionReportToPdf
+  commissionReportToPdf,
+  commissionReportToXlsx,
+  summarizeCommissionReport
 };

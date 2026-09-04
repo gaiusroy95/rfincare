@@ -34,10 +34,12 @@ function extractCibilDemographics({ application, customer, extra = {} } = {}) {
   const name = extra.fullName || customer?.full_name || [merged.firstName || merged.first_name, merged.lastName || merged.last_name].filter(Boolean).join(" ") || firstValue(merged, ["fullName", "full_name", "name", "applicant_name"]);
   return {
     name,
+    fatherName: firstValue(merged, ["fatherName", "father_name", "fathersName"]),
     pan: firstValue(merged, ["panNumber", "pan_number", "pan", "id_number"]).toUpperCase(),
     mobile: firstValue(merged, ["phone", "mobile", "mobile_number", "mobileNo"]) || customer?.phone,
     dob: firstValue(merged, ["dateOfBirth", "date_of_birth", "dob"]),
     gender: firstValue(merged, ["gender"]),
+    pincode: firstValue(merged, ["pincode", "pin_code", "pinCode"]),
     consent: extra.consent !== false
   };
 }
@@ -321,7 +323,7 @@ async function getLatestCustomerCibilCheck(customerId) {
     checkedAt: row.checked_at
   };
 }
-async function pullCibilForCustomer(customerId, { forceSandbox = false } = {}) {
+async function pullCibilForCustomer(customerId, { forceSandbox = false, demographics = null } = {}) {
   await ensureMilestone4Schema();
   const pool = getPool();
   const [[customer]] = await pool.execute(
@@ -362,7 +364,28 @@ async function pullCibilForCustomer(customerId, { forceSandbox = false } = {}) {
     `SELECT id, data FROM loan_applications WHERE customer_id = :id ORDER BY updated_at DESC LIMIT 1`,
     { id: customerId }
   );
-  const stubApplication = latestApp || { id: customer.id, data: "{}" };
+  let stubApplication = latestApp || { id: customer.id, data: "{}" };
+  if (demographics?.panNumber) {
+    const existingData = (() => {
+      try {
+        return typeof stubApplication.data === "object" ? stubApplication.data : JSON.parse(stubApplication.data || "{}");
+      } catch {
+        return {};
+      }
+    })();
+    stubApplication = {
+      id: stubApplication.id || customer.id,
+      data: JSON.stringify({
+        ...existingData,
+        pan_number: demographics.panNumber,
+        panNumber: demographics.panNumber,
+        father_name: demographics.fatherName || existingData.father_name,
+        fatherName: demographics.fatherName || existingData.fatherName,
+        pincode: demographics.pincode || existingData.pincode,
+        pin_code: demographics.pincode || existingData.pin_code
+      })
+    };
+  }
   const useSandbox = forceSandbox || Boolean(vendor.sandbox_mode);
   const result = useSandbox ? await sandboxPull({ vendor, application: stubApplication, customer }) : await productionPull({ vendor, application: stubApplication, customer });
   const checkId = newId();
@@ -401,6 +424,73 @@ const BAND_LABELS = {
   fair: "Fair",
   needs_improvement: "Needs improvement"
 };
+async function pullCibilForEmployee(demographics, employeeUserId) {
+  await ensureMilestone4Schema();
+  const pool = getPool();
+  const vendor = await getActiveVendor(pool);
+  if (!vendor) {
+    const e = new Error("CIBIL check is temporarily unavailable. Please try again later.");
+    e.status = 503;
+    throw e;
+  }
+  const stubId = newId();
+  const stubCustomer = {
+    id: stubId,
+    full_name: demographics.fullName,
+    phone: demographics.mobile
+  };
+  const stubApplication = {
+    id: stubId,
+    data: JSON.stringify({
+      pan_number: demographics.panNumber,
+      panNumber: demographics.panNumber,
+      father_name: demographics.fatherName,
+      fatherName: demographics.fatherName,
+      pincode: demographics.pincode,
+      pin_code: demographics.pincode
+    })
+  };
+  const extra = {
+    fullName: demographics.fullName,
+    fatherName: demographics.fatherName,
+    pincode: demographics.pincode,
+    consent: true
+  };
+  const useSandbox = Boolean(vendor.sandbox_mode);
+  const result = useSandbox ? await sandboxPull({ vendor, application: stubApplication, customer: stubCustomer, extra }) : await productionPull({ vendor, application: stubApplication, customer: stubCustomer, extra });
+  const checkId = newId();
+  await pool.execute(
+    `INSERT INTO cibil_checks
+     (id, application_id, customer_id, vendor_key, status, credit_score, report_path, error_message, request_payload, response_payload)
+     VALUES (:id, NULL, NULL, :vendor, :status, :score, :path, :err, :req::jsonb, :resp::jsonb)`,
+    {
+      id: checkId,
+      vendor: vendor.vendor_key,
+      status: result.status,
+      score: result.creditScore,
+      path: result.reportPath,
+      err: result.errorMessage || null,
+      req: JSON.stringify({ ...demographics, initiatedByUserId: employeeUserId, source: "employee_portal" }),
+      resp: JSON.stringify(result.response || {})
+    }
+  );
+  if (result.status !== "success") {
+    const e = new Error(result.errorMessage || "Could not fetch CIBIL score");
+    e.status = 422;
+    throw e;
+  }
+  const band = scoreBand(result.creditScore || 0);
+  return {
+    checkId,
+    creditScore: result.creditScore,
+    band: result.creditScore ? band : "unknown",
+    bandLabel: result.creditScore ? BAND_LABELS[band] : "Report generated",
+    vendorName: vendor.display_name,
+    sandboxMode: useSandbox,
+    reportPath: result.reportPath,
+    checkedAt: (/* @__PURE__ */ new Date()).toISOString()
+  };
+}
 async function pullCibilForGuest(demographics, { upsertLead } = {}) {
   await ensureMilestone4Schema();
   const pool = getPool();
@@ -506,6 +596,7 @@ export {
   listCibilVendors,
   pullCibilForApplication,
   pullCibilForCustomer,
+  pullCibilForEmployee,
   pullCibilForGuest,
   requireSuccessfulCibilForSubmit,
   syncSurepassVendorFromEnv,

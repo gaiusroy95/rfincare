@@ -160,27 +160,32 @@ function mapCommissionConfigRow(row) {
   };
 }
 async function resolveAgentCommissionConfig(pool, agentUserId, loanType = null) {
-  if (loanType) {
-    const [[row]] = await pool.execute(
+  try {
+    if (loanType) {
+      const [[row]] = await pool.execute(
+        `SELECT * FROM agent_commission_config
+         WHERE agent_user_id = :uid AND loan_type = :lt
+         LIMIT 1`,
+        { uid: agentUserId, lt: loanType }
+      );
+      if (row) return row;
+    }
+    const [[latest]] = await pool.execute(
       `SELECT * FROM agent_commission_config
-       WHERE agent_user_id = :uid AND loan_type = :lt
+       WHERE agent_user_id = :uid
+       ORDER BY updated_at DESC
        LIMIT 1`,
-      { uid: agentUserId, lt: loanType }
+      { uid: agentUserId }
     );
-    if (row) return row;
+    if (latest) return latest;
+    const [[globalRow]] = await pool.execute(
+      `SELECT * FROM global_commission_config WHERE id = 'default' LIMIT 1`
+    );
+    return globalRow || null;
+  } catch (err) {
+    console.warn("[commission] resolveAgentCommissionConfig failed:", err?.message);
+    return null;
   }
-  const [[latest]] = await pool.execute(
-    `SELECT * FROM agent_commission_config
-     WHERE agent_user_id = :uid
-     ORDER BY updated_at DESC
-     LIMIT 1`,
-    { uid: agentUserId }
-  );
-  if (latest) return latest;
-  const [[globalRow]] = await pool.execute(
-    `SELECT * FROM global_commission_config WHERE id = 'default' LIMIT 1`
-  );
-  return globalRow || null;
 }
 async function findAgentByCode(pool, agentCode) {
   const [[row]] = await pool.execute(

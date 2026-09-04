@@ -39,7 +39,10 @@ const CreateSchema = z.object({
   leadId: z.string().optional(),
   lead_id: z.string().optional(),
   bankResults: z.array(z.unknown()).optional(),
-  bank_results: z.array(z.unknown()).optional()
+  bank_results: z.array(z.unknown()).optional(),
+  pincode: z.string().optional(),
+  pinCode: z.string().optional(),
+  pin_code: z.string().optional()
 });
 eligibilityAssessmentsRouter.post("/", async (req, res, next) => {
   try {
@@ -54,7 +57,8 @@ eligibilityAssessmentsRouter.post("/", async (req, res, next) => {
       employmentType: body.employmentType || body.employment_type,
       creditScore: body.creditScoreRange || body.credit_score_range,
       creditScoreRange: body.creditScoreRange || body.credit_score_range,
-      existingLoans: body.existingLoans ?? body.existing_loans ?? 0
+      existingLoans: body.existingLoans ?? body.existing_loans ?? 0,
+      pincode: body.pincode || body.pinCode || body.pin_code
     };
     let bankResults = body.bankResults || body.bank_results;
     let score = body.eligibilityScore ?? body.eligibility_score;

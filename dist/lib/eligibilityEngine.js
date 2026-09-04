@@ -1,5 +1,23 @@
 import { getPool } from "../db/pool.js";
 import { ensureMilestone3Schema } from "../db/ensureMilestone3Schema.js";
+import { getMatchingConfig, DEFAULT_MATCHING_WEIGHTS, DEFAULT_DECISION_THRESHOLDS } from "./matchingConfig.js";
+import { evaluateRule, summarizeDecision } from "./ruleEngine.js";
+import { listEngineEligibilityRules, ensurePolicyConsoleSchema } from "./policyConsole.js";
+import { getApplicantAge } from "./applicantAge.js";
+import { ensureGeoSchema } from "./geoHierarchy.js";
+import {
+  applyLocationServiceabilityGate,
+  normalizeApplicationPincode,
+  pickServiceabilityRow
+} from "./lenderPinServiceability.js";
+import {
+  buildAddressPinChecks,
+  buildOverallGeoMessage,
+  evaluateBankGeoCoverage,
+  partitionBanksByGeo,
+  GEO_MESSAGES
+} from "./lenderGeoEligibility.js";
+import { loadActiveGeoCoverageByBank, ensureLenderGeoPolicySchema } from "./lenderGeoPolicy.js";
 const CREDIT_SCORE_MAP = {
   excellent: 780,
   good: 725,
@@ -96,16 +114,80 @@ function employmentTypesMatch(ruleEmploymentTypes, employmentType) {
 }
 async function calculateEligibility(input) {
   await ensureMilestone3Schema();
+  await ensurePolicyConsoleSchema().catch(() => {
+  });
   const pool = getPool();
-  const monthlyIncome = clampAmount(input.monthlyIncome);
+  const matchingConfig = await getMatchingConfig().catch(() => ({
+    weights: DEFAULT_MATCHING_WEIGHTS,
+    decisionThresholds: DEFAULT_DECISION_THRESHOLDS
+  }));
+  const W = { ...DEFAULT_MATCHING_WEIGHTS, ...matchingConfig.weights || {} };
+  const thresholds = {
+    ...DEFAULT_DECISION_THRESHOLDS,
+    ...matchingConfig.decisionThresholds || {}
+  };
+  const monthlyIncomeBase = clampAmount(input.monthlyIncome);
+  const extraIncome = clampAmount(input.extraIncome ?? input.extra_income);
+  const monthlyIncome = monthlyIncomeBase + extraIncome;
   const loanAmount = clampAmount(input.loanAmount);
   const existingLoans = clampAmount(input.existingLoans);
   const creditKey = normalizeCreditScoreKey(input.creditScore || input.creditScoreRange);
-  const creditScore = CREDIT_SCORE_MAP[creditKey] ?? CREDIT_SCORE_MAP[input.creditScore] ?? CREDIT_SCORE_MAP[input.creditScoreRange] ?? 700;
+  const liveNumeric = Number(input.liveCreditScore);
+  const creditScore = Number.isFinite(liveNumeric) && liveNumeric >= 300 && liveNumeric <= 900 ? Math.round(liveNumeric) : CREDIT_SCORE_MAP[creditKey] ?? CREDIT_SCORE_MAP[input.creditScore] ?? CREDIT_SCORE_MAP[input.creditScoreRange] ?? 700;
   const employmentType = normalizeEmploymentType(input.employmentType);
   const loanType = input.loanType || input.loanPurpose || null;
   const loanCategory = inferSecuredCategory(loanType);
   const collateralValue = clampAmount(input.collateralValue ?? input.propertyValue);
+  const yearsEmployed = Number(input.yearsEmployed ?? input.years_employed);
+  const applicantAge = (() => {
+    const fromInput = Number(input.age);
+    if (Number.isFinite(fromInput) && fromInput > 0) return fromInput;
+    return getApplicantAge(input.dateOfBirth || input.date_of_birth || input.dob);
+  })();
+  const applicantPincode = normalizeApplicationPincode(
+    input.pincode || input.pinCode || input.pin_code || input.postal || input.currentPincode
+  );
+  const addressChecks = buildAddressPinChecks(input, { loanCategory });
+  const districtNameHint = input.district || input.districtName || input.propertyDistrict || input.city || null;
+  let geoPolicy = { versionId: null, byBank: /* @__PURE__ */ new Map(), bankIdsWithPolicy: /* @__PURE__ */ new Set() };
+  try {
+    await ensureLenderGeoPolicySchema();
+    geoPolicy = await loadActiveGeoCoverageByBank(pool);
+  } catch {
+    geoPolicy = { versionId: null, byBank: /* @__PURE__ */ new Map(), bankIdsWithPolicy: /* @__PURE__ */ new Set() };
+  }
+  const versionedRules = await listEngineEligibilityRules({}).catch(() => []);
+  const rulesByBankVersioned = /* @__PURE__ */ new Map();
+  for (const vr of versionedRules) {
+    const key = vr.bank_id || "__global__";
+    if (!rulesByBankVersioned.has(key)) rulesByBankVersioned.set(key, []);
+    rulesByBankVersioned.get(key).push(vr);
+  }
+  let propertyLtvByBank = /* @__PURE__ */ new Map();
+  try {
+    const [ltvRows] = await pool.query(
+      `SELECT plr.bank_id, plr.property_type, plr.max_ltv
+       FROM property_ltv_rules plr
+       LEFT JOIN product_policy_versions ppv ON ppv.id = plr.version_id
+       WHERE plr.is_active = TRUE
+         AND (
+           (plr.version_id IS NOT NULL AND ppv.status = 'active')
+           OR (
+             plr.version_id IS NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM product_policy_versions v
+               WHERE v.status = 'active' AND v.bank_id = plr.bank_id
+             )
+           )
+         )`
+    );
+    for (const row of ltvRows) {
+      if (!propertyLtvByBank.has(row.bank_id)) propertyLtvByBank.set(row.bank_id, []);
+      propertyLtvByBank.get(row.bank_id).push(row);
+    }
+  } catch {
+    propertyLtvByBank = /* @__PURE__ */ new Map();
+  }
   const [banks] = await pool.query(
     `SELECT b.id, b.name, bp.id AS product_id, bp.name AS product_name, bp.data AS product_data
      FROM banks b
@@ -129,6 +211,35 @@ async function calculateEligibility(input) {
   for (const r of rules) {
     if (!rulesByBank.has(r.bank_id)) rulesByBank.set(r.bank_id, []);
     rulesByBank.get(r.bank_id).push(r);
+  }
+  const serviceabilityByBank = /* @__PURE__ */ new Map();
+  try {
+    await ensureGeoSchema();
+    const [coverageCounts] = await pool.query(
+      `SELECT bank_id, COUNT(*)::int AS c
+       FROM lender_serviceability
+       WHERE level = 'pincode' AND pincode IS NOT NULL AND pincode <> ''
+       GROUP BY bank_id`
+    );
+    for (const row of coverageCounts) {
+      serviceabilityByBank.set(row.bank_id, { hasList: Number(row.c) > 0, pinRows: [] });
+    }
+    if (applicantPincode) {
+      const [pinRows] = await pool.query(
+        `SELECT bank_id, bank_product_id, pincode, status, notes
+         FROM lender_serviceability
+         WHERE level = 'pincode' AND pincode = :pincode`,
+        { pincode: applicantPincode }
+      );
+      for (const row of pinRows) {
+        if (!serviceabilityByBank.has(row.bank_id)) {
+          serviceabilityByBank.set(row.bank_id, { hasList: true, pinRows: [] });
+        }
+        serviceabilityByBank.get(row.bank_id).pinRows.push(row);
+      }
+    }
+  } catch {
+    serviceabilityByBank.clear();
   }
   const bankResults = [];
   const bankMap = /* @__PURE__ */ new Map();
@@ -177,11 +288,28 @@ async function calculateEligibility(input) {
         const minLoan = Number(d.min_loan_amount ?? d.minLoanAmount ?? 0);
         const maxLoan = Number(d.max_loan_amount ?? d.maxLoanAmount ?? Infinity);
         const annualIncome = monthlyIncome * 12;
-        if (annualIncome < minIncome || Number.isFinite(maxIncome) && annualIncome > maxIncome) score -= 25;
-        if (creditScore < minCredit || creditScore > maxCredit) score -= 20;
-        if (loanAmount < minLoan || loanAmount > maxLoan) score -= 20;
-        if (!employmentTypesMatch(d.employment_types, employmentType)) score -= 15;
-        if (d.loan_types && loanType && !String(d.loan_types).includes(loanType)) score -= 10;
+        if (annualIncome < minIncome || Number.isFinite(maxIncome) && annualIncome > maxIncome) {
+          score -= W.income_mismatch;
+        }
+        if (creditScore < minCredit || creditScore > maxCredit) score -= W.credit_mismatch;
+        if (loanAmount < minLoan || loanAmount > maxLoan) score -= W.loan_amount_mismatch;
+        if (!employmentTypesMatch(d.employment_types, employmentType)) score -= W.employment_mismatch;
+        if (d.loan_types && loanType && !String(d.loan_types).includes(loanType)) {
+          score -= W.loan_type_mismatch;
+        }
+        const minAge = getRuleNumber(d, ["min_age", "minAge", "age_min"], 21);
+        const maxAge = getRuleNumber(d, ["max_age", "maxAge", "age_max"], 70);
+        if (applicantAge != null) {
+          if (applicantAge < minAge || applicantAge > maxAge) score -= W.age_mismatch;
+        }
+        const minYearsEmployed = getRuleNumber(
+          d,
+          ["min_years_employed", "minYearsEmployed", "min_employment_years", "stability_years"],
+          employmentType === "salaried" ? 1 : 0
+        );
+        if (Number.isFinite(yearsEmployed) && yearsEmployed >= 0 && yearsEmployed < minYearsEmployed) {
+          score -= W.stability_mismatch;
+        }
         const foirDefault = loanCategory === "secured" ? 0.65 : employmentType === "salaried" ? 0.55 : 0.5;
         const tenureDefault = loanCategory === "secured" ? 240 : 60;
         const ltvDefault = loanCategory === "secured" ? 0.75 : 1;
@@ -200,18 +328,24 @@ async function calculateEligibility(input) {
           ],
           tenureDefault
         );
-        const ltv = getRuleNumber(
+        let ltv = getRuleNumber(
           d,
           ["ltv", "ltv_ratio", "max_ltv", `${loanCategory}_ltv`, `ltv_${loanCategory}`],
           ltvDefault
         );
+        const bankLtv = (propertyLtvByBank.get(bankId) || [])[0];
+        if (bankLtv?.max_ltv != null && Number.isFinite(Number(bankLtv.max_ltv))) {
+          ltv = Number(bankLtv.max_ltv);
+        }
         maxMonthlyEmi = Math.max(0, monthlyIncome * foir - existingLoans);
         const emiEligible = principalFromEmi(matchedRate, tenureMonths, maxMonthlyEmi);
         const assetCap = loanCategory === "secured" && collateralValue > 0 ? collateralValue * ltv : Number.MAX_SAFE_INTEGER;
         eligibleAmount = Math.max(eligibleAmount, Math.max(0, Math.min(emiEligible, assetCap)));
         const expectedEmi = pmt(matchedRate, tenureMonths, loanAmount);
-        if (expectedEmi > maxMonthlyEmi) score -= 12;
-        if (loanCategory === "secured" && collateralValue > 0 && loanAmount > collateralValue * ltv) score -= 10;
+        if (expectedEmi > maxMonthlyEmi) score -= W.emi_capacity_mismatch;
+        if (loanCategory === "secured" && collateralValue > 0 && loanAmount > collateralValue * ltv) {
+          score -= W.ltv_mismatch;
+        }
         return Math.max(0, Math.min(100, score));
       });
       probability = Math.round(scores.reduce((a, b) => a + b, 0) / scores.length);
@@ -226,33 +360,135 @@ async function calculateEligibility(input) {
       const incomeRatio = loanAmount > 0 ? eligibleAmount / loanAmount : 1;
       probability = Math.min(95, Math.round(40 + incomeRatio * 30 + (creditScore - 600) / 10));
     }
+    const applicantCtx = {
+      monthlyIncome,
+      loanAmount,
+      creditScore,
+      employmentType,
+      age: applicantAge,
+      yearsEmployed,
+      existingLoans,
+      collateralValue,
+      loanType
+    };
+    const versioned = [
+      ...rulesByBankVersioned.get(bankId) || [],
+      ...rulesByBankVersioned.get("__global__") || []
+    ];
+    const ruleTraces = versioned.map(
+      (rule) => evaluateRule(rule, rule.conditions || [], applicantCtx)
+    );
+    const criticalFail = ruleTraces.some(
+      (t) => t.status === "FAIL" && String(t.severity).toLowerCase() === "critical"
+    );
+    if (criticalFail) {
+      probability = Math.max(0, probability - (W.critical_fail_penalty || 100));
+    } else {
+      const softFails = ruleTraces.filter((t) => t.status === "FAIL" && t.severity !== "critical").length;
+      if (softFails > 0) probability = Math.max(0, probability - softFails * 5);
+    }
+    const decisionInfo = summarizeDecision(ruleTraces, {
+      eligibleMin: thresholds.eligible_min_probability,
+      conditionalMin: thresholds.conditional_min_probability,
+      probability
+    });
     bank.bestProbability = probability;
     bank.loanCategory = loanCategory;
     bank.eligibleAmount = safeRound(eligibleAmount);
     bank.maxMonthlyEmi = safeRound(maxMonthlyEmi);
     bank.estimatedRate = Number(matchedRate.toFixed(2));
+    bank.decision = decisionInfo.decision;
+    bank.decisionReason = decisionInfo.reason;
+    bank.ruleTraceCount = ruleTraces.length;
+    bank.applicantPincode = applicantPincode;
+    const hasNewGeo = geoPolicy.bankIdsWithPolicy.has(bankId);
+    if (geoPolicy.versionId && (hasNewGeo || geoPolicy.bankIdsWithPolicy.size > 0)) {
+      const geoEval = evaluateBankGeoCoverage({
+        bankHasGeoPolicy: hasNewGeo,
+        coverageRows: geoPolicy.byBank.get(bankId) || [],
+        addressChecks,
+        districtName: districtNameHint
+      });
+      bank.geoStatus = geoEval.geoStatus;
+      bank.geoCovered = geoEval.geoCovered;
+      bank.geoReason = geoEval.reason;
+      bank.geoPinResults = geoEval.pinResults;
+      bank.locationRemark = geoEval.reason;
+      bank.locationCovered = geoEval.geoCovered;
+      bank.locationStatus = geoEval.geoStatus;
+      bank.showInScoredList = geoEval.showInScoredList;
+      if (geoEval.showInScoredList === false) {
+        bank.decision = geoEval.geoStatus === "conditional" || geoEval.geoStatus === "in_review" ? "CONDITIONAL" : "NOT_ELIGIBLE";
+        bank.decisionReason = geoEval.reason;
+      }
+    } else {
+      const primaryProductId = bank.products?.[0]?.id || null;
+      const svc = serviceabilityByBank.get(bankId) || { hasList: false, pinRows: [] };
+      const svcRow = pickServiceabilityRow(svc.pinRows, {
+        bankId,
+        bankProductId: primaryProductId
+      });
+      const locationGate = applyLocationServiceabilityGate({
+        pincode: applicantPincode,
+        bankHasCoverageList: Boolean(svc.hasList),
+        row: svcRow,
+        decision: decisionInfo.decision,
+        decisionReason: decisionInfo.reason,
+        probability,
+        eligibleAmount
+      });
+      bank.bestProbability = locationGate.probability;
+      bank.eligibleAmount = safeRound(locationGate.eligibleAmount);
+      bank.decision = locationGate.decision;
+      bank.decisionReason = locationGate.decisionReason;
+      bank.locationRemark = locationGate.locationRemark;
+      bank.locationCovered = locationGate.locationCovered;
+      bank.locationStatus = locationGate.locationStatus;
+      bank.geoStatus = locationGate.locationCovered === true ? "covered" : locationGate.locationCovered === false ? "not_covered" : "skipped";
+      bank.showInScoredList = locationGate.locationCovered !== false;
+    }
     bankResults.push(bank);
   }
   bankResults.sort((a, b) => b.bestProbability - a.bestProbability);
-  const overallProbability = bankResults.length ? Math.round(bankResults.reduce((s, b) => s + b.bestProbability, 0) / bankResults.length) : 0;
-  const bestEligibleAmount = bankResults.reduce((max, bank) => Math.max(max, bank.eligibleAmount || 0), 0);
-  const maxMonthlyEmiOverall = bankResults.reduce((max, bank) => Math.max(max, bank.maxMonthlyEmi || 0), 0);
-  const approved = overallProbability >= 70 && loanAmount <= bestEligibleAmount;
+  const { scored, inReview } = partitionBanksByGeo(bankResults);
+  const scoredForResponse = scored.slice(0, 12);
+  const overallProbability = scoredForResponse.length ? Math.round(scoredForResponse.reduce((s, b) => s + b.bestProbability, 0) / scoredForResponse.length) : 0;
+  const bestEligibleAmount = scoredForResponse.reduce((max, bank) => Math.max(max, bank.eligibleAmount || 0), 0);
+  const maxMonthlyEmiOverall = scoredForResponse.reduce((max, bank) => Math.max(max, bank.maxMonthlyEmi || 0), 0);
+  const eligibleMin = thresholds.eligible_min_probability;
+  const conditionalMin = thresholds.conditional_min_probability;
+  const approved = overallProbability >= eligibleMin && loanAmount <= bestEligibleAmount;
+  const overallDecision = summarizeDecision([], {
+    eligibleMin,
+    conditionalMin,
+    probability: overallProbability
+  }).decision;
+  const geoMessage = buildOverallGeoMessage({ scored: scoredForResponse, inReview });
+  const defaultMessage = approved ? "Strong match with lender criteria based on current parameters." : loanCategory === "secured" ? "For secured products, eligible amount is capped by FOIR and LTV. Higher collateral value can improve eligibility." : "For unsecured products, eligibility is calculated from FOIR-based EMI capacity and tenure. Lower existing EMI can improve approval odds.";
   return {
     overallProbability,
     eligibleAmount: safeRound(bestEligibleAmount),
     maxMonthlyEmi: safeRound(maxMonthlyEmiOverall),
     loanCategory,
-    status: approved ? "likely_approved" : overallProbability >= 50 ? "conditional" : "unlikely",
-    message: approved ? "Strong match with lender criteria based on current parameters." : loanCategory === "secured" ? "For secured products, eligible amount is capped by FOIR and LTV. Higher collateral value can improve eligibility." : "For unsecured products, eligibility is calculated from FOIR-based EMI capacity and tenure. Lower existing EMI can improve approval odds.",
-    banks: bankResults.slice(0, 12),
+    decision: overallDecision,
+    status: approved ? "likely_approved" : overallProbability >= conditionalMin ? "conditional" : "unlikely",
+    message: geoMessage || defaultMessage,
+    geoMessage: geoMessage || null,
+    geoMessages: GEO_MESSAGES,
+    banks: scoredForResponse,
+    banksInReview: inReview.slice(0, 12),
+    geoPolicyVersionId: geoPolicy.versionId,
+    matchingWeights: W,
+    decisionThresholds: thresholds,
     input: {
       monthlyIncome,
       loanAmount,
       creditScore,
       employmentType,
       loanType,
-      collateralValue
+      collateralValue,
+      pincode: applicantPincode,
+      addressMode: addressChecks.mode
     }
   };
 }

@@ -7,6 +7,7 @@ const EMPLOYEE_ACCESS_MODULES = [
   { key: "banks", label: "Bank Management" },
   { key: "reports", label: "Reports & Analytics" },
   { key: "documents", label: "Document Management" },
+  { key: "leads", label: "Marketing Leads" },
   { key: "approval_matrix", label: "Approval Matrix" },
   { key: "system_config", label: "System Configuration" }
 ];

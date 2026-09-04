@@ -12,7 +12,7 @@ paymentsRouter.post(
     try {
       const signature = req.headers["x-razorpay-signature"];
       const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || "");
-      if (!verifyRazorpayWebhookSignature(rawBody, signature)) {
+      if (!await verifyRazorpayWebhookSignature(rawBody, signature)) {
         return res.status(401).json({ error: "Invalid webhook signature" });
       }
       const payload = JSON.parse(rawBody.toString("utf8") || "{}");

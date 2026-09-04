@@ -4,49 +4,85 @@ function smtpConfigured() {
   );
 }
 function smtpPassword() {
-  const raw = process.env.SMTP_PASS || process.env.SMTP_PASSWORD || "";
-  return String(raw).replace(/^["']|["']$/g, "").trim();
+  let raw = process.env.SMTP_PASS || process.env.SMTP_PASSWORD || "";
+  raw = String(raw).trim();
+  if (raw.startsWith('"') && raw.endsWith('"') || raw.startsWith("'") && raw.endsWith("'")) {
+    raw = raw.slice(1, -1).trim();
+  }
+  const host = String(process.env.SMTP_HOST || "").toLowerCase();
+  if (host.includes("gmail.com") || host.includes("googlemail.com")) {
+    raw = raw.replace(/\s+/g, "");
+  }
+  return raw;
 }
 function smtpFromAddress() {
   return String(
     process.env.SMTP_FROM || process.env.SMTP_FROM_EMAIL || process.env.SMTP_USER || ""
   ).trim();
 }
-async function sendViaSmtp({ to, subject, text, html, attachments = [] }) {
+function humanizeSmtpError(err) {
+  const message = String(err?.message || err || "");
+  const response = String(err?.response || "");
+  const combined = `${message} ${response}`;
+  if (/535|BadCredentials|Username and Password not accepted/i.test(combined)) {
+    return "Gmail SMTP login failed (535 BadCredentials). Use a Google App Password (not your normal Gmail password), set SMTP_USER to the full Gmail address, set SMTP_PASS to the 16-character app password WITHOUT spaces or quotes, and ensure 2-Step Verification is ON. Then update Cloud Run Variables & Secrets and redeploy/restart the service.";
+  }
+  if (/EAUTH/i.test(combined) || /Invalid login/i.test(combined)) {
+    return "SMTP authentication failed. Check SMTP_HOST, SMTP_USER, SMTP_PASS/SMTP_PASSWORD on the server (Cloud Run Variables). For Gmail you must use an App Password.";
+  }
+  return message || "Email could not be delivered via SMTP. Check SMTP_* env vars or hosting outbound port access.";
+}
+async function sendViaSmtp({ to, subject, text, html, attachments = [], cc }) {
   const nodemailer = await import("nodemailer");
   const pass = smtpPassword();
   const user = String(process.env.SMTP_USER || "").trim();
   const port = Number(process.env.SMTP_PORT || 587);
   const secure = process.env.SMTP_SECURE === "true" || port === 465;
+  if (!user || !pass) {
+    const err = new Error(
+      "SMTP_USER and SMTP_PASS (or SMTP_PASSWORD) are required when SMTP_HOST is set."
+    );
+    err.code = "EAUTH";
+    throw err;
+  }
   const transporter = nodemailer.createTransport({
     host: process.env.SMTP_HOST,
     port,
     secure,
     requireTLS: !secure && port === 587,
-    auth: user && pass ? { user, pass } : void 0,
+    auth: { user, pass },
     connectionTimeout: Number(process.env.SMTP_CONNECTION_TIMEOUT_MS || 1e4),
     greetingTimeout: Number(process.env.SMTP_GREETING_TIMEOUT_MS || 1e4),
     socketTimeout: Number(process.env.SMTP_SOCKET_TIMEOUT_MS || 15e3)
   });
   await transporter.sendMail({
-    from: smtpFromAddress(),
+    from: smtpFromAddress() || user,
     to,
+    cc: cc || void 0,
     subject,
     text,
     html: html || text,
     attachments
   });
 }
-async function sendEmail({ to, subject, text, html, attachments }) {
+async function sendEmail({ to, subject, text, html, attachments, cc }) {
   if (!to) return { sent: false, reason: "no_recipient" };
   const mailAttachments = Array.isArray(attachments) ? attachments.filter((a) => a?.path || a?.content) : [];
   if (smtpConfigured()) {
     try {
-      await sendViaSmtp({ to, subject, text, html, attachments: mailAttachments });
+      await sendViaSmtp({
+        to,
+        subject,
+        text,
+        html,
+        attachments: mailAttachments,
+        cc
+      });
       return {
         sent: true,
         channel: "smtp",
-        attachmentCount: mailAttachments.length
+        attachmentCount: mailAttachments.length,
+        ccSupported: true
       };
     } catch (err) {
       console.error("[email:smtp]", err?.message || err);
@@ -54,12 +90,12 @@ async function sendEmail({ to, subject, text, html, attachments }) {
         sent: false,
         channel: "smtp",
         reason: err?.code || "smtp_error",
-        warning: err?.message || "Email could not be delivered via SMTP. Check SMTP_* env vars or hosting outbound port access.",
+        warning: humanizeSmtpError(err),
         attachmentCount: mailAttachments.length
       };
     }
   }
-  console.log("[email]", { to, subject }, process.env.LOG_OTP === "true" ? text : "(body hidden)");
+  console.log("[email]", { to, cc, subject }, process.env.LOG_OTP === "true" ? text : "(body hidden)");
   return {
     sent: false,
     channel: "log",
@@ -198,8 +234,33 @@ Reason: ${reason}` : "",
   `;
   return sendEmail({ to: email, subject, text, html });
 }
+async function sendEmployeeTerminationEmail({ email, fullName, reason, remarks }) {
+  const subject = "Rfincare employee account terminated";
+  const text = [
+    `Hello ${fullName || email},`,
+    "",
+    "Your Rfincare employee account has been terminated and login access is now disabled.",
+    reason ? `
+Reason: ${reason}` : "",
+    remarks ? `
+Remarks: ${remarks}` : "",
+    "",
+    "If you believe this was done in error, contact your administrator.",
+    "",
+    "— Rfincare Team"
+  ].join("\n");
+  const html = `
+    <p>Hello ${fullName || email},</p>
+    <p>Your <strong>Rfincare employee</strong> account has been terminated and login access is disabled.</p>
+    ${reason ? `<p><strong>Reason:</strong> ${reason}</p>` : ""}
+    ${remarks ? `<p><strong>Remarks:</strong> ${remarks}</p>` : ""}
+    <p>Contact your administrator if you have questions.</p>
+  `;
+  return sendEmail({ to: email, subject, text, html });
+}
 export {
   sendEmail,
+  sendEmployeeTerminationEmail,
   sendPartnerApplicationAdminEmail,
   sendPartnerRejectionEmail,
   sendPartnerWelcomeEmail,

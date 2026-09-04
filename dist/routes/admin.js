@@ -23,7 +23,9 @@ import {
   fetchEmployeeDetail,
   updateAgentDetails,
   updateEmployeeDetails,
-  resetStaffPassword
+  resetStaffPassword,
+  terminateEmployee,
+  deleteAgentPermanently
 } from "../lib/adminStaffManage.js";
 import { parseCsvToRows } from "../lib/parseCsv.js";
 import { buildFunnelAnalytics, buildProductConversionRows } from "../lib/funnelAnalytics.js";
@@ -159,6 +161,15 @@ adminRouter.get(
          FROM user_profiles
          WHERE role = 'agent' AND is_active = TRUE AND account_status = 'active'`
       );
+      const [[leadStats]] = await pool.execute(
+        `SELECT COUNT(*) AS total FROM marketing_leads`
+      );
+      const [[productStats]] = await pool.execute(
+        `SELECT COUNT(*) AS total FROM bank_products WHERE is_active = TRUE`
+      );
+      const [[ruleStats]] = await pool.execute(
+        `SELECT COUNT(*) AS total FROM approval_matrix_rules WHERE is_active = TRUE`
+      );
       const total = Number(appStats?.total || 0);
       const approved = Number(appStats?.approved || 0);
       const approvalRate = total > 0 ? `${(approved / total * 100).toFixed(1)}%` : "0%";
@@ -166,7 +177,10 @@ adminRouter.get(
         total_applications: total,
         pending_reviews: Number(appStats?.pending || 0),
         active_agents: Number(agentStats?.active_agents || 0),
-        approval_rate: approvalRate
+        approval_rate: approvalRate,
+        total_leads: Number(leadStats?.total || 0),
+        loan_products: Number(productStats?.total || 0),
+        approval_rules: Number(ruleStats?.total || 0)
       });
     } catch (err) {
       next(err);
@@ -464,6 +478,45 @@ adminRouter.post(
     }
   }
 );
+async function handlePermanentAgentDelete(req, res, next) {
+  try {
+    const agentId = String(req.params.id || "").trim();
+    if (!agentId) {
+      return res.status(400).json({ error: "Agent id is required" });
+    }
+    if (agentId === req.auth.userId) {
+      return res.status(400).json({ error: "You cannot delete your own account" });
+    }
+    const result = await deleteAgentPermanently(agentId);
+    await writeAuditLog({
+      userId: req.auth.userId,
+      actionType: "delete",
+      tableName: "user_profiles",
+      recordId: agentId,
+      oldValues: result.deleted || null,
+      newValues: { scope: "admin_agent_delete" }
+    });
+    res.json({
+      success: true,
+      message: result.message || "Agent deleted permanently",
+      deleted: result.deleted
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+adminRouter.post(
+  "/agents/:id/delete",
+  authenticate,
+  authorize({ resource: "agents", action: "manage" }),
+  handlePermanentAgentDelete
+);
+adminRouter.delete(
+  "/agents/:id",
+  authenticate,
+  authorize({ resource: "agents", action: "manage" }),
+  handlePermanentAgentDelete
+);
 adminRouter.get(
   "/employees/:id",
   authenticate,
@@ -490,6 +543,36 @@ adminRouter.patch(
         tableName: "employee_onboarding",
         recordId: req.params.id,
         newValues: { scope: "admin_employee_update" }
+      });
+      res.json(detail);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+adminRouter.post(
+  "/employees/:id/terminate",
+  authenticate,
+  authorize({ resource: "employees", action: "update" }),
+  async (req, res, next) => {
+    try {
+      const reason = req.body?.reason || req.body?.terminationReason;
+      const remarks = req.body?.remarks || req.body?.terminationRemarks || "";
+      const detail = await terminateEmployee(req.params.id, {
+        reason,
+        remarks,
+        terminatedBy: req.auth.userId
+      });
+      await writeAuditLog({
+        userId: req.auth.userId,
+        actionType: "update",
+        tableName: "employee_onboarding",
+        recordId: req.params.id,
+        newValues: {
+          scope: "admin_employee_terminate",
+          reason,
+          remarks
+        }
       });
       res.json(detail);
     } catch (err) {
@@ -729,6 +812,80 @@ adminRouter.patch(
         newValues: { is_active: row.is_active, account_status: row.account_status }
       });
       res.json(mapCustomerRow(row));
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+adminRouter.delete(
+  "/customers/:id",
+  authenticate,
+  authorize({ resource: "customers", action: "manage" }),
+  async (req, res, next) => {
+    try {
+      await ensureMilestone3Schema();
+      const pool = getPool();
+      const [[before]] = await pool.execute(
+        `SELECT * FROM user_profiles WHERE id = :id AND role = 'customer' LIMIT 1`,
+        { id: req.params.id }
+      );
+      if (!before) {
+        const e = new Error("Customer not found");
+        e.status = 404;
+        throw e;
+      }
+      const [[apps]] = await pool.execute(
+        `SELECT COUNT(*)::int AS c FROM loan_applications WHERE customer_id = :id`,
+        { id: req.params.id }
+      );
+      const appCount = Number(apps?.c || 0);
+      const hardDelete = req.query.hard === "1" || req.body?.hard === true;
+      if (hardDelete && appCount > 0) {
+        const e = new Error(
+          "Cannot hard-delete a customer with applications. Deactivate/anonymize instead, or archive applications first."
+        );
+        e.status = 409;
+        throw e;
+      }
+      if (hardDelete) {
+        await pool.execute(`DELETE FROM auth_users WHERE id = :id`, { id: req.params.id });
+        await writeAuditLog({
+          userId: req.auth.userId,
+          actionType: "delete",
+          tableName: "user_profiles",
+          recordId: req.params.id,
+          oldValues: { email: before.email, full_name: before.full_name, hard: true }
+        });
+        return res.json({ success: true, mode: "hard_deleted" });
+      }
+      const anonEmail = `deleted+${req.params.id.slice(0, 8)}@rfincare.deleted`;
+      await pool.execute(
+        `UPDATE user_profiles SET
+           full_name = 'Deleted Customer',
+           email = :email,
+           phone = NULL,
+           avatar_url = NULL,
+           is_active = FALSE,
+           account_status = 'deleted'
+         WHERE id = :id AND role = 'customer'`,
+        { id: req.params.id, email: anonEmail }
+      );
+      try {
+        await pool.execute(`UPDATE auth_users SET email = :email WHERE id = :id`, {
+          id: req.params.id,
+          email: anonEmail
+        });
+      } catch {
+      }
+      await writeAuditLog({
+        userId: req.auth.userId,
+        actionType: "delete",
+        tableName: "user_profiles",
+        recordId: req.params.id,
+        oldValues: { email: before.email, full_name: before.full_name },
+        newValues: { mode: "anonymized", account_status: "deleted" }
+      });
+      res.json({ success: true, mode: "anonymized", applicationCount: appCount });
     } catch (err) {
       next(err);
     }

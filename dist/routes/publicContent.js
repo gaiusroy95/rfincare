@@ -5,7 +5,6 @@ import multer from "multer";
 import { z } from "zod";
 import { getPool } from "../db/pool.js";
 import { newId } from "../lib/ids.js";
-import { calculateEligibility } from "../lib/eligibilityEngine.js";
 import { generateOtp, hashOtp, sendOtpNotification } from "../lib/otp.js";
 import { getSiteContactSettings } from "../lib/siteContactSettings.js";
 import { getHomepageTrustContent } from "../lib/homepageTrustContent.js";
@@ -16,6 +15,12 @@ import {
   logMarketingEvent
 } from "../lib/marketingSettings.js";
 import { getMarketplaceVisibility } from "../lib/marketplaceVisibility.js";
+import { getLegalPageBySlug } from "../lib/legalPages.js";
+import {
+  mapHomepageNewsRow,
+  mapHomepageVideoRow,
+  mapSuccessStoryRow
+} from "../lib/cmsContentMap.js";
 import { createResumeToken, resolveResumeToken } from "../lib/resumeTokens.js";
 import { resolveFrontendEnvPath } from "../lib/envPaths.js";
 import { entriesToObject, readEnvFile } from "../lib/envFile.js";
@@ -69,11 +74,12 @@ publicContentRouter.get("/homepage/news", async (req, res, next) => {
   try {
     const pool = getPool();
     const [rows] = await pool.query(
-      `SELECT id, title, excerpt, blog_url AS "blogUrl", image_url AS "imageUrl", image_alt AS "imageAlt",
-              category, published_at AS "publishedAt"
-       FROM homepage_news WHERE is_published = TRUE ORDER BY sort_order DESC, published_at DESC LIMIT 12`
+      `SELECT id, title, excerpt, blog_url, image_url, image_alt,
+              category, published_at, is_published, sort_order, created_at
+       FROM homepage_news WHERE is_published = TRUE
+       ORDER BY sort_order DESC, published_at DESC LIMIT 12`
     );
-    res.json(rows);
+    res.json((rows || []).map(mapHomepageNewsRow).filter(Boolean));
   } catch (err) {
     next(err);
   }
@@ -82,11 +88,12 @@ publicContentRouter.get("/homepage/videos", async (req, res, next) => {
   try {
     const pool = getPool();
     const [rows] = await pool.query(
-      `SELECT id, title, description, youtube_url AS "youtubeUrl", thumbnail_url AS "thumbnailUrl",
-              thumbnail_alt AS "thumbnailAlt", duration_label AS "durationLabel"
-       FROM homepage_videos WHERE is_published = TRUE ORDER BY sort_order DESC LIMIT 12`
+      `SELECT id, title, description, youtube_url, thumbnail_url, thumbnail_alt,
+              duration_label, is_published, sort_order
+       FROM homepage_videos WHERE is_published = TRUE
+       ORDER BY sort_order DESC LIMIT 12`
     );
-    res.json(rows);
+    res.json((rows || []).map(mapHomepageVideoRow).filter(Boolean));
   } catch (err) {
     next(err);
   }
@@ -129,13 +136,9 @@ publicContentRouter.get("/marketplace-visibility", async (_req, res, next) => {
 });
 publicContentRouter.get("/legal/:slug", async (req, res, next) => {
   try {
-    const pool = getPool();
-    const [[row]] = await pool.query(
-      `SELECT slug, title, body_html AS bodyHtml, updated_at AS updatedAt FROM legal_pages WHERE slug = :slug`,
-      { slug: req.params.slug }
-    );
-    if (!row) return res.status(404).json({ error: "Not found" });
-    res.json(row);
+    const page = await getLegalPageBySlug(getPool(), req.params.slug, { createIfMissing: true });
+    if (!page) return res.status(404).json({ error: "Not found" });
+    res.json(page);
   } catch (err) {
     next(err);
   }
@@ -144,12 +147,13 @@ publicContentRouter.get("/success-stories", async (req, res, next) => {
   try {
     const pool = getPool();
     const [rows] = await pool.query(
-      `SELECT id, submitter_name AS name, story_type AS storyType, story_text AS storyText,
-              location, loan_amount AS loanAmount, photo_url AS photoUrl, created_at AS createdAt
+      `SELECT id, submitter_name, story_type, story_text,
+              location, loan_amount, photo_url, created_at
        FROM success_stories WHERE moderation_status = 'approved'
-       ORDER BY display_order DESC, moderated_at DESC LIMIT 20`
+       ORDER BY display_order DESC, moderated_at DESC NULLS LAST, created_at DESC
+       LIMIT 20`
     );
-    res.json(rows);
+    res.json((rows || []).map(mapSuccessStoryRow).filter(Boolean));
   } catch (err) {
     next(err);
   }
@@ -238,29 +242,11 @@ publicContentRouter.post("/cibil/check", async (req, res, next) => {
     next(err);
   }
 });
-publicContentRouter.post("/eligibility/calculate", async (req, res, next) => {
-  try {
-    const EligibilityInputSchema = z.object({
-      loanType: z.string().min(1, "Loan type is required"),
-      loanAmount: z.coerce.number().positive("Loan amount must be greater than zero").max(1e12),
-      monthlyIncome: z.coerce.number().positive("Monthly income must be greater than zero").max(1e12),
-      employmentType: z.string().min(1, "Employment type is required"),
-      creditScore: z.string().optional(),
-      creditScoreRange: z.string().optional(),
-      existingLoans: z.coerce.number().min(0).max(1e12).optional().default(0),
-      collateralValue: z.coerce.number().min(0).max(1e12).optional(),
-      propertyValue: z.coerce.number().min(0).max(1e12).optional(),
-      loanPurpose: z.string().optional()
-    }).refine((data) => data.creditScore || data.creditScoreRange, {
-      message: "Credit score range is required",
-      path: ["creditScore"]
-    });
-    const input = EligibilityInputSchema.parse(req.body);
-    const result = await calculateEligibility(input);
-    res.json(result);
-  } catch (err) {
-    next(err);
-  }
+publicContentRouter.post("/eligibility/calculate", async (req, res) => {
+  res.status(401).json({
+    error: "Authentication required. Sign in as a customer to view eligibility results.",
+    code: "ELIGIBILITY_AUTH_REQUIRED"
+  });
 });
 const OtpRequestSchema = z.object({
   email: z.string().email(),

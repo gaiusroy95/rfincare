@@ -1,4 +1,5 @@
 import { getPool } from "../db/pool.js";
+import { pickField } from "./cmsContentMap.js";
 const DEFAULT_TRUST_CONTENT = {
   heading: "Trusted by Thousands",
   subtitle: "Our commitment to security, transparency, and customer success speaks for itself",
@@ -16,8 +17,11 @@ const DEFAULT_TRUST_CONTENT = {
   ]
 };
 function parseJson(value, fallback) {
-  if (!value) return fallback;
+  if (value == null || value === "") return fallback;
   if (Array.isArray(value)) return value;
+  if (typeof value === "object") {
+    return Array.isArray(value) ? value : fallback;
+  }
   try {
     const parsed = JSON.parse(value);
     return Array.isArray(parsed) ? parsed : fallback;
@@ -33,24 +37,30 @@ async function getHomepageTrustContent() {
   );
   if (!row) return { ...DEFAULT_TRUST_CONTENT };
   return {
-    heading: row.heading || DEFAULT_TRUST_CONTENT.heading,
-    subtitle: row.subtitle || DEFAULT_TRUST_CONTENT.subtitle,
-    stats: parseJson(row.stats_json, DEFAULT_TRUST_CONTENT.stats),
-    certifications: parseJson(row.certifications_json, DEFAULT_TRUST_CONTENT.certifications),
-    updatedAt: row.updated_at
+    heading: pickField(row, "heading") || DEFAULT_TRUST_CONTENT.heading,
+    subtitle: pickField(row, "subtitle") || DEFAULT_TRUST_CONTENT.subtitle,
+    stats: parseJson(pickField(row, "stats_json", "statsJson"), DEFAULT_TRUST_CONTENT.stats),
+    certifications: parseJson(
+      pickField(row, "certifications_json", "certificationsJson"),
+      DEFAULT_TRUST_CONTENT.certifications
+    ),
+    updatedAt: pickField(row, "updated_at", "updatedAt") ?? null
   };
 }
 async function upsertHomepageTrustContent(input, userId) {
   const pool = getPool();
   await pool.execute(
     `INSERT INTO homepage_trust_content
-      (id, heading, subtitle, stats_json, certifications_json, updated_by)
+      (id, heading, subtitle, stats_json, certifications_json, updated_by, updated_at)
      VALUES
-      ('default', :heading, :subtitle, :stats, :certs, :updated_by) ON CONFLICT (id) DO UPDATE SET heading = EXCLUDED.heading,
+      ('default', :heading, :subtitle, :stats, :certs, :updated_by, NOW())
+     ON CONFLICT (id) DO UPDATE SET
+      heading = EXCLUDED.heading,
       subtitle = EXCLUDED.subtitle,
       stats_json = EXCLUDED.stats_json,
       certifications_json = EXCLUDED.certifications_json,
-      updated_by = EXCLUDED.updated_by`,
+      updated_by = EXCLUDED.updated_by,
+      updated_at = NOW()`,
     {
       heading: input.heading,
       subtitle: input.subtitle || null,

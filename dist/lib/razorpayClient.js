@@ -1,23 +1,33 @@
 import crypto from "node:crypto";
 import axios from "axios";
-function requireEnv(name) {
-  const value = String(process.env[name] || "").trim();
-  if (!value) {
-    const err = new Error(`${name} is required for Razorpay integration`);
+import { resolveRazorpayCredentials } from "./paymentGatewaySettings.js";
+async function requireRazorpayKeys() {
+  const creds = await resolveRazorpayCredentials();
+  if (!creds.isEnabled) {
+    const err = new Error("Payment gateway is disabled in admin settings");
     err.status = 503;
     throw err;
   }
-  return value;
+  if (!creds.keyId || !creds.keySecret) {
+    const err = new Error(
+      "Razorpay is not configured. Set RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET or save keys in Admin → API Configuration."
+    );
+    err.status = 503;
+    throw err;
+  }
+  return creds;
 }
-function getRazorpayConfig() {
+async function getRazorpayConfig() {
+  const creds = await requireRazorpayKeys();
   return {
-    keyId: requireEnv("RAZORPAY_KEY_ID"),
-    keySecret: requireEnv("RAZORPAY_KEY_SECRET"),
-    webhookSecret: String(process.env.RAZORPAY_WEBHOOK_SECRET || "").trim()
+    keyId: creds.keyId,
+    keySecret: creds.keySecret,
+    webhookSecret: creds.webhookSecret || "",
+    mode: creds.mode
   };
 }
-function getAuthHeader() {
-  const { keyId, keySecret } = getRazorpayConfig();
+async function getAuthHeader() {
+  const { keyId, keySecret } = await getRazorpayConfig();
   return `Basic ${Buffer.from(`${keyId}:${keySecret}`).toString("base64")}`;
 }
 async function createRazorpayOrder({
@@ -37,7 +47,7 @@ async function createRazorpayOrder({
     },
     {
       headers: {
-        Authorization: getAuthHeader(),
+        Authorization: await getAuthHeader(),
         "Content-Type": "application/json"
       },
       timeout: 3e4
@@ -45,8 +55,9 @@ async function createRazorpayOrder({
   );
   return res.data;
 }
-function verifyRazorpayWebhookSignature(rawBody, signature) {
-  const webhookSecret = String(process.env.RAZORPAY_WEBHOOK_SECRET || "").trim();
+async function verifyRazorpayWebhookSignature(rawBody, signature) {
+  const creds = await resolveRazorpayCredentials();
+  const webhookSecret = String(creds.webhookSecret || "").trim();
   if (!webhookSecret) return false;
   const digest = crypto.createHmac("sha256", webhookSecret).update(rawBody).digest("hex");
   try {

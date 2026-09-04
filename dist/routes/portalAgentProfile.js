@@ -38,7 +38,7 @@ async function loadAgentContext(pool, userId) {
   const [[row]] = await pool.execute(
     `SELECT up.id, up.email, up.full_name, up.phone, up.avatar_url, up.is_active, up.account_status,
             ao.agent_code, ao.username, ao.mobile_number, ao.account_number, ao.bank_name, ao.ifsc_code,
-            ao.onboarding_status
+            ao.account_proof_path, ao.onboarding_status
      FROM user_profiles up
      LEFT JOIN agent_onboarding ao ON ao.user_id = up.id
      WHERE up.id = :id AND up.role = 'agent'
@@ -114,6 +114,26 @@ const avatarUpload = multer({
     cb(null, true);
   }
 });
+const proofDir = resolve(uploadRoot, "agent-bank-proof");
+mkdirSync(proofDir, { recursive: true });
+const bankProofUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, proofDir),
+    filename: (req, file, cb) => {
+      const safe = `${req.auth.userId}-proof-${Date.now()}${extname(file.originalname)}`;
+      cb(null, safe);
+    }
+  }),
+  limits: { fileSize: 8 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const ok = file.mimetype.startsWith("image/") || file.mimetype === "application/pdf";
+    if (!ok) {
+      cb(new Error("Only image or PDF files are allowed for account proof"));
+      return;
+    }
+    cb(null, true);
+  }
+});
 portalAgentProfileRouter.use(authenticate);
 portalAgentProfileRouter.get("/", async (req, res, next) => {
   try {
@@ -141,7 +161,8 @@ portalAgentProfileRouter.get("/", async (req, res, next) => {
         accountNumber: row.account_number,
         accountNumberMasked: maskAccount(row.account_number),
         bankName: row.bank_name,
-        ifscCode: row.ifsc_code
+        ifscCode: row.ifsc_code,
+        accountProofPath: row.account_proof_path || null
       },
       maskedMobile: maskPhone(mobile),
       registeredMobile: mobile,
@@ -204,39 +225,60 @@ portalAgentProfileRouter.post("/bank/request-otp", async (req, res, next) => {
     next(err);
   }
 });
-portalAgentProfileRouter.post("/bank/confirm", async (req, res, next) => {
-  try {
-    requireAgent(req);
-    const input = z.object({
-      otp: z.string().length(6),
-      accountNumber: z.string().min(4),
-      bankName: z.string().min(2),
-      ifscCode: z.string().min(8).max(16)
-    }).parse(req.body);
-    await ensureAgentProfileSchema();
-    const pool = getPool();
-    const verified = await verifyLatestOtp(pool, {
-      agentUserId: req.auth.userId,
-      purpose: "bank_update",
-      otp: input.otp
-    });
-    if (!verified) return res.status(401).json({ error: "Invalid or expired OTP" });
-    await pool.execute(
-      `UPDATE agent_onboarding
-       SET account_number = :acct, bank_name = :bank, ifsc_code = :ifsc, updated_at = NOW()
-       WHERE user_id = :id`,
-      {
-        id: req.auth.userId,
-        acct: input.accountNumber.trim(),
-        bank: input.bankName.trim(),
-        ifsc: input.ifscCode.trim().toUpperCase()
+portalAgentProfileRouter.post(
+  "/bank/confirm",
+  bankProofUpload.single("accountProof"),
+  async (req, res, next) => {
+    try {
+      requireAgent(req);
+      const input = z.object({
+        otp: z.string().length(6),
+        accountNumber: z.string().min(4),
+        bankName: z.string().min(2),
+        ifscCode: z.string().min(8).max(16)
+      }).parse(req.body);
+      await ensureAgentProfileSchema();
+      const pool = getPool();
+      const verified = await verifyLatestOtp(pool, {
+        agentUserId: req.auth.userId,
+        purpose: "bank_update",
+        otp: input.otp
+      });
+      if (!verified) return res.status(401).json({ error: "Invalid or expired OTP" });
+      const existing = await loadAgentContext(pool, req.auth.userId);
+      const accountChanged = String(existing.account_number || "") !== input.accountNumber.trim() || String(existing.ifsc_code || "").toUpperCase() !== input.ifscCode.trim().toUpperCase();
+      let proofPath = existing.account_proof_path || null;
+      if (req.file) {
+        proofPath = `/uploads/agent-bank-proof/${req.file.filename}`;
+      } else if (accountChanged && !proofPath) {
+        return res.status(400).json({
+          error: "Upload a cancelled cheque or bank account proof when changing bank details."
+        });
       }
-    );
-    res.json({ success: true, message: "Commission bank details updated" });
-  } catch (err) {
-    next(err);
+      await pool.execute(
+        `UPDATE agent_onboarding
+       SET account_number = :acct, bank_name = :bank, ifsc_code = :ifsc,
+           account_proof_path = COALESCE(:proof, account_proof_path),
+           updated_at = NOW()
+       WHERE user_id = :id`,
+        {
+          id: req.auth.userId,
+          acct: input.accountNumber.trim(),
+          bank: input.bankName.trim(),
+          ifsc: input.ifscCode.trim().toUpperCase(),
+          proof: proofPath
+        }
+      );
+      res.json({
+        success: true,
+        message: "Commission bank details updated",
+        accountProofPath: proofPath
+      });
+    } catch (err) {
+      next(err);
+    }
   }
-});
+);
 const EmailOtpSchema = z.object({ newEmail: z.string().email() });
 portalAgentProfileRouter.post("/email/request-otp", async (req, res, next) => {
   try {

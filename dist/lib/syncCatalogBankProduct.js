@@ -4,9 +4,10 @@ import { cacheDeletePrefix } from "./simpleCache.js";
 const BANK_LIST_CACHE_PREFIX = "banks:list:";
 function parseProductData(data) {
   if (!data) return {};
-  if (typeof data === "object") return data;
+  if (typeof data === "object") return { ...data };
   try {
-    return JSON.parse(data);
+    const parsed = JSON.parse(data);
+    return parsed && typeof parsed === "object" ? { ...parsed } : {};
   } catch {
     return {};
   }
@@ -30,29 +31,49 @@ async function syncCatalogBankProduct({
 }) {
   if (!bankId || !category?.slug) return bankProductId || null;
   const pool = getPool();
-  const productData = {
-    loan_type: category.parentLoanType || category.parent_loan_type || category.slug,
-    product_category_slug: category.slug,
-    catalog_api_key: category.slug,
-    interest_rate_min: interestRateMin ?? null,
-    interest_rate_max: interestRateMax ?? null,
-    features: features || []
-  };
   let targetId = bankProductId || null;
+  let existingData = {};
   if (!targetId) {
     const [rows] = await pool.execute(
       `SELECT id, data FROM bank_products WHERE bank_id = :bankId AND is_active = TRUE`,
       { bankId }
     );
     const match = rows.find((row) => productMatchesCategory(row, category.slug));
-    if (match) targetId = match.id;
+    if (match) {
+      targetId = match.id;
+      existingData = parseProductData(match.data);
+    }
+  } else {
+    const [[row]] = await pool.execute(
+      `SELECT id, data FROM bank_products WHERE id = :id LIMIT 1`,
+      { id: targetId }
+    );
+    if (row) existingData = parseProductData(row.data);
   }
+  const catalogPatch = {
+    loan_type: category.parentLoanType || category.parent_loan_type || category.slug,
+    product_category_slug: category.slug,
+    catalog_api_key: category.slug
+  };
+  if (Array.isArray(features)) {
+    catalogPatch.features = features;
+  }
+  if (interestRateMin !== void 0 && interestRateMin !== null && interestRateMin !== "") {
+    catalogPatch.interest_rate_min = Number(interestRateMin);
+  }
+  if (interestRateMax !== void 0 && interestRateMax !== null && interestRateMax !== "") {
+    catalogPatch.interest_rate_max = Number(interestRateMax);
+  }
+  const productData = {
+    ...existingData,
+    ...catalogPatch
+  };
   if (targetId) {
     await pool.execute(
       `UPDATE bank_products SET name = :name, data = :data WHERE id = :id`,
       {
         id: targetId,
-        name: label,
+        name: label || existingData.productName || "Loan product",
         data: JSON.stringify(productData)
       }
     );

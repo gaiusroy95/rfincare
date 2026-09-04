@@ -22,6 +22,10 @@ import {
   fetchMarketplaceEnquiries,
   isMarketplaceProductFilter
 } from "../lib/marketplaceEnquiries.js";
+import {
+  autoAssignApplicationsForEmployeeVerification,
+  fetchEmployeeOwnedApplicationIds
+} from "../lib/employeeApplicationAssignment.js";
 const loanApplicationsRouter = Router();
 const STAFF_ROLES = /* @__PURE__ */ new Set(["admin", "super_admin", "employee"]);
 const ADMIN_DELETE_ROLES = /* @__PURE__ */ new Set(["admin", "super_admin"]);
@@ -322,9 +326,17 @@ loanApplicationsRouter.get(
     try {
       await assertEmployeeAccess(req, "applications", "read");
       const pool = getPool();
-      const { where, params } = await buildListQuery(pool, req.auth.role, req.auth.userId, {});
+      const ownedIds = await fetchEmployeeOwnedApplicationIds(pool, req.auth.userId);
+      if (!ownedIds.size) {
+        return res.json([]);
+      }
+      const params = {};
+      const placeholders = Array.from(ownedIds).map((id, i) => {
+        params[`app${i}`] = id;
+        return `:app${i}`;
+      });
       const [rows] = await pool.execute(
-        `${LIST_SELECT} ${where} ORDER BY la.created_at DESC`,
+        `${LIST_SELECT} WHERE la.id IN (${placeholders.join(", ")}) ORDER BY la.created_at DESC`,
         params
       );
       res.json(rows.map(formatApplication));
@@ -703,7 +715,11 @@ const PatchSchema = z.object({
   qc_admin_id: z.string().optional(),
   eligibility_status: z.string().optional(),
   document_stage_status: z.string().optional(),
-  bank_approval_status: z.string().optional()
+  bank_approval_status: z.string().optional(),
+  notify_customer: z.boolean().optional(),
+  notifyCustomer: z.boolean().optional(),
+  send_notification: z.boolean().optional(),
+  sendNotification: z.boolean().optional()
 }).passthrough();
 loanApplicationsRouter.patch(
   "/:id",
@@ -741,6 +757,11 @@ loanApplicationsRouter.patch(
         }
       }
       const input = PatchSchema.parse(req.body);
+      const notifyCustomer = input.notify_customer ?? input.notifyCustomer ?? input.send_notification ?? input.sendNotification;
+      delete input.notify_customer;
+      delete input.notifyCustomer;
+      delete input.send_notification;
+      delete input.sendNotification;
       if (!canUpdateAll) {
         delete input.document_stage_status;
         delete input.bank_approval_status;
@@ -851,6 +872,7 @@ loanApplicationsRouter.patch(
             message: `QC stage update: document=${document_stage_status || existing.document_stage_status}, bank=${bank_approval_status || existing.bank_approval_status}`
           }
         );
+        await autoAssignApplicationsForEmployeeVerification(pool);
       }
       const row = await fetchApplicationById(pool, req.params.id);
       if ((document_stage_status || bank_approval_status) && existing.status === "submitted" && existing.submitted_at) {
@@ -859,6 +881,22 @@ loanApplicationsRouter.patch(
           extra: {
             title: "Application stage updated",
             message: `Bank processing stage is now ${bank_approval_status || document_stage_status}.`
+          }
+        }).catch(() => {
+        });
+      }
+      const shouldNotifyCustomer = notifyCustomer !== false && STAFF_ROLES.has(req.auth.role) && (Boolean(statusValue && statusValue !== existing.status) || Boolean(status_notes));
+      if (shouldNotifyCustomer) {
+        const notesLine = status_notes || review_notes || rejection_reason || "";
+        dispatchFileUpdateNotification("application_status_update", {
+          applicationId: req.params.id,
+          extra: {
+            title: "Application status update",
+            message: [
+              `Your loan application ${row.application_number || req.params.id.slice(0, 8)} was updated.`,
+              statusValue ? `Status: ${statusValue}` : null,
+              notesLine ? `Remarks: ${notesLine}` : null
+            ].filter(Boolean).join("\n")
           }
         }).catch(() => {
         });
@@ -947,6 +985,8 @@ loanApplicationsRouter.post(
         throw e;
       }
       const selectedBankId = req.body?.selected_bank_id || req.body?.selectedBankId || null;
+      const selectedBankIds = Array.isArray(req.body?.selectedBankIds) ? req.body.selectedBankIds.filter(Boolean) : selectedBankId ? [selectedBankId] : [];
+      const primaryBankId = selectedBankId || selectedBankIds[0] || null;
       try {
         await requireSuccessfulCibilForSubmit(req.params.id);
       } catch (cibilErr) {
@@ -961,6 +1001,12 @@ loanApplicationsRouter.post(
         if (!skipCibil) throw cibilErr;
         console.warn("[submit] CIBIL check skipped:", cibilErr.message);
       }
+      const existingData = parseJson(existing.data) || {};
+      const nextData = {
+        ...existingData,
+        selected_bank_ids: selectedBankIds,
+        preferred_bank_ids: selectedBankIds
+      };
       await pool.execute(
         `UPDATE loan_applications
          SET status = 'submitted',
@@ -968,9 +1014,14 @@ loanApplicationsRouter.post(
              document_stage_status = COALESCE(document_stage_status, 'documents_pending'),
              bank_approval_status = 'submitted_to_bank',
              submitted_at = NOW(),
-             selected_bank_id = COALESCE(:selected_bank_id, selected_bank_id)
+             selected_bank_id = COALESCE(:selected_bank_id, selected_bank_id),
+             data = :data::jsonb
          WHERE id = :id`,
-        { id: req.params.id, selected_bank_id: selectedBankId }
+        {
+          id: req.params.id,
+          selected_bank_id: primaryBankId,
+          data: JSON.stringify(nextData)
+        }
       );
       await pool.execute(
         `INSERT INTO application_timeline (id, application_id, status, message)

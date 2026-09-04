@@ -22,6 +22,10 @@ import {
   requireEmployeeModuleAccess,
   getEffectiveEmployeeAccess
 } from "../lib/employeeAccessControls.js";
+import {
+  autoAssignApplicationsForEmployeeVerification,
+  fetchEmployeeOwnedApplicationIds
+} from "../lib/employeeApplicationAssignment.js";
 const documentsRouter = Router();
 const STAFF_ROLES = /* @__PURE__ */ new Set(["admin", "super_admin", "employee"]);
 function isStaffRole(role) {
@@ -81,12 +85,33 @@ function formatDocumentRow(row) {
   const isPdf = mimeType.includes("pdf");
   const previewUrl = fileName && (isImage || isPdf) ? `/uploads/${encodeURIComponent(fileName)}` : row.document_url?.startsWith("/uploads/") ? row.document_url : null;
   const verificationStatus = normalizeDocStatus(row);
+  let ocrPayload = row.ocr_payload;
+  if (typeof ocrPayload === "string") {
+    try {
+      ocrPayload = JSON.parse(ocrPayload);
+    } catch {
+      ocrPayload = null;
+    }
+  }
   return {
     ...row,
     mime_type: mimeType,
+    mimeType,
     verification_status: verificationStatus,
     status: verificationStatus,
-    preview_url: previewUrl
+    preview_url: previewUrl,
+    documentType: row.document_type,
+    documentName: row.document_name,
+    ocr_payload: ocrPayload,
+    ocrPayload,
+    ocr_status: row.ocr_status,
+    ocrStatus: row.ocr_status,
+    ocr_suggestion: row.ocr_suggestion,
+    ocrSuggestion: row.ocr_suggestion,
+    ocr_confidence: row.ocr_confidence,
+    ocrConfidence: row.ocr_confidence,
+    ocr_engine: row.ocr_engine,
+    ocrEngine: row.ocr_engine
   };
 }
 function summarizeApplicationDocStatus(counts) {
@@ -108,121 +133,6 @@ function parseJson(value, fallback = {}) {
   } catch {
     return fallback;
   }
-}
-function normalizeAgentCode(value) {
-  return String(value || "").trim().toLowerCase();
-}
-function stagePriorityOrder(app) {
-  const status = String(app?.status || "").toLowerCase();
-  const docStage = String(app?.document_stage_status || "").toLowerCase();
-  const bankStage = String(app?.bank_approval_status || "").toLowerCase();
-  if (["documents_pending", "pending", "uploaded", "in_review"].includes(docStage)) return 1;
-  if (["submitted_to_bank", "under_review", "bank_review"].includes(bankStage)) return 2;
-  if (["approved", "rejected", "completed"].includes(status)) return 3;
-  if (["submitted", "pending", "under_review", "draft"].includes(status)) return 1;
-  return 2;
-}
-function resolveResponsibleEmployeeIdForStage(app, hierarchyRows = []) {
-  if (!hierarchyRows.length) return app.assigned_employee_id || null;
-  const sorted = [...hierarchyRows].sort((a, b) => {
-    const la = Number(a.hierarchy_level || 999);
-    const lb = Number(b.hierarchy_level || 999);
-    if (la !== lb) return la - lb;
-    if (Boolean(a.is_primary) !== Boolean(b.is_primary)) return a.is_primary ? -1 : 1;
-    return String(a.employee_user_id || "").localeCompare(String(b.employee_user_id || ""));
-  });
-  const idx = Math.max(0, Math.min(sorted.length - 1, stagePriorityOrder(app) - 1));
-  return sorted[idx]?.employee_user_id || app.assigned_employee_id || null;
-}
-async function fetchEmployeeOwnedApplicationIds(pool, employeeId) {
-  const [candidateApps] = await pool.execute(
-    `SELECT la.id, la.agent_id, la.assigned_employee_id, la.sourced_agent_code,
-            la.document_stage_status, la.bank_approval_status, la.status, la.data
-     FROM loan_applications la
-     WHERE la.assigned_employee_id = :id
-        OR EXISTS (
-          SELECT 1
-          FROM agent_employee_hierarchy h
-          LEFT JOIN agent_onboarding ao ON ao.user_id = h.agent_user_id
-          WHERE h.employee_user_id = :id
-            AND (
-              h.agent_user_id = la.agent_id
-              OR LOWER(TRIM(CAST(COALESCE(la.sourced_agent_code, '') AS TEXT))) = LOWER(TRIM(CAST(COALESCE(ao.agent_code, '') AS TEXT)))
-              OR LOWER(TRIM(CAST(COALESCE(la.data->>'sourced_agent_code', '') AS TEXT))) = LOWER(TRIM(CAST(COALESCE(ao.agent_code, '') AS TEXT)))
-              OR LOWER(TRIM(CAST(COALESCE(la.data->>'sourcedAgentCode', '') AS TEXT))) = LOWER(TRIM(CAST(COALESCE(ao.agent_code, '') AS TEXT)))
-              OR LOWER(TRIM(CAST(COALESCE(la.data->>'agent_code', '') AS TEXT))) = LOWER(TRIM(CAST(COALESCE(ao.agent_code, '') AS TEXT)))
-              OR LOWER(TRIM(CAST(COALESCE(la.data->>'agentCode', '') AS TEXT))) = LOWER(TRIM(CAST(COALESCE(ao.agent_code, '') AS TEXT)))
-            )
-        )`,
-    { id: employeeId }
-  );
-  if (!candidateApps.length) return /* @__PURE__ */ new Set();
-  const appData = candidateApps.map((app) => parseJson(app.data, {}));
-  const agentIds = [...new Set(candidateApps.map((r) => r.agent_id).filter(Boolean))];
-  const codes = [
-    ...new Set(
-      candidateApps.map(
-        (app, idx) => normalizeAgentCode(
-          app.sourced_agent_code || appData[idx]?.sourced_agent_code || appData[idx]?.sourcedAgentCode || appData[idx]?.agent_code || appData[idx]?.agentCode
-        )
-      ).filter(Boolean)
-    )
-  ];
-  const agentCodeToUser = /* @__PURE__ */ new Map();
-  if (codes.length) {
-    const codeParams = {};
-    const codePlaceholders = codes.map((code, i) => {
-      codeParams[`code${i}`] = code;
-      return `:code${i}`;
-    });
-    const [codeRows] = await pool.execute(
-      `SELECT user_id, agent_code
-       FROM agent_onboarding
-       WHERE LOWER(TRIM(CAST(agent_code AS TEXT))) IN (${codePlaceholders.join(", ")})`,
-      codeParams
-    );
-    for (const row of codeRows || []) {
-      agentCodeToUser.set(normalizeAgentCode(row.agent_code), row.user_id);
-      if (row.user_id) agentIds.push(row.user_id);
-    }
-  }
-  const uniqueAgentIds = [...new Set(agentIds.filter(Boolean))];
-  const hierarchyByAgent = /* @__PURE__ */ new Map();
-  if (uniqueAgentIds.length) {
-    const hParams = {};
-    const hPlaceholders = uniqueAgentIds.map((id, i) => {
-      hParams[`aid${i}`] = id;
-      return `:aid${i}`;
-    });
-    const [hRows] = await pool.execute(
-      `SELECT agent_user_id, employee_user_id, hierarchy_level, is_primary
-       FROM agent_employee_hierarchy
-       WHERE agent_user_id IN (${hPlaceholders.join(", ")})`,
-      hParams
-    );
-    for (const row of hRows || []) {
-      if (!hierarchyByAgent.has(row.agent_user_id)) hierarchyByAgent.set(row.agent_user_id, []);
-      hierarchyByAgent.get(row.agent_user_id).push(row);
-    }
-  }
-  const allowedIds = /* @__PURE__ */ new Set();
-  for (let i = 0; i < candidateApps.length; i += 1) {
-    const app = candidateApps[i];
-    const d = appData[i];
-    const resolvedAgentId = app.agent_id || agentCodeToUser.get(
-      normalizeAgentCode(
-        app.sourced_agent_code || d?.sourced_agent_code || d?.sourcedAgentCode || d?.agent_code || d?.agentCode
-      )
-    ) || null;
-    const ownerId = resolveResponsibleEmployeeIdForStage(
-      app,
-      resolvedAgentId ? hierarchyByAgent.get(resolvedAgentId) || [] : []
-    );
-    if (ownerId === employeeId || app.assigned_employee_id === employeeId) {
-      allowedIds.add(app.id);
-    }
-  }
-  return allowedIds;
 }
 function normalizeLoanType(rawLoanType, productType) {
   const value = String(rawLoanType || "").toLowerCase();
@@ -567,6 +477,7 @@ documentsRouter.post(
       );
       const [[doc]] = await pool.execute(`SELECT * FROM customer_documents WHERE id = :id`, { id: docId });
       if (applicationId) {
+        await autoAssignApplicationsForEmployeeVerification(pool);
         dispatchFileUpdateNotification("customer_document_upload", {
           applicationId,
           extra: {
@@ -634,6 +545,27 @@ const VerifyDocumentSchema = z.object({
   verification_notes: z.string().optional(),
   verificationNotes: z.string().optional()
 });
+documentsRouter.post(
+  "/:id/ocr",
+  authenticate,
+  authorize({ resource: "documents", action: "update" }),
+  async (req, res, next) => {
+    try {
+      if (!isStaffRole(req.auth.role) || isAgentRole(req.auth.role)) {
+        const e = new Error("Insufficient permissions");
+        e.status = 403;
+        throw e;
+      }
+      const { runDocumentOcr } = await import("../lib/documentOcr.js");
+      const profile = req.body?.profile || {};
+      const extractedText = req.body?.extractedText || req.body?.text || null;
+      const result = await runDocumentOcr(req.params.id, { profile, extractedText });
+      res.json({ data: result });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
 documentsRouter.patch(
   "/:id/verification",
   authenticate,
@@ -773,8 +705,141 @@ documentsRouter.delete(
   async (req, res, next) => {
     try {
       const pool = getPool();
+      if (isAgentRole(req.auth.role)) {
+        const [[doc]] = await pool.execute(
+          `SELECT id, application_id FROM customer_documents WHERE id = :id LIMIT 1`,
+          { id: req.params.id }
+        );
+        if (!doc) {
+          const e = new Error("Document not found");
+          e.status = 404;
+          throw e;
+        }
+        const allowed = await agentCanAccessApplication(pool, req.auth.userId, doc.application_id);
+        if (!allowed) {
+          const e = new Error("Insufficient permissions");
+          e.status = 403;
+          throw e;
+        }
+      }
       await pool.execute(`DELETE FROM customer_documents WHERE id = :id`, { id: req.params.id });
-      res.json({ ok: true });
+      res.json({ ok: true, deleted: 1 });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+documentsRouter.post(
+  "/bulk-delete",
+  authenticate,
+  async (req, res, next) => {
+    try {
+      const body = z.object({
+        documentIds: z.array(z.string().min(1)).optional(),
+        applicationIds: z.array(z.string().min(1)).optional()
+      }).parse(req.body || {});
+      const documentIds = [...new Set((body.documentIds || []).filter(Boolean))];
+      const applicationIds = [...new Set((body.applicationIds || []).filter(Boolean))];
+      if (!documentIds.length && !applicationIds.length) {
+        return res.status(400).json({ error: "Provide documentIds and/or applicationIds" });
+      }
+      const role = req.auth.role;
+      const canStaffDelete = isStaffRole(role) || hasPermission(role, "update:documents") || hasPermission(role, "update:*");
+      const isAgent = isAgentRole(role);
+      if (!canStaffDelete && !isAgent) {
+        const e = new Error("Insufficient permissions");
+        e.status = 403;
+        throw e;
+      }
+      if (role === "employee") {
+        await assertEmployeeAccess(req, "documents", "write");
+      }
+      const pool = getPool();
+      await ensureDocumentSchema();
+      let idsToDelete = [...documentIds];
+      if (applicationIds.length) {
+        if (isAgent) {
+          const scope = await resolveAgentScopeParams(pool, req.auth.userId);
+          const appParams = {};
+          const appPlaceholders = applicationIds.map((id, i) => {
+            const key = `app_${i}`;
+            appParams[key] = id;
+            return `:${key}`;
+          });
+          const [allowedApps] = await pool.execute(
+            `SELECT id FROM loan_applications
+             WHERE id IN (${appPlaceholders.join(", ")})
+               AND ${agentApplicationScopeSql("loan_applications")}`,
+            { ...appParams, ...scope }
+          );
+          const allowedSet = new Set((allowedApps || []).map((r) => r.id));
+          const scopedAppIds = applicationIds.filter((id) => allowedSet.has(id));
+          if (scopedAppIds.length) {
+            const p = {};
+            const ph = scopedAppIds.map((id, i) => {
+              const key = `dapp_${i}`;
+              p[key] = id;
+              return `:${key}`;
+            });
+            const [rows] = await pool.execute(
+              `SELECT id FROM customer_documents WHERE application_id IN (${ph.join(", ")})`,
+              p
+            );
+            idsToDelete.push(...(rows || []).map((r) => r.id));
+          }
+        } else {
+          const p = {};
+          const ph = applicationIds.map((id, i) => {
+            const key = `dapp_${i}`;
+            p[key] = id;
+            return `:${key}`;
+          });
+          const [rows] = await pool.execute(
+            `SELECT id FROM customer_documents WHERE application_id IN (${ph.join(", ")})`,
+            p
+          );
+          idsToDelete.push(...(rows || []).map((r) => r.id));
+        }
+      }
+      idsToDelete = [...new Set(idsToDelete.filter(Boolean))];
+      if (!idsToDelete.length) {
+        return res.json({ ok: true, deleted: 0 });
+      }
+      if (isAgent) {
+        const scope = await resolveAgentScopeParams(pool, req.auth.userId);
+        const p = {};
+        const ph = idsToDelete.map((id, i) => {
+          const key = `doc_${i}`;
+          p[key] = id;
+          return `:${key}`;
+        });
+        const [owned] = await pool.execute(
+          `SELECT cd.id
+           FROM customer_documents cd
+           JOIN loan_applications la ON la.id = cd.application_id
+           WHERE cd.id IN (${ph.join(", ")})
+             AND ${agentApplicationScopeSql("la")}`,
+          { ...p, ...scope }
+        );
+        idsToDelete = (owned || []).map((r) => r.id);
+        if (!idsToDelete.length) {
+          const e = new Error("Insufficient permissions");
+          e.status = 403;
+          throw e;
+        }
+      }
+      const delParams = {};
+      const delPh = idsToDelete.map((id, i) => {
+        const key = `del_${i}`;
+        delParams[key] = id;
+        return `:${key}`;
+      });
+      const [result] = await pool.execute(
+        `DELETE FROM customer_documents WHERE id IN (${delPh.join(", ")})`,
+        delParams
+      );
+      const deleted = Number(result?.affectedRows ?? result?.rowCount ?? idsToDelete.length);
+      res.json({ ok: true, deleted, documentIds: idsToDelete });
     } catch (err) {
       next(err);
     }

@@ -25,6 +25,10 @@ import {
   mapLedgerEntryToCommission
 } from "../lib/agentCommissionLedger.js";
 import { buildAgentRecentActivities } from "../lib/agentRecentActivities.js";
+import {
+  autoAssignApplicationsForEmployeeVerification,
+  fetchEmployeeOwnedApplicationIds
+} from "../lib/employeeApplicationAssignment.js";
 const portalDashboardsRouter = Router();
 function mapAppToClient(row) {
   const data = typeof row.data === "string" ? JSON.parse(row.data || "{}") : row.data || {};
@@ -41,6 +45,7 @@ function mapAppToClient(row) {
   return {
     id: row.id,
     kind: "application",
+    customerId: row.customer_id || null,
     name: row.customer_full_name || data.full_name || data.fullName || "Customer",
     loanType: data.loan_type_label || data.loan_type || data.loanPurpose || "Loan",
     amount: loanAmountValue ? `₹${Number(loanAmountValue).toLocaleString("en-IN")}` : "—",
@@ -71,7 +76,8 @@ function mapLeadToPipelineClient(row) {
   const statusMap = {
     new: "new",
     verified: "new",
-    assigned: "in-progress",
+    // Freshly assigned work should land in New Leads for the agent.
+    assigned: "new",
     contacted: "in-progress",
     in_progress: "in-progress",
     converted: "submitted",
@@ -98,110 +104,6 @@ function mapLeadToPipelineClient(row) {
     followUpAt: row.updated_at || row.created_at || null
   };
 }
-function parseJsonSafe(value, fallback = {}) {
-  if (!value) return fallback;
-  if (typeof value === "object") return value;
-  try {
-    return JSON.parse(value);
-  } catch {
-    return fallback;
-  }
-}
-function normalizeAgentCode(value) {
-  return String(value || "").trim().toLowerCase();
-}
-function stagePriorityOrder(row) {
-  const status = String(row?.status || "").toLowerCase();
-  const docStage = String(row?.document_stage_status || "").toLowerCase();
-  const bankStage = String(row?.bank_approval_status || "").toLowerCase();
-  if (["documents_pending", "pending", "uploaded", "in_review"].includes(docStage)) return 1;
-  if (["submitted_to_bank", "under_review", "bank_review"].includes(bankStage)) return 2;
-  if (["approved", "rejected", "completed"].includes(status)) return 3;
-  if (["submitted", "pending", "under_review", "draft"].includes(status)) return 1;
-  return 2;
-}
-function resolveResponsibleEmployeeIdForStage(app, hierarchyRows = []) {
-  if (!hierarchyRows.length) return app.assigned_employee_id || null;
-  const sorted = [...hierarchyRows].sort((a, b) => {
-    const la = Number(a.hierarchy_level || 999);
-    const lb = Number(b.hierarchy_level || 999);
-    if (la !== lb) return la - lb;
-    if (Boolean(a.is_primary) !== Boolean(b.is_primary)) return a.is_primary ? -1 : 1;
-    return String(a.employee_user_id || "").localeCompare(String(b.employee_user_id || ""));
-  });
-  const targetIdx = Math.max(0, Math.min(sorted.length - 1, stagePriorityOrder(app) - 1));
-  return sorted[targetIdx]?.employee_user_id || app.assigned_employee_id || null;
-}
-async function filterApplicationsForEmployeeByHierarchy(pool, employeeId, apps = []) {
-  const rows = Array.isArray(apps) ? apps : [];
-  if (!rows.length) return [];
-  const agentIds = [...new Set(rows.map((r) => r.agent_id).filter(Boolean))];
-  const appData = rows.map((r) => parseJsonSafe(r.data, {}));
-  const candidateCodes = [
-    ...new Set(
-      rows.map(
-        (r, idx) => normalizeAgentCode(
-          r.sourced_agent_code || appData[idx]?.sourced_agent_code || appData[idx]?.sourcedAgentCode || appData[idx]?.agent_code || appData[idx]?.agentCode
-        )
-      ).filter(Boolean)
-    )
-  ];
-  const agentCodeToUser = /* @__PURE__ */ new Map();
-  if (candidateCodes.length) {
-    const codeParams = {};
-    const codePlaceholders = candidateCodes.map((code, i) => {
-      codeParams[`code${i}`] = code;
-      return `:code${i}`;
-    });
-    const [codeRows] = await pool.execute(
-      `SELECT user_id, agent_code
-       FROM agent_onboarding
-       WHERE LOWER(TRIM(CAST(agent_code AS TEXT))) IN (${codePlaceholders.join(", ")})`,
-      codeParams
-    );
-    for (const row of codeRows || []) {
-      agentCodeToUser.set(normalizeAgentCode(row.agent_code), row.user_id);
-      if (row.user_id) agentIds.push(row.user_id);
-    }
-  }
-  const uniqueAgentIds = [...new Set(agentIds.filter(Boolean))];
-  const hierarchyByAgent = /* @__PURE__ */ new Map();
-  if (uniqueAgentIds.length) {
-    const hParams = {};
-    const hPlaceholders = uniqueAgentIds.map((id, i) => {
-      hParams[`aid${i}`] = id;
-      return `:aid${i}`;
-    });
-    const [hRows] = await pool.execute(
-      `SELECT agent_user_id, employee_user_id, hierarchy_level, is_primary
-       FROM agent_employee_hierarchy
-       WHERE agent_user_id IN (${hPlaceholders.join(", ")})`,
-      hParams
-    );
-    for (const row of hRows || []) {
-      if (!hierarchyByAgent.has(row.agent_user_id)) hierarchyByAgent.set(row.agent_user_id, []);
-      hierarchyByAgent.get(row.agent_user_id).push(row);
-    }
-  }
-  const result = [];
-  for (let i = 0; i < rows.length; i += 1) {
-    const app = rows[i];
-    const data = appData[i];
-    const resolvedAgentId = app.agent_id || agentCodeToUser.get(
-      normalizeAgentCode(
-        app.sourced_agent_code || data?.sourced_agent_code || data?.sourcedAgentCode || data?.agent_code || data?.agentCode
-      )
-    ) || null;
-    const ownerId = resolveResponsibleEmployeeIdForStage(
-      app,
-      resolvedAgentId ? hierarchyByAgent.get(resolvedAgentId) || [] : []
-    );
-    if (ownerId === employeeId || app.assigned_employee_id === employeeId) {
-      result.push(app);
-    }
-  }
-  return result;
-}
 portalDashboardsRouter.get("/agent/dashboard", authenticate, async (req, res, next) => {
   try {
     if (req.auth.role !== "agent" && !["admin", "super_admin"].includes(req.auth.role)) {
@@ -220,32 +122,97 @@ portalDashboardsRouter.get("/agent/dashboard", authenticate, async (req, res, ne
       { id: agentId }
     );
     const agentCode = await ensureAgentCodeForUser(pool, agentId) || profile?.agent_code || null;
-    const [apps] = await pool.execute(
-      `SELECT la.*, c.full_name AS customer_full_name, c.email AS customer_email, c.phone AS customer_phone
-       FROM loan_applications la
-       LEFT JOIN user_profiles c ON c.id = la.customer_id
-       WHERE la.agent_id = :agentId
-          OR CAST(COALESCE(la.data->>'agent_id', '') AS TEXT) = CAST(:agentId AS TEXT)
-          OR CAST(COALESCE(la.data->>'agentId', '') AS TEXT) = CAST(:agentId AS TEXT)
-          OR (
-            :agentCode IS NOT NULL
-            AND (
-              LOWER(TRIM(CAST(COALESCE(la.sourced_agent_code, '') AS TEXT))) = LOWER(TRIM(CAST(:agentCode AS TEXT)))
-              OR LOWER(TRIM(CAST(COALESCE(la.data->>'sourced_agent_code', '') AS TEXT))) = LOWER(TRIM(CAST(:agentCode AS TEXT)))
-              OR LOWER(TRIM(CAST(COALESCE(la.data->>'sourcedAgentCode', '') AS TEXT))) = LOWER(TRIM(CAST(:agentCode AS TEXT)))
-              OR LOWER(TRIM(CAST(COALESCE(la.data->>'agent_code', '') AS TEXT))) = LOWER(TRIM(CAST(:agentCode AS TEXT)))
-              OR LOWER(TRIM(CAST(COALESCE(la.data->>'agentCode', '') AS TEXT))) = LOWER(TRIM(CAST(:agentCode AS TEXT)))
-            )
-          )
-       ORDER BY la.created_at DESC`,
-      { agentId, agentCode }
-    );
+    let apps = [];
+    try {
+      const [ownedById] = await pool.execute(
+        `SELECT la.*, c.full_name AS customer_full_name, c.email AS customer_email, c.phone AS customer_phone
+         FROM loan_applications la
+         LEFT JOIN user_profiles c ON c.id = la.customer_id
+         WHERE CAST(COALESCE(la.agent_id, '') AS TEXT) = CAST(:agentId AS TEXT)
+         ORDER BY la.created_at DESC`,
+        { agentId }
+      );
+      apps = ownedById || [];
+    } catch (err) {
+      console.warn("[agent-dashboard] agent_id applications query failed:", err?.message);
+      apps = [];
+    }
+    try {
+      const appParams = { agentId };
+      const appMatch = [
+        `CAST(COALESCE(la.agent_id, '') AS TEXT) = CAST(:agentId AS TEXT)`,
+        `CAST(COALESCE(la.data->>'agent_id', '') AS TEXT) = CAST(:agentId AS TEXT)`,
+        `CAST(COALESCE(la.data->>'agentId', '') AS TEXT) = CAST(:agentId AS TEXT)`,
+        `EXISTS (
+           SELECT 1 FROM marketing_leads ml
+           WHERE ml.application_id = la.id
+             AND CAST(COALESCE(ml.assigned_to, '') AS TEXT) = CAST(:agentId AS TEXT)
+         )`
+      ];
+      if (agentCode) {
+        appParams.code = agentCode;
+        appMatch.push(
+          `LOWER(TRIM(CAST(COALESCE(la.sourced_agent_code, '') AS TEXT))) = LOWER(TRIM(CAST(:code AS TEXT)))`,
+          `LOWER(TRIM(CAST(COALESCE(la.data->>'sourced_agent_code', '') AS TEXT))) = LOWER(TRIM(CAST(:code AS TEXT)))`,
+          `LOWER(TRIM(CAST(COALESCE(la.data->>'sourcedAgentCode', '') AS TEXT))) = LOWER(TRIM(CAST(:code AS TEXT)))`,
+          `LOWER(TRIM(CAST(COALESCE(la.data->>'agent_code', '') AS TEXT))) = LOWER(TRIM(CAST(:code AS TEXT)))`,
+          `LOWER(TRIM(CAST(COALESCE(la.data->>'agentCode', '') AS TEXT))) = LOWER(TRIM(CAST(:code AS TEXT)))`,
+          `EXISTS (
+             SELECT 1 FROM marketing_leads ml
+             WHERE ml.application_id = la.id
+               AND LOWER(TRIM(CAST(COALESCE(ml.sourced_agent_code, '') AS TEXT)))
+                 = LOWER(TRIM(CAST(:code AS TEXT)))
+           )`
+        );
+      }
+      const [appRows] = await pool.execute(
+        `SELECT la.*, c.full_name AS customer_full_name, c.email AS customer_email, c.phone AS customer_phone
+         FROM loan_applications la
+         LEFT JOIN user_profiles c ON c.id = la.customer_id
+         WHERE ${appMatch.join("\n          OR ")}
+         ORDER BY la.created_at DESC`,
+        appParams
+      );
+      if (Array.isArray(appRows) && appRows.length) {
+        const byId = new Map(apps.map((row) => [row.id, row]));
+        for (const row of appRows) byId.set(row.id, row);
+        apps = [...byId.values()].sort(
+          (a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime()
+        );
+      }
+      if (apps.length && agentCode) {
+        try {
+          const bfParams = { agentId, code: agentCode };
+          const bfPlaceholders = apps.map((row, i) => {
+            const key = `bf${i}`;
+            bfParams[key] = row.id;
+            return `:${key}`;
+          });
+          await pool.execute(
+            `UPDATE loan_applications
+             SET agent_id = COALESCE(agent_id, :agentId),
+                 sourced_agent_code = COALESCE(NULLIF(TRIM(CAST(sourced_agent_code AS TEXT)), ''), :code)
+             WHERE id IN (${bfPlaceholders.join(", ")})`,
+            bfParams
+          );
+        } catch {
+        }
+      }
+    } catch (err) {
+      console.warn("[agent-dashboard] expanded applications query failed:", err?.message);
+    }
     const total = apps.length;
     const approved = apps.filter((a) => a.status === "approved").length;
     const conversionRate = total > 0 ? Math.round(approved / total * 100) : 0;
-    await ensureStaffExtrasSchema();
-    const { resolveAgentCommissionConfig } = await import("../lib/agentCommission.js");
-    const commissionConfig = await resolveAgentCommissionConfig(pool, agentId);
+    let commissionConfig = null;
+    try {
+      await ensureStaffExtrasSchema();
+      const { resolveAgentCommissionConfig } = await import("../lib/agentCommission.js");
+      commissionConfig = await resolveAgentCommissionConfig(pool, agentId);
+    } catch (err) {
+      console.warn("[agent-dashboard] commission config failed:", err?.message);
+      commissionConfig = null;
+    }
     const commissionEntries = apps.map((row) => {
       const data = typeof row.data === "string" ? JSON.parse(row.data || "{}") : row.data || {};
       const amount = calculateCommissionFromApplication(
@@ -266,27 +233,36 @@ portalDashboardsRouter.get("/agent/dashboard", authenticate, async (req, res, ne
         date: row.submitted_at || row.updated_at || row.created_at
       };
     });
-    const ledgerRows = await fetchAgentCommissionLedger(pool, agentId);
+    let ledgerRows = [];
+    try {
+      ledgerRows = await fetchAgentCommissionLedger(pool, agentId);
+    } catch {
+      ledgerRows = [];
+    }
     let insuranceOrders = [];
     let sipOrders = [];
     if (ledgerRows.length) {
-      const insuranceIds = ledgerRows.filter((r) => r.source_type === "insurance_purchase").map((r) => r.source_id);
-      const sipIds = ledgerRows.filter((r) => r.source_type === "mf_sip").map((r) => r.source_id);
-      const fetchByIds = async (table, ids) => {
-        if (!ids.length) return [];
-        const params = {};
-        const placeholders = ids.map((id, i) => {
-          params[`id${i}`] = id;
-          return `:id${i}`;
-        });
-        const [rows] = await pool.execute(
-          `SELECT id, customer_name FROM ${table} WHERE id IN (${placeholders.join(",")})`,
-          params
-        );
-        return rows || [];
-      };
-      insuranceOrders = await fetchByIds("insurance_purchase_orders", insuranceIds);
-      sipOrders = await fetchByIds("mutual_fund_sip_orders", sipIds);
+      try {
+        const insuranceIds = ledgerRows.filter((r) => r.source_type === "insurance_purchase").map((r) => r.source_id);
+        const sipIds = ledgerRows.filter((r) => r.source_type === "mf_sip").map((r) => r.source_id);
+        const fetchByIds = async (table, ids) => {
+          if (!ids.length) return [];
+          const params = {};
+          const placeholders = ids.map((id, i) => {
+            params[`id${i}`] = id;
+            return `:id${i}`;
+          });
+          const [rows] = await pool.execute(
+            `SELECT id, customer_name FROM ${table} WHERE id IN (${placeholders.join(",")})`,
+            params
+          );
+          return rows || [];
+        };
+        insuranceOrders = await fetchByIds("insurance_purchase_orders", insuranceIds);
+        sipOrders = await fetchByIds("mutual_fund_sip_orders", sipIds);
+      } catch (err) {
+        console.warn("[agent-dashboard] marketplace order lookup failed:", err?.message);
+      }
     }
     const ledgerEntries = ledgerRows.map(
       (row) => mapLedgerEntryToCommission(row, { insuranceOrders, sipOrders })
@@ -326,29 +302,49 @@ portalDashboardsRouter.get("/agent/dashboard", authenticate, async (req, res, ne
     let attributedLeads = 0;
     let pipelineLeads = [];
     let attributedSipOrders = 0;
+    try {
+      const leadParams = { agentId };
+      const leadMatch = [
+        `CAST(COALESCE(assigned_to, '') AS TEXT) = CAST(:agentId AS TEXT)`
+      ];
+      if (agentCode) {
+        leadParams.code = agentCode;
+        leadMatch.push(
+          `LOWER(TRIM(CAST(COALESCE(sourced_agent_code, '') AS TEXT)))
+             = LOWER(TRIM(CAST(:code AS TEXT)))`
+        );
+        try {
+          await pool.execute(
+            `UPDATE marketing_leads
+             SET sourced_agent_code = :code
+             WHERE CAST(COALESCE(assigned_to, '') AS TEXT) = CAST(:agentId AS TEXT)
+               AND (sourced_agent_code IS NULL OR TRIM(CAST(sourced_agent_code AS TEXT)) = '')`,
+            { agentId, code: agentCode }
+          );
+        } catch {
+        }
+      }
+      const leadWhereSql = `(${leadMatch.join(" OR ")})`;
+      const [[leadRow]] = await pool.execute(
+        `SELECT COUNT(*)::int AS c FROM marketing_leads WHERE ${leadWhereSql}`,
+        leadParams
+      );
+      attributedLeads = Number(leadRow?.c || 0);
+      const [leadRows] = await pool.execute(
+        `SELECT id, full_name, email, phone, loan_type, status, application_id, source, created_at, updated_at
+         FROM marketing_leads
+         WHERE ${leadWhereSql}
+         ORDER BY created_at DESC
+         LIMIT 100`,
+        leadParams
+      );
+      pipelineLeads = (leadRows || []).map(mapLeadToPipelineClient);
+    } catch (err) {
+      console.warn("[agent-dashboard] pipeline leads failed:", err?.message);
+      attributedLeads = 0;
+      pipelineLeads = [];
+    }
     if (agentCode) {
-      try {
-        const [[leadRow]] = await pool.execute(
-          `SELECT COUNT(*)::int AS c FROM marketing_leads
-           WHERE sourced_agent_code = :code`,
-          { code: agentCode }
-        );
-        attributedLeads = Number(leadRow?.c || 0);
-      } catch {
-      }
-      try {
-        const [leadRows] = await pool.execute(
-          `SELECT id, full_name, email, phone, loan_type, status, application_id, source, created_at, updated_at
-           FROM marketing_leads
-           WHERE sourced_agent_code = :code
-           ORDER BY created_at DESC
-           LIMIT 100`,
-          { code: agentCode }
-        );
-        pipelineLeads = (leadRows || []).map(mapLeadToPipelineClient);
-      } catch {
-        pipelineLeads = [];
-      }
       try {
         const [[sipRow]] = await pool.execute(
           `SELECT COUNT(*)::int AS c FROM mutual_fund_sip_orders
@@ -433,6 +429,12 @@ portalDashboardsRouter.get("/agent/dashboard", authenticate, async (req, res, ne
     const paidEntries = allCommissionEntries.filter((c) => c.status === "paid");
     const lastPaid = paidEntries[0];
     const monthTarget = 15e4;
+    const submittedApps = apps.filter(
+      (a) => ["submitted", "under_review", "documents_pending", "approved", "disbursed"].includes(
+        String(a.status || "").toLowerCase()
+      )
+    ).length;
+    const disbursedApps = apps.filter((a) => String(a.status || "").toLowerCase() === "disbursed").length;
     const leadsChart = (performanceAnalytics.week || []).map((row) => ({
       name: row.name,
       leads: row.clients,
@@ -535,7 +537,18 @@ portalDashboardsRouter.get("/agent/dashboard", authenticate, async (req, res, ne
           lastPayoutDate: lastPaid?.date || null,
           nextPayout: pendingCommission,
           nextPayoutDate: null
-        }
+        },
+        submissionVsDisbursement: {
+          submitted: submittedApps,
+          disbursed: disbursedApps,
+          ratePct: submittedApps > 0 ? Math.round(disbursedApps / submittedApps * 100) : 0
+        },
+        policyUpdates: (circulars || []).slice(0, 5).map((c) => ({
+          id: c.id,
+          title: c.title || "Policy update",
+          fileUrl: c.file_url || c.fileUrl,
+          createdAt: c.created_at || c.createdAt
+        }))
       },
       attribution: {
         agentCode,
@@ -576,33 +589,40 @@ portalDashboardsRouter.get("/employee/dashboard", authenticate, async (req, res,
     const pool = getPool();
     const employeeId = req.auth.userId;
     await ensureAgentLearningSchema();
-    const [rawApps] = await pool.execute(
-      `SELECT la.*, c.full_name AS customer_full_name
-       FROM loan_applications la
-       LEFT JOIN user_profiles c ON c.id = la.customer_id
-       WHERE la.assigned_employee_id = :id
-          OR EXISTS (
-            SELECT 1
-            FROM agent_employee_hierarchy h
-            LEFT JOIN agent_onboarding ao ON ao.user_id = h.agent_user_id
-            WHERE h.employee_user_id = :id
-              AND (
-                h.agent_user_id = la.agent_id
-                OR LOWER(TRIM(CAST(COALESCE(la.sourced_agent_code, '') AS TEXT))) = LOWER(TRIM(CAST(COALESCE(ao.agent_code, '') AS TEXT)))
-                OR LOWER(TRIM(CAST(COALESCE(la.data->>'sourced_agent_code', '') AS TEXT))) = LOWER(TRIM(CAST(COALESCE(ao.agent_code, '') AS TEXT)))
-                OR LOWER(TRIM(CAST(COALESCE(la.data->>'sourcedAgentCode', '') AS TEXT))) = LOWER(TRIM(CAST(COALESCE(ao.agent_code, '') AS TEXT)))
-                OR LOWER(TRIM(CAST(COALESCE(la.data->>'agent_code', '') AS TEXT))) = LOWER(TRIM(CAST(COALESCE(ao.agent_code, '') AS TEXT)))
-                OR LOWER(TRIM(CAST(COALESCE(la.data->>'agentCode', '') AS TEXT))) = LOWER(TRIM(CAST(COALESCE(ao.agent_code, '') AS TEXT)))
-              )
-          )
-       ORDER BY la.created_at DESC`,
-      { id: employeeId }
-    );
-    const apps = await filterApplicationsForEmployeeByHierarchy(pool, employeeId, rawApps);
-    const [[pendingDocs]] = await pool.execute(
-      `SELECT COUNT(*) AS c FROM customer_documents cd
-       WHERE COALESCE(cd.verification_status, cd.status, 'pending') IN ('pending','uploaded')`
-    );
+    await autoAssignApplicationsForEmployeeVerification(pool);
+    const ownedIds = await fetchEmployeeOwnedApplicationIds(pool, employeeId, { autoAssign: false });
+    let apps = [];
+    if (ownedIds.size) {
+      const idParams = { id: employeeId };
+      const placeholders = Array.from(ownedIds).map((appId, i) => {
+        idParams[`oid${i}`] = appId;
+        return `:oid${i}`;
+      });
+      const [ownedApps] = await pool.execute(
+        `SELECT la.*, c.full_name AS customer_full_name
+         FROM loan_applications la
+         LEFT JOIN user_profiles c ON c.id = la.customer_id
+         WHERE la.id IN (${placeholders.join(", ")})
+         ORDER BY la.created_at DESC`,
+        idParams
+      );
+      apps = ownedApps || [];
+    }
+    let pendingDocCount = 0;
+    if (ownedIds.size) {
+      const docParams = {};
+      const docPlaceholders = Array.from(ownedIds).map((appId, i) => {
+        docParams[`did${i}`] = appId;
+        return `:did${i}`;
+      });
+      const [[pendingDocs]] = await pool.execute(
+        `SELECT COUNT(*) AS c FROM customer_documents cd
+         WHERE cd.application_id IN (${docPlaceholders.join(", ")})
+           AND COALESCE(cd.verification_status, cd.status, 'pending') IN ('pending','uploaded')`,
+        docParams
+      );
+      pendingDocCount = Number(pendingDocs?.c || 0);
+    }
     const [activities] = await pool.execute(
       `SELECT action_type, table_name, record_id, created_at
        FROM audit_logs WHERE user_id = :id ORDER BY created_at DESC LIMIT 20`,
@@ -618,7 +638,7 @@ portalDashboardsRouter.get("/employee/dashboard", authenticate, async (req, res,
       stats: {
         assignedApplications: canApplications ? apps.length : 0,
         pendingReview: canApplications ? apps.filter((a) => ["submitted", "pending", "under_review"].includes(a.status)).length : 0,
-        pendingDocuments: canDocuments ? Number(pendingDocs?.c || 0) : 0,
+        pendingDocuments: canDocuments ? pendingDocCount : 0,
         completedToday: canApplications ? apps.filter((a) => {
           if (!a.reviewed_at) return false;
           const d = new Date(a.reviewed_at);

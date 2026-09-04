@@ -5,6 +5,7 @@ import {
   getMsg91Config,
   isMsg91Configured,
   isMsg91EmailConfigured,
+  isMsg91WhatsappConfigured,
   sendMsg91EmailOtp,
   sendMsg91Otp,
   sendMsg91Whatsapp
@@ -25,17 +26,23 @@ function formatOtpMessage(template, otp) {
   const tpl = template || "Your Rfincare verification code is {{otp}}. Valid for 10 minutes.";
   return tpl.replace(/\{\{otp\}\}/g, otp);
 }
-function getOtpInfrastructureStatus() {
+function getOtpInfrastructureStatus(providerConfig = {}) {
+  const cfg = providerConfig || {};
+  const msg91 = getMsg91Config(cfg);
   return {
     msg91: {
       configured: isMsg91Configured(),
-      emailConfigured: isMsg91EmailConfigured(),
-      senderId: process.env.MSG91_SENDER_ID || null,
-      otpTemplateId: process.env.MSG91_OTP_TEMPLATE_ID || process.env.MSG91_TEMPLATE_ID || null,
-      whatsappTemplateId: process.env.MSG91_WHATSAPP_TEMPLATE_ID || null,
-      emailDomain: process.env.MSG91_EMAIL_DOMAIN || null,
-      emailFrom: process.env.MSG91_EMAIL_FROM_EMAIL || process.env.MSG91_EMAIL_FROM || null,
-      emailOtpTemplateId: process.env.MSG91_EMAIL_OTP_TEMPLATE_ID || null
+      emailConfigured: isMsg91EmailConfigured(cfg),
+      whatsappConfigured: isMsg91WhatsappConfigured(cfg),
+      senderId: msg91.senderId || null,
+      senderIdWarning: msg91.senderIdWarning || null,
+      otpTemplateId: msg91.otpTemplateId || null,
+      whatsappTemplateId: msg91.whatsappTemplateId || null,
+      whatsappNamespace: msg91.whatsappNamespace || null,
+      whatsappIntegratedNumber: msg91.whatsappIntegratedNumber || null,
+      emailDomain: cfg.msg91EmailDomain || process.env.MSG91_EMAIL_DOMAIN || null,
+      emailFrom: cfg.msg91EmailFromEmail || process.env.MSG91_EMAIL_FROM_EMAIL || process.env.MSG91_EMAIL_FROM || null,
+      emailOtpTemplateId: cfg.msg91EmailOtpTemplateId || process.env.MSG91_EMAIL_OTP_TEMPLATE_ID || null
     },
     twilio: {
       configured: Boolean(
@@ -116,8 +123,13 @@ async function sendViaMsg91({ phone, otp, config }) {
       msg91SenderId: providerConfig.msg91SenderId,
       msg91OtpTemplateId: providerConfig.msg91OtpTemplateId || providerConfig.msg91TemplateId,
       msg91FlowTemplateId: providerConfig.msg91FlowTemplateId,
-      msg91WhatsappTemplateId: providerConfig.msg91WhatsappTemplateId
-    }
+      msg91WhatsappTemplateId: providerConfig.msg91WhatsappTemplateId,
+      msg91WhatsappNamespace: providerConfig.msg91WhatsappNamespace,
+      msg91WhatsappIntegratedNumber: providerConfig.msg91WhatsappIntegratedNumber,
+      msg91WhatsappLanguage: providerConfig.msg91WhatsappLanguage,
+      msg91WhatsappIncludeButton: providerConfig.msg91WhatsappIncludeButton
+    },
+    messageTemplate: providerConfig.otpMessageTemplate
   });
 }
 async function sendViaMsg91Email({ email, otp, recipientName, config }) {
@@ -224,7 +236,12 @@ async function sendWhatsappOtp({ phone, otp, settings }) {
       { phone: maskPhone(phone), provider },
       process.env.LOG_OTP === "true" ? otp : "(hidden)"
     );
-    return { sent: true, provider: "console" };
+    return {
+      sent: false,
+      provider: "console",
+      delivered: false,
+      warning: "WhatsApp operator is set to Console, so no WhatsApp message was sent. Set WhatsApp operator to MSG91 in Admin → OTP settings."
+    };
   }
   if (provider === "twilio") {
     return sendViaTwilioWhatsapp({ phone, message });
@@ -233,6 +250,13 @@ async function sendWhatsappOtp({ phone, otp, settings }) {
     if (!isMsg91Configured()) {
       const err = new Error(
         "WhatsApp operator is MSG91 but MSG91_AUTH_KEY is not set on the server."
+      );
+      err.status = 503;
+      throw err;
+    }
+    if (!isMsg91WhatsappConfigured(settings?.providerConfig)) {
+      const err = new Error(
+        "WhatsApp operator is MSG91 but template name, namespace, or integrated number is incomplete. Fill them in Admin → OTP settings and Save."
       );
       err.status = 503;
       throw err;
@@ -266,7 +290,7 @@ async function sendOtpNotification({
   const labels = [];
   const wantSms = channel === "sms" || channel === "both" || !channel && settings.requireMobileOtp;
   const wantEmail = channel === "email" || channel === "both" || !channel && settings.requireEmailOtp;
-  const wantWhatsapp = channel === "whatsapp" || channel === "both" || !channel && settings.requireWhatsappOtp;
+  const wantWhatsapp = channel === "whatsapp" || channel === "both" || !channel && settings.requireWhatsappOtp || Boolean(settings.requireWhatsappOtp) && Boolean(phone) && channel !== "email";
   if (wantSms && phone) {
     tasks.push(channelTimeout(sendSmsOtp({ phone, otp, settings }), "SMS OTP"));
     labels.push("sms");
@@ -280,6 +304,18 @@ async function sendOtpNotification({
     labels.push("whatsapp");
   }
   if (!tasks.length) {
+    const missing = [];
+    if ((channel === "sms" || channel === "whatsapp" || channel === "both") && !phone) {
+      missing.push("mobile number");
+    }
+    if ((channel === "email" || channel === "both") && !email) {
+      missing.push("email");
+    }
+    if (missing.length) {
+      const err = new Error(`Cannot send OTP: missing ${missing.join(" and ")}.`);
+      err.status = 400;
+      throw err;
+    }
     console.log(
       "[otp]",
       { email, phone: maskPhone(phone), channel },
@@ -308,16 +344,20 @@ async function sendDualChannelOtp({ email, phone, settings: settingsOverride }) 
   const outcomes = {};
   async function runSmsChannel() {
     try {
-      return await channelTimeout(
+      const result = await channelTimeout(
         sendSmsOtp({ phone, otp: mobileOtp, settings }),
         "SMS OTP"
       );
+      if (result?.warning) warnings.push(result.warning);
+      if (result?.sent === false && result?.delivered === false) {
+        warnings.push(result.warning || "SMS OTP was not delivered.");
+      }
+      return result;
     } catch (err) {
       const errMsg = err?.message || "SMS send failed";
-      const hint = settings.smsProvider === "msg91" ? `${errMsg} Confirm MSG91_AUTH_KEY and MSG91_OTP_TEMPLATE_ID on the server, and that the template is DLT-approved.` : errMsg;
-      const e = new Error(hint);
-      e.status = err?.status || 502;
-      throw e;
+      const hint = settings.smsProvider === "msg91" ? `${errMsg} Confirm MSG91_AUTH_KEY, MSG91_OTP_TEMPLATE_ID / Admin OTP template, and a valid 6-char sender ID.` : errMsg;
+      warnings.push(hint);
+      return { sent: false, provider: settings.smsProvider, delivered: false, warning: hint };
     }
   }
   async function runEmailChannel() {
@@ -329,15 +369,17 @@ async function sendDualChannelOtp({ email, phone, settings: settingsOverride }) 
       if (result?.delivered === false || result?.sent === false) {
         throw new Error(result.warning || "Email OTP could not be delivered.");
       }
+      if (result?.warning) warnings.push(result.warning);
       return result;
     } catch (err) {
       await sendEmailOtp({
         email,
         otp: emailOtp,
         settings: { ...settings, emailProvider: "console" }
+      }).catch(() => {
       });
       warnings.push(
-        `Email OTP could not be sent (${err?.message || "delivery failed"}). You can continue with mobile OTP only.`
+        `Email OTP could not be sent (${err?.message || "delivery failed"}). You can continue with mobile OTP only if SMS was delivered.`
       );
       return { sent: false, provider: settings.emailProvider, delivered: false, degraded: true };
     }
@@ -358,23 +400,46 @@ async function sendDualChannelOtp({ email, phone, settings: settingsOverride }) 
     );
   }
   await Promise.all(parallel);
-  const emailDelivered = outcomes.email?.delivered !== false && outcomes.email?.sent !== false;
-  const smsDelivered = outcomes.sms?.sent !== false;
-  if (settings.requireMobileOtp !== false && !smsDelivered && outcomes.sms?.warning) {
-    warnings.push(outcomes.sms.warning);
-  }
+  const emailDelivered = Boolean(
+    outcomes.email && outcomes.email.delivered !== false && outcomes.email.sent !== false
+  );
+  const smsDelivered = Boolean(
+    outcomes.sms && outcomes.sms.sent !== false && outcomes.sms.delivered !== false
+  );
   if (settings.requireWhatsappOtp && phone) {
     try {
       outcomes.whatsapp = await channelTimeout(
         sendWhatsappOtp({ phone, otp: mobileOtp, settings }),
         "WhatsApp OTP"
       );
+      if (outcomes.whatsapp?.warning) warnings.push(outcomes.whatsapp.warning);
     } catch (err) {
       warnings.push(err?.message || "WhatsApp OTP failed");
+      outcomes.whatsapp = { sent: false, delivered: false };
+    }
+  } else if (!smsDelivered && phone && settings.whatsappProvider === "msg91" && isMsg91WhatsappConfigured(settings?.providerConfig)) {
+    try {
+      outcomes.whatsapp = await channelTimeout(
+        sendWhatsappOtp({ phone, otp: mobileOtp, settings }),
+        "WhatsApp OTP"
+      );
+      if (outcomes.whatsapp?.warning) warnings.push(outcomes.whatsapp.warning);
+    } catch (err) {
+      warnings.push(err?.message || "WhatsApp OTP fallback failed");
+      outcomes.whatsapp = { sent: false, delivered: false };
     }
   }
+  const whatsappDelivered = outcomes.whatsapp?.sent === true;
+  const mobileChannelOk = smsDelivered || whatsappDelivered;
+  if (!mobileChannelOk && !emailDelivered && (settings.requireMobileOtp !== false || settings.requireEmailOtp !== false || settings.requireWhatsappOtp)) {
+    const err = new Error(
+      warnings.join(" ") || "OTP could not be delivered on any channel. Check Admin → OTP settings and MSG91/SMTP credentials."
+    );
+    err.status = 502;
+    throw err;
+  }
   return {
-    mobileOtp: settings.requireMobileOtp !== false && smsDelivered ? mobileOtp : null,
+    mobileOtp: settings.requireMobileOtp !== false && mobileChannelOk ? mobileOtp : null,
     emailOtp: settings.requireEmailOtp !== false && emailDelivered ? emailOtp : null,
     smsProvider: settings.smsProvider,
     emailProvider: settings.emailProvider,
@@ -382,7 +447,8 @@ async function sendDualChannelOtp({ email, phone, settings: settingsOverride }) 
     msg91Configured: isMsg91Configured(),
     emailDelivered,
     smsDelivered,
-    requireMobileOtp: settings.requireMobileOtp !== false && smsDelivered,
+    whatsappDelivered,
+    requireMobileOtp: settings.requireMobileOtp !== false && mobileChannelOk,
     requireEmailOtp: settings.requireEmailOtp !== false && emailDelivered,
     warnings,
     delivery: outcomes

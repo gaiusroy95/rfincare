@@ -8,86 +8,20 @@ import { ensureStaffMessagingSchema } from "../db/ensureStaffMessagingSchema.js"
 import { dispatchFileUpdateNotification } from "../lib/fileNotificationService.js";
 import { ensureAgentCodeForUser } from "../lib/agentCode.js";
 import { sendStaffWelcomeEmail } from "../lib/email.js";
+import { pullCibilForEmployee } from "../lib/cibilService.js";
 import { sqlCastParam, sqlCoalescePatch } from "../lib/sqlCollation.js";
-import { newId } from "../lib/ids.js";
 import {
   assertEmployeeAccess,
   getEffectiveEmployeeAccess,
   requireEmployeeModuleAccess
 } from "../lib/employeeAccessControls.js";
+import { autoAssignPendingAgentsToEmployees } from "../lib/employeeApplicationAssignment.js";
 const portalEmployeeMilestone4Router = Router();
 function requireEmployee(req) {
   if (!["employee", "admin", "super_admin"].includes(req.auth.role)) {
     const e = new Error("Employee access only");
     e.status = 403;
     throw e;
-  }
-}
-async function autoAssignPendingAgentsToEmployees(pool) {
-  const [pendingAgents] = await pool.execute(
-    `SELECT ao.user_id
-     FROM agent_onboarding ao
-     JOIN user_profiles up ON up.id = ao.user_id
-     WHERE CAST(ao.qc_status AS TEXT) IN ('pending_qc', 'qc_review')
-       AND up.role = 'agent'`
-  );
-  if (!pendingAgents.length) return;
-  const pendingIds = pendingAgents.map((r) => r.user_id);
-  const params = {};
-  const pendingPlaceholders = pendingIds.map((id, i) => {
-    params[`aid${i}`] = id;
-    return `:aid${i}`;
-  });
-  const [existingMappings] = await pool.execute(
-    `SELECT agent_user_id, employee_user_id, is_primary
-     FROM agent_employee_hierarchy
-     WHERE agent_user_id IN (${pendingPlaceholders.join(", ")})`,
-    params
-  );
-  const alreadyMappedAgents = new Set((existingMappings || []).map((r) => r.agent_user_id));
-  const unmappedAgentIds = pendingIds.filter((id) => !alreadyMappedAgents.has(id));
-  if (!unmappedAgentIds.length) return;
-  const [employees] = await pool.execute(
-    `SELECT id, email
-     FROM user_profiles
-     WHERE role = 'employee' AND is_active = TRUE
-     ORDER BY created_at ASC`
-  );
-  if (!employees.length) return;
-  const [counts] = await pool.execute(
-    `SELECT employee_user_id, COUNT(*)::int AS c
-     FROM agent_employee_hierarchy
-     GROUP BY employee_user_id`
-  );
-  const countMap = new Map((counts || []).map((r) => [r.employee_user_id, Number(r.c || 0)]));
-  const candidates = employees.map((e) => ({ id: e.id, email: e.email || "", count: countMap.get(e.id) || 0 })).sort((a, b) => a.count - b.count || String(a.id).localeCompare(String(b.id)));
-  for (const agentUserId of unmappedAgentIds) {
-    candidates.sort((a, b) => a.count - b.count || String(a.id).localeCompare(String(b.id)));
-    const pick = candidates[0];
-    if (!pick) break;
-    const [[exists]] = await pool.execute(
-      `SELECT id
-       FROM agent_employee_hierarchy
-       WHERE agent_user_id = :agent_user_id
-       LIMIT 1`,
-      { agent_user_id: agentUserId }
-    );
-    if (exists?.id) continue;
-    await pool.execute(
-      `INSERT INTO agent_employee_hierarchy
-       (id, agent_user_id, employee_user_id, communication_email, hierarchy_level, is_primary, notes, created_by)
-       VALUES
-       (:id, :agent_user_id, :employee_user_id, :communication_email, 1, 1, :notes, :created_by)`,
-      {
-        id: newId(),
-        agent_user_id: agentUserId,
-        employee_user_id: pick.id,
-        communication_email: pick.email,
-        notes: "Auto-assigned for QC verification",
-        created_by: "system:auto-assign"
-      }
-    );
-    pick.count += 1;
   }
 }
 portalEmployeeMilestone4Router.use(authenticate);
@@ -295,6 +229,38 @@ portalEmployeeMilestone4Router.post("/agent-onboarding/:userId/qc", async (req, 
     next(err);
   }
 });
+const EmployeeCibilPullSchema = z.object({
+  fullName: z.string().min(2, "Name is required"),
+  fatherName: z.string().min(2, "Father's name is required"),
+  panNumber: z.string().regex(/^[A-Z]{5}[0-9]{4}[A-Z]$/i, "Enter a valid PAN number"),
+  mobile: z.string().min(10, "Mobile number is required"),
+  pincode: z.string().regex(/^\d{6}$/, "Enter a valid 6-digit pincode"),
+  consentAccepted: z.literal(true, { errorMap: () => ({ message: "Consent is required" }) })
+});
+portalEmployeeMilestone4Router.post("/cibil/pull", async (req, res, next) => {
+  try {
+    requireEmployee(req);
+    if (req.auth.role === "employee") {
+      await assertEmployeeAccess(req, "applications", "read");
+    }
+    const input = EmployeeCibilPullSchema.parse(req.body);
+    const phone = String(input.mobile).replace(/\D/g, "").slice(-10);
+    const result = await pullCibilForEmployee(
+      {
+        fullName: input.fullName.trim(),
+        fatherName: input.fatherName.trim(),
+        panNumber: input.panNumber.toUpperCase(),
+        mobile: phone,
+        pincode: input.pincode,
+        consentAccepted: true
+      },
+      req.auth.userId
+    );
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
 portalEmployeeMilestone4Router.get("/notifications", async (req, res, next) => {
   try {
     requireEmployee(req);
@@ -306,6 +272,136 @@ portalEmployeeMilestone4Router.get("/notifications", async (req, res, next) => {
       { uid: req.auth.userId }
     );
     res.json(rows);
+  } catch (err) {
+    next(err);
+  }
+});
+function mapEmployeeManagedAgent(row) {
+  return {
+    id: row.id,
+    agentName: row.agent_name || row.full_name,
+    agentCode: row.agent_code || null,
+    username: row.username || null,
+    email: row.email,
+    mobileNumber: row.mobile_number || row.phone,
+    accountStatus: row.account_status,
+    onboardingStatus: row.ao_status || row.onboarding_status,
+    isActive: Boolean(row.is_active),
+    createdAt: row.created_at,
+    totalApplications: Number(row.total_applications || 0)
+  };
+}
+portalEmployeeMilestone4Router.get("/agents", async (req, res, next) => {
+  try {
+    requireEmployee(req);
+    await assertEmployeeAccess(req, "agents", "read");
+    const pool = getPool();
+    const [rows] = await pool.execute(
+      `SELECT up.*,
+              ao.agent_code,
+              ao.username,
+              ao.agent_name,
+              ao.mobile_number,
+              ao.onboarding_status AS ao_status,
+              (SELECT COUNT(*) FROM loan_applications la WHERE la.agent_id = up.id) AS total_applications
+       FROM user_profiles up
+       LEFT JOIN agent_onboarding ao ON ao.user_id = up.id
+       WHERE up.role = 'agent'
+       ORDER BY up.created_at DESC
+       LIMIT 500`
+    );
+    res.json(rows.map(mapEmployeeManagedAgent));
+  } catch (err) {
+    next(err);
+  }
+});
+portalEmployeeMilestone4Router.post("/agents", async (req, res, next) => {
+  try {
+    requireEmployee(req);
+    await assertEmployeeAccess(req, "agents", "write");
+    const { createAgentAccount } = await import("../lib/staffOnboarding.js");
+    const row = await createAgentAccount(req.body, req.auth.userId);
+    res.status(201).json(
+      mapEmployeeManagedAgent({
+        ...row,
+        agent_name: row.full_name || row.agent_name,
+        agent_code: row.agent_code,
+        ao_status: row.ao_status || row.onboarding_status,
+        total_applications: 0
+      })
+    );
+  } catch (err) {
+    next(err);
+  }
+});
+const AgentStatusSchema = z.object({
+  accountStatus: z.enum(["active", "inactive", "suspended", "pending"])
+});
+portalEmployeeMilestone4Router.patch("/agents/:id/status", async (req, res, next) => {
+  try {
+    requireEmployee(req);
+    await assertEmployeeAccess(req, "agents", "write");
+    const input = AgentStatusSchema.parse({
+      accountStatus: req.body?.accountStatus ?? req.body?.account_status
+    });
+    const { updateAgentDetails, fetchAgentDetail } = await import("../lib/adminStaffManage.js");
+    const detail = await updateAgentDetails(req.params.id, {
+      accountStatus: input.accountStatus,
+      onboardingStatus: input.accountStatus === "active" ? "active" : input.accountStatus
+    });
+    res.json(detail || await fetchAgentDetail(req.params.id));
+  } catch (err) {
+    next(err);
+  }
+});
+portalEmployeeMilestone4Router.get("/agents/:id/reports", async (req, res, next) => {
+  try {
+    requireEmployee(req);
+    await assertEmployeeAccess(req, "agents", "read");
+    const {
+      buildAgentCommissionReport,
+      commissionReportToCsv,
+      commissionReportToPdf
+    } = await import("../lib/commissionReportService.js");
+    const report = await buildAgentCommissionReport(req.params.id, {
+      from: req.query.from || null,
+      to: req.query.to || null,
+      applicationStatus: req.query.applicationStatus || "all",
+      commissionStatus: req.query.commissionStatus || "all",
+      loanType: req.query.loanType || "all"
+    });
+    const format = String(req.query.format || "json").toLowerCase();
+    if (format === "xlsx" || format === "excel") {
+      const { commissionReportToXlsx } = await import("../lib/commissionReportService.js");
+      const buf = commissionReportToXlsx(report);
+      res.setHeader(
+        "Content-Type",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      );
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="agent-report-${req.params.id.slice(0, 8)}-${Date.now()}.xlsx"`
+      );
+      return res.send(buf);
+    }
+    if (format === "csv") {
+      const csv = commissionReportToCsv(report);
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="agent-report-${req.params.id.slice(0, 8)}-${Date.now()}.csv"`
+      );
+      return res.send(csv);
+    }
+    if (format === "pdf") {
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="agent-report-${req.params.id.slice(0, 8)}-${Date.now()}.pdf"`
+      );
+      return res.send(commissionReportToPdf(report));
+    }
+    res.json(report);
   } catch (err) {
     next(err);
   }

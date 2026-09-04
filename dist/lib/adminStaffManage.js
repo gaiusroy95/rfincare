@@ -1,7 +1,7 @@
 import bcrypt from "bcryptjs";
 import { getPool } from "../db/pool.js";
 import { ensureOnboardingSchema } from "../db/ensureOnboardingSchema.js";
-import { sendStaffWelcomeEmail } from "./email.js";
+import { sendStaffWelcomeEmail, sendEmployeeTerminationEmail } from "./email.js";
 import { ensureAgentCodeForUser } from "./agentCode.js";
 import { sqlCastParam, sqlCoalescePatch, sqlLiteralEquals, sqlParamEqualsLower } from "./sqlCollation.js";
 function pick(body, ...keys) {
@@ -239,6 +239,60 @@ async function updateEmployeeDetails(userId, body) {
   );
   return fetchEmployeeDetail(userId);
 }
+async function terminateEmployee(userId, { reason, remarks, terminatedBy } = {}) {
+  if (!reason || String(reason).trim().length < 2) {
+    const e = new Error("Termination reason is required");
+    e.status = 400;
+    throw e;
+  }
+  await ensureOnboardingSchema();
+  const detail = await fetchEmployeeDetail(userId);
+  const pool = getPool();
+  const reasonText = String(reason).trim();
+  const remarksText = remarks ? String(remarks).trim() : "";
+  await pool.execute(
+    `UPDATE user_profiles SET
+       account_status = 'inactive',
+       onboarding_status = 'inactive',
+       is_active = FALSE
+     WHERE id = :id AND ${sqlLiteralEquals("role", "employee")}`,
+    { id: userId }
+  );
+  try {
+    await pool.execute(
+      `UPDATE employee_onboarding SET
+         onboarding_status = 'inactive',
+         termination_reason = :reason,
+         termination_remarks = :remarks,
+         terminated_at = NOW(),
+         terminated_by = :by
+       WHERE user_id = :id`,
+      {
+        id: userId,
+        reason: reasonText,
+        remarks: remarksText || null,
+        by: terminatedBy || null
+      }
+    );
+  } catch (err) {
+    await pool.execute(
+      `UPDATE employee_onboarding SET onboarding_status = 'inactive' WHERE user_id = :id`,
+      { id: userId }
+    );
+    if (!String(err?.message || "").includes("termination_")) {
+      console.warn("[terminate-employee]", err.message);
+    }
+  }
+  if (detail.email) {
+    await sendEmployeeTerminationEmail({
+      email: detail.email,
+      fullName: detail.employeeName || detail.fullName,
+      reason: reasonText,
+      remarks: remarksText
+    }).catch((err) => console.warn("[employee-termination-email]", err.message));
+  }
+  return fetchEmployeeDetail(userId);
+}
 async function resetStaffPassword({ userId, password, role, fullName, email, notifyEmail }) {
   if (!password || String(password).length < 8) {
     const e = new Error("Password must be at least 8 characters");
@@ -267,10 +321,111 @@ async function resetStaffPassword({ userId, password, role, fullName, email, not
   }
   return { success: true };
 }
+async function deleteIfTableExists(pool, sql, params) {
+  try {
+    await pool.execute(sql, params);
+  } catch (err) {
+    if (err?.code === "42P01") return;
+    throw err;
+  }
+}
+async function deleteAgentPermanently(agentId) {
+  await ensureOnboardingSchema();
+  const pool = getPool();
+  const id = String(agentId || "").trim();
+  if (!id) {
+    const e = new Error("Agent id is required");
+    e.status = 400;
+    throw e;
+  }
+  const detail = await fetchAgentDetail(id);
+  await pool.execute("BEGIN");
+  try {
+    await deleteIfTableExists(
+      pool,
+      `DELETE FROM agent_commission_config WHERE agent_user_id = :id`,
+      { id }
+    );
+    await deleteIfTableExists(
+      pool,
+      `DELETE FROM agent_commission_ledger WHERE agent_user_id = :id`,
+      { id }
+    );
+    await deleteIfTableExists(
+      pool,
+      `DELETE FROM agent_commission_bills WHERE agent_user_id = :id`,
+      { id }
+    );
+    await deleteIfTableExists(
+      pool,
+      `DELETE FROM agent_employee_hierarchy WHERE agent_user_id = :id`,
+      { id }
+    );
+    await deleteIfTableExists(
+      pool,
+      `DELETE FROM agent_learning_progress WHERE agent_user_id = :id`,
+      { id }
+    );
+    await deleteIfTableExists(
+      pool,
+      `DELETE FROM agent_profile_otps WHERE agent_user_id = :id`,
+      { id }
+    );
+    await deleteIfTableExists(
+      pool,
+      `DELETE FROM agent_onboarding WHERE user_id = :id`,
+      { id }
+    );
+    await deleteIfTableExists(
+      pool,
+      `DELETE FROM oauth_identities WHERE user_id = :id`,
+      { id }
+    );
+    await pool.execute(
+      `UPDATE loan_applications SET agent_id = NULL WHERE agent_id = :id`,
+      { id }
+    );
+    await deleteIfTableExists(
+      pool,
+      `UPDATE marketing_leads SET assigned_to = NULL WHERE assigned_to = :id`,
+      { id }
+    );
+    await deleteIfTableExists(
+      pool,
+      `UPDATE leads SET assigned_to = NULL WHERE assigned_to = :id`,
+      { id }
+    );
+    await pool.execute(
+      `UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = :id AND revoked_at IS NULL`,
+      { id }
+    );
+    await pool.execute(`DELETE FROM auth_users WHERE id = :id`, { id });
+    await pool.execute(`DELETE FROM user_profiles WHERE id = :id AND role = 'agent'`, { id });
+    await pool.execute("COMMIT");
+  } catch (err) {
+    try {
+      await pool.execute("ROLLBACK");
+    } catch {
+    }
+    throw err;
+  }
+  return {
+    success: true,
+    message: "Agent deleted permanently",
+    deleted: {
+      id: detail.id,
+      agentName: detail.agentName,
+      email: detail.email,
+      agentCode: detail.agentCode
+    }
+  };
+}
 export {
+  deleteAgentPermanently,
   fetchAgentDetail,
   fetchEmployeeDetail,
   resetStaffPassword,
+  terminateEmployee,
   updateAgentDetails,
   updateEmployeeDetails
 };

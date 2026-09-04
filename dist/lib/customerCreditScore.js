@@ -30,9 +30,10 @@ async function getCustomerCreditProfile(customerId, email) {
   let bureauScore = null;
   let bureauCheckedAt = null;
   let bureauVendor = null;
+  let reportPath = null;
   try {
     const [[check]] = await pool.execute(
-      `SELECT cc.credit_score, cc.checked_at, cc.status, cv.display_name AS vendor_name
+      `SELECT cc.credit_score, cc.checked_at, cc.status, cc.report_path, cv.display_name AS vendor_name
        FROM cibil_checks cc
        LEFT JOIN cibil_vendors cv ON cv.vendor_key = cc.vendor_key
        WHERE cc.customer_id = :id AND cc.status = 'success' AND cc.credit_score IS NOT NULL
@@ -44,6 +45,7 @@ async function getCustomerCreditProfile(customerId, email) {
       bureauScore = Number(check.credit_score);
       bureauCheckedAt = check.checked_at;
       bureauVendor = check.vendor_name;
+      reportPath = check.report_path || null;
     }
   } catch {
   }
@@ -79,7 +81,9 @@ async function getCustomerCreditProfile(customerId, email) {
     bureauCheckedAt,
     bureauVendor,
     selfReportedRange,
-    hasBureauPull: bureauScore != null
+    hasBureauPull: bureauScore != null,
+    hasReport: Boolean(reportPath),
+    reportPath: reportPath || null
   };
 }
 export {

@@ -1,4 +1,6 @@
 import { Router } from "express";
+import { readFileSync, existsSync } from "node:fs";
+import { resolve } from "node:path";
 import { getPool } from "../db/pool.js";
 import { authenticate } from "../middleware/authenticate.js";
 import { sqlParamEqualsLower } from "../lib/sqlCollation.js";
@@ -7,6 +9,7 @@ import { buildCustomer360 } from "../lib/customer360.js";
 import { ensureEngagementNotifications } from "../lib/customerEngagement.js";
 import { getCustomerCreditProfile } from "../lib/customerCreditScore.js";
 import { pullCibilForCustomer } from "../lib/cibilService.js";
+import { getUploadDir } from "../lib/uploadPaths.js";
 import {
   listCustomerSupportMessages,
   resolveAssignedEmployeeSupportContact,
@@ -19,6 +22,13 @@ import {
   deleteFinancialGoal
 } from "../lib/customerFinancialGoals.js";
 const portalCustomerRouter = Router();
+function requireCustomer(req) {
+  if (req.auth.role !== "customer") {
+    const e = new Error("Customer access only");
+    e.status = 403;
+    throw e;
+  }
+}
 portalCustomerRouter.get("/360", authenticate, async (req, res, next) => {
   try {
     if (req.auth.role !== "customer") {
@@ -39,11 +49,7 @@ portalCustomerRouter.get("/360", authenticate, async (req, res, next) => {
 });
 portalCustomerRouter.get("/credit-score", authenticate, async (req, res, next) => {
   try {
-    if (req.auth.role !== "customer") {
-      const e = new Error("Customer access only");
-      e.status = 403;
-      throw e;
-    }
+    requireCustomer(req);
     const pool = getPool();
     const [[profile]] = await pool.execute(
       `SELECT email FROM user_profiles WHERE id = :id LIMIT 1`,
@@ -55,13 +61,36 @@ portalCustomerRouter.get("/credit-score", authenticate, async (req, res, next) =
     next(err);
   }
 });
+portalCustomerRouter.get("/credit-score/report", authenticate, async (req, res, next) => {
+  try {
+    requireCustomer(req);
+    const pool = getPool();
+    const [[check]] = await pool.execute(
+      `SELECT report_path, credit_score, status
+       FROM cibil_checks
+       WHERE customer_id = :id AND status = 'success' AND report_path IS NOT NULL
+       ORDER BY checked_at DESC
+       LIMIT 1`,
+      { id: req.auth.userId }
+    );
+    if (!check?.report_path) {
+      return res.status(404).json({ error: "CIBIL report not available yet. Pull your score first." });
+    }
+    const fileName = String(check.report_path).split("/").pop();
+    const fullPath = resolve(getUploadDir(), "cibil-reports", fileName);
+    if (!existsSync(fullPath)) {
+      return res.status(404).json({ error: "CIBIL report file not found" });
+    }
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="cibil-report-${fileName}"`);
+    res.send(readFileSync(fullPath));
+  } catch (err) {
+    next(err);
+  }
+});
 portalCustomerRouter.post("/credit-score/pull", authenticate, async (req, res, next) => {
   try {
-    if (req.auth.role !== "customer") {
-      const e = new Error("Customer access only");
-      e.status = 403;
-      throw e;
-    }
+    requireCustomer(req);
     const pool = getPool();
     const pull = await pullCibilForCustomer(req.auth.userId);
     const [[profile]] = await pool.execute(
@@ -472,13 +501,6 @@ portalCustomerRouter.get("/financial-snapshot", authenticate, async (req, res, n
     next(err);
   }
 });
-function requireCustomer(req) {
-  if (req.auth.role !== "customer") {
-    const e = new Error("Customer access only");
-    e.status = 403;
-    throw e;
-  }
-}
 portalCustomerRouter.get("/support-chat", authenticate, async (req, res, next) => {
   try {
     requireCustomer(req);
