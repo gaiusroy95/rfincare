@@ -34,6 +34,11 @@ import {
   listCatalogLegalPages,
   upsertLegalPage,
 } from '../lib/legalPages.js';
+import {
+  mapHomepageNewsRow,
+  mapHomepageVideoRow,
+  mapSuccessStoryRow,
+} from '../lib/cmsContentMap.js';
 import { normalizeYoutubeWatchUrl } from '../lib/youtube.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { requireRoles } from '../middleware/requireRoles.js';
@@ -46,7 +51,24 @@ cmsRouter.use(requireRoles('admin', 'super_admin', 'employee'));
 const NewsSchema = z.object({
   title: z.string().min(1),
   excerpt: z.string().optional(),
-  blogUrl: z.string().url().optional().or(z.literal('')),
+  blogUrl: z
+    .string()
+    .optional()
+    .or(z.literal(''))
+    .transform((value) => {
+      const trimmed = String(value || '').trim();
+      if (!trimmed) return '';
+      try {
+        // Accept absolute http(s) URLs; leave relative paths as-is for internal links.
+        if (/^https?:\/\//i.test(trimmed)) {
+          // eslint-disable-next-line no-new
+          new URL(trimmed);
+        }
+        return trimmed;
+      } catch {
+        return '';
+      }
+    }),
   imageUrl: z.string().optional(),
   imageAlt: z.string().optional(),
   category: z.string().optional(),
@@ -405,9 +427,11 @@ cmsRouter.put('/about-content', async (req, res, next) => {
 cmsRouter.get('/news', async (req, res, next) => {
   try {
     const [rows] = await getPool().query(
-      `SELECT * FROM homepage_news ORDER BY sort_order DESC, created_at DESC`,
+      `SELECT id, title, excerpt, blog_url, image_url, image_alt, category,
+              published_at, is_published, sort_order, created_at
+       FROM homepage_news ORDER BY sort_order DESC, created_at DESC`,
     );
-    res.json(rows);
+    res.json((rows || []).map(mapHomepageNewsRow).filter(Boolean));
   } catch (err) {
     next(err);
   }
@@ -429,12 +453,18 @@ cmsRouter.post('/news', async (req, res, next) => {
         imageAlt: input.imageAlt ?? null,
         category: input.category ?? null,
         pubAt: input.publishedAt ? new Date(input.publishedAt) : new Date(),
-        pub: input.isPublished ? true : false,
+        pub: input.isPublished !== false,
         sort: input.sortOrder ?? 0,
         by: req.auth.userId,
       },
     );
-    res.status(201).json({ id });
+    const [[row]] = await getPool().query(
+      `SELECT id, title, excerpt, blog_url, image_url, image_alt, category,
+              published_at, is_published, sort_order, created_at
+       FROM homepage_news WHERE id = :id`,
+      { id },
+    );
+    res.status(201).json(mapHomepageNewsRow(row) || { id });
   } catch (err) {
     next(err);
   }
@@ -452,7 +482,8 @@ cmsRouter.put('/news/:id', async (req, res, next) => {
         image_alt = COALESCE(:imageAlt, image_alt),
         category = COALESCE(:category, category),
         is_published = COALESCE(:pub, is_published),
-        sort_order = COALESCE(:sort, sort_order)
+        sort_order = COALESCE(:sort, sort_order),
+        updated_at = NOW()
        WHERE id = :id`,
       {
         id: req.params.id,
@@ -466,7 +497,13 @@ cmsRouter.put('/news/:id', async (req, res, next) => {
         sort: input.sortOrder ?? null,
       },
     );
-    res.json({ ok: true });
+    const [[row]] = await getPool().query(
+      `SELECT id, title, excerpt, blog_url, image_url, image_alt, category,
+              published_at, is_published, sort_order, created_at
+       FROM homepage_news WHERE id = :id`,
+      { id: req.params.id },
+    );
+    res.json(mapHomepageNewsRow(row) || { ok: true, id: req.params.id });
   } catch (err) {
     next(err);
   }
@@ -484,12 +521,11 @@ cmsRouter.delete('/news/:id', async (req, res, next) => {
 cmsRouter.get('/videos', async (req, res, next) => {
   try {
     const [rows] = await getPool().query(
-      `SELECT id, title, description, youtube_url AS "youtubeUrl", thumbnail_url AS "thumbnailUrl",
-              thumbnail_alt AS "thumbnailAlt", duration_label AS "durationLabel",
-              is_published AS "isPublished", sort_order AS "sortOrder"
+      `SELECT id, title, description, youtube_url, thumbnail_url, thumbnail_alt,
+              duration_label, is_published, sort_order
        FROM homepage_videos ORDER BY sort_order DESC`,
     );
-    res.json(rows);
+    res.json((rows || []).map(mapHomepageVideoRow).filter(Boolean));
   } catch (err) {
     next(err);
   }
@@ -510,12 +546,18 @@ cmsRouter.post('/videos', async (req, res, next) => {
         thumb: input.thumbnailUrl ?? null,
         thumbAlt: input.thumbnailAlt ?? null,
         dur: input.durationLabel ?? null,
-        pub: input.isPublished ? true : false,
+        pub: input.isPublished !== false,
         sort: input.sortOrder ?? 0,
         by: req.auth.userId,
       },
     );
-    res.status(201).json({ id });
+    const [[row]] = await getPool().query(
+      `SELECT id, title, description, youtube_url, thumbnail_url, thumbnail_alt,
+              duration_label, is_published, sort_order
+       FROM homepage_videos WHERE id = :id`,
+      { id },
+    );
+    res.status(201).json(mapHomepageVideoRow(row) || { id });
   } catch (err) {
     next(err);
   }
@@ -531,7 +573,8 @@ cmsRouter.put('/videos/:id', async (req, res, next) => {
         youtube_url = COALESCE(:url, youtube_url),
         thumbnail_url = COALESCE(:thumb, thumbnail_url),
         is_published = COALESCE(:pub, is_published),
-        sort_order = COALESCE(:sort, sort_order)
+        sort_order = COALESCE(:sort, sort_order),
+        updated_at = NOW()
        WHERE id = :id`,
       {
         id: req.params.id,
@@ -543,7 +586,13 @@ cmsRouter.put('/videos/:id', async (req, res, next) => {
         sort: input.sortOrder ?? null,
       },
     );
-    res.json({ ok: true });
+    const [[row]] = await getPool().query(
+      `SELECT id, title, description, youtube_url, thumbnail_url, thumbnail_alt,
+              duration_label, is_published, sort_order
+       FROM homepage_videos WHERE id = :id`,
+      { id: req.params.id },
+    );
+    res.json(mapHomepageVideoRow(row) || { ok: true, id: req.params.id });
   } catch (err) {
     next(err);
   }
@@ -622,10 +671,12 @@ cmsRouter.get('/success-stories', async (req, res, next) => {
   try {
     const status = req.query.status || 'pending';
     const [rows] = await getPool().query(
-      `SELECT * FROM success_stories WHERE moderation_status = :status ORDER BY created_at DESC`,
+      `SELECT id, submitter_name, submitter_email, submitter_phone, story_type, story_text,
+              location, loan_amount, photo_url, moderation_status, created_at
+       FROM success_stories WHERE moderation_status = :status ORDER BY created_at DESC`,
       { status },
     );
-    res.json(rows);
+    res.json((rows || []).map(mapSuccessStoryRow).filter(Boolean));
   } catch (err) {
     next(err);
   }

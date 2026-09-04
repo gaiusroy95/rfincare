@@ -16,6 +16,11 @@ import {
 } from '../lib/marketingSettings.js';
 import { getMarketplaceVisibility } from '../lib/marketplaceVisibility.js';
 import { getLegalPageBySlug } from '../lib/legalPages.js';
+import {
+  mapHomepageNewsRow,
+  mapHomepageVideoRow,
+  mapSuccessStoryRow,
+} from '../lib/cmsContentMap.js';
 import { createResumeToken, resolveResumeToken } from '../lib/resumeTokens.js';
 import { resolveFrontendEnvPath } from '../lib/envPaths.js';
 import { entriesToObject, readEnvFile } from '../lib/envFile.js';
@@ -75,11 +80,12 @@ publicContentRouter.get('/homepage/news', async (req, res, next) => {
   try {
     const pool = getPool();
     const [rows] = await pool.query(
-      `SELECT id, title, excerpt, blog_url AS "blogUrl", image_url AS "imageUrl", image_alt AS "imageAlt",
-              category, published_at AS "publishedAt"
-       FROM homepage_news WHERE is_published = TRUE ORDER BY sort_order DESC, published_at DESC LIMIT 12`,
+      `SELECT id, title, excerpt, blog_url, image_url, image_alt,
+              category, published_at, is_published, sort_order, created_at
+       FROM homepage_news WHERE is_published = TRUE
+       ORDER BY sort_order DESC, published_at DESC LIMIT 12`,
     );
-    res.json(rows);
+    res.json((rows || []).map(mapHomepageNewsRow).filter(Boolean));
   } catch (err) {
     next(err);
   }
@@ -89,11 +95,12 @@ publicContentRouter.get('/homepage/videos', async (req, res, next) => {
   try {
     const pool = getPool();
     const [rows] = await pool.query(
-      `SELECT id, title, description, youtube_url AS "youtubeUrl", thumbnail_url AS "thumbnailUrl",
-              thumbnail_alt AS "thumbnailAlt", duration_label AS "durationLabel"
-       FROM homepage_videos WHERE is_published = TRUE ORDER BY sort_order DESC LIMIT 12`,
+      `SELECT id, title, description, youtube_url, thumbnail_url, thumbnail_alt,
+              duration_label, is_published, sort_order
+       FROM homepage_videos WHERE is_published = TRUE
+       ORDER BY sort_order DESC LIMIT 12`,
     );
-    res.json(rows);
+    res.json((rows || []).map(mapHomepageVideoRow).filter(Boolean));
   } catch (err) {
     next(err);
   }
@@ -154,12 +161,13 @@ publicContentRouter.get('/success-stories', async (req, res, next) => {
   try {
     const pool = getPool();
     const [rows] = await pool.query(
-      `SELECT id, submitter_name AS name, story_type AS storyType, story_text AS storyText,
-              location, loan_amount AS loanAmount, photo_url AS photoUrl, created_at AS createdAt
+      `SELECT id, submitter_name, story_type, story_text,
+              location, loan_amount, photo_url, created_at
        FROM success_stories WHERE moderation_status = 'approved'
-       ORDER BY display_order DESC, moderated_at DESC LIMIT 20`,
+       ORDER BY display_order DESC, moderated_at DESC NULLS LAST, created_at DESC
+       LIMIT 20`,
     );
-    res.json(rows);
+    res.json((rows || []).map(mapSuccessStoryRow).filter(Boolean));
   } catch (err) {
     next(err);
   }

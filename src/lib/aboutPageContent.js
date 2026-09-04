@@ -1,4 +1,5 @@
 import { getPool } from '../db/pool.js';
+import { pickField } from './cmsContentMap.js';
 
 const DEFAULT_ABOUT_CONTENT = {
   heroTitle: 'About Rfincare',
@@ -49,8 +50,11 @@ const DEFAULT_ABOUT_CONTENT = {
 };
 
 function parseJson(value, fallback) {
-  if (!value) return fallback;
+  if (value == null || value === '') return fallback;
   if (Array.isArray(value)) return value;
+  if (typeof value === 'object') {
+    return Array.isArray(value) ? value : fallback;
+  }
   try {
     const parsed = JSON.parse(value);
     return Array.isArray(parsed) ? parsed : fallback;
@@ -71,13 +75,16 @@ export async function getAboutPageContent() {
   if (!row) return { ...DEFAULT_ABOUT_CONTENT };
 
   return {
-    heroTitle: row.hero_title || DEFAULT_ABOUT_CONTENT.heroTitle,
-    heroSubtitle: row.hero_subtitle || DEFAULT_ABOUT_CONTENT.heroSubtitle,
-    stats: parseJson(row.stats_json, DEFAULT_ABOUT_CONTENT.stats),
-    values: parseJson(row.values_json, DEFAULT_ABOUT_CONTENT.values),
-    storyHeading: row.story_heading || DEFAULT_ABOUT_CONTENT.storyHeading,
-    storyParagraphs: parseJson(row.story_paragraphs_json, DEFAULT_ABOUT_CONTENT.storyParagraphs),
-    updatedAt: row.updated_at,
+    heroTitle: pickField(row, 'hero_title', 'heroTitle') || DEFAULT_ABOUT_CONTENT.heroTitle,
+    heroSubtitle: pickField(row, 'hero_subtitle', 'heroSubtitle') || DEFAULT_ABOUT_CONTENT.heroSubtitle,
+    stats: parseJson(pickField(row, 'stats_json', 'statsJson'), DEFAULT_ABOUT_CONTENT.stats),
+    values: parseJson(pickField(row, 'values_json', 'valuesJson'), DEFAULT_ABOUT_CONTENT.values),
+    storyHeading: pickField(row, 'story_heading', 'storyHeading') || DEFAULT_ABOUT_CONTENT.storyHeading,
+    storyParagraphs: parseJson(
+      pickField(row, 'story_paragraphs_json', 'storyParagraphsJson'),
+      DEFAULT_ABOUT_CONTENT.storyParagraphs,
+    ),
+    updatedAt: pickField(row, 'updated_at', 'updatedAt') ?? null,
   };
 }
 
@@ -85,15 +92,18 @@ export async function upsertAboutPageContent(input, userId) {
   const pool = getPool();
   await pool.execute(
     `INSERT INTO about_page_content
-      (id, hero_title, hero_subtitle, stats_json, values_json, story_heading, story_paragraphs_json, updated_by)
+      (id, hero_title, hero_subtitle, stats_json, values_json, story_heading, story_paragraphs_json, updated_by, updated_at)
      VALUES
-      ('default', :hero_title, :hero_subtitle, :stats_json, :values_json, :story_heading, :story_paragraphs_json, :updated_by) ON CONFLICT (id) DO UPDATE SET hero_title = EXCLUDED.hero_title,
+      ('default', :hero_title, :hero_subtitle, :stats_json, :values_json, :story_heading, :story_paragraphs_json, :updated_by, NOW())
+     ON CONFLICT (id) DO UPDATE SET
+      hero_title = EXCLUDED.hero_title,
       hero_subtitle = EXCLUDED.hero_subtitle,
       stats_json = EXCLUDED.stats_json,
       values_json = EXCLUDED.values_json,
       story_heading = EXCLUDED.story_heading,
       story_paragraphs_json = EXCLUDED.story_paragraphs_json,
-      updated_by = EXCLUDED.updated_by`,
+      updated_by = EXCLUDED.updated_by,
+      updated_at = NOW()`,
     {
       hero_title: input.heroTitle,
       hero_subtitle: input.heroSubtitle || null,
