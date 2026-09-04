@@ -26,6 +26,7 @@ import {
   updateEmployeeDetails,
   resetStaffPassword,
   terminateEmployee,
+  deleteAgentPermanently,
 } from '../lib/adminStaffManage.js';
 import { parseCsvToRows } from '../lib/parseCsv.js';
 import { buildFunnelAnalytics, buildProductConversionRows } from '../lib/funnelAnalytics.js';
@@ -521,6 +522,40 @@ adminRouter.post(
         newValues: { scope: 'admin_agent_password_reset' },
       });
       res.json({ success: true, message: 'Agent password updated' });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+adminRouter.delete(
+  '/agents/:id',
+  authenticate,
+  authorize({ resource: 'agents', action: 'manage' }),
+  async (req, res, next) => {
+    try {
+      const agentId = String(req.params.id || '').trim();
+      if (!agentId) {
+        return res.status(400).json({ error: 'Agent id is required' });
+      }
+      if (agentId === req.auth.userId) {
+        return res.status(400).json({ error: 'You cannot delete your own account' });
+      }
+
+      const result = await deleteAgentPermanently(agentId);
+      await writeAuditLog({
+        userId: req.auth.userId,
+        actionType: 'delete',
+        tableName: 'user_profiles',
+        recordId: agentId,
+        oldValues: result.deleted || null,
+        newValues: { scope: 'admin_agent_delete' },
+      });
+      res.json({
+        success: true,
+        message: result.message || 'Agent deleted permanently',
+        deleted: result.deleted,
+      });
     } catch (err) {
       next(err);
     }

@@ -345,3 +345,113 @@ export async function resetStaffPassword({ userId, password, role, fullName, ema
 
   return { success: true };
 }
+
+async function deleteIfTableExists(pool, sql, params) {
+  try {
+    await pool.execute(sql, params);
+  } catch (err) {
+    if (err?.code === '42P01') return; // undefined_table
+    throw err;
+  }
+}
+
+/**
+ * Permanently remove an agent account and related staff/CMS rows.
+ * Loan applications keep history with agent_id cleared (not deleted).
+ */
+export async function deleteAgentPermanently(agentId) {
+  await ensureOnboardingSchema();
+  const pool = getPool();
+  const id = String(agentId || '').trim();
+  if (!id) {
+    const e = new Error('Agent id is required');
+    e.status = 400;
+    throw e;
+  }
+
+  const detail = await fetchAgentDetail(id);
+
+  await pool.execute('BEGIN');
+  try {
+    await deleteIfTableExists(
+      pool,
+      `DELETE FROM agent_commission_config WHERE agent_user_id = :id`,
+      { id },
+    );
+    await deleteIfTableExists(
+      pool,
+      `DELETE FROM agent_commission_ledger WHERE agent_user_id = :id`,
+      { id },
+    );
+    await deleteIfTableExists(
+      pool,
+      `DELETE FROM agent_commission_bills WHERE agent_user_id = :id`,
+      { id },
+    );
+    await deleteIfTableExists(
+      pool,
+      `DELETE FROM agent_employee_hierarchy WHERE agent_user_id = :id`,
+      { id },
+    );
+    await deleteIfTableExists(
+      pool,
+      `DELETE FROM agent_learning_progress WHERE agent_user_id = :id`,
+      { id },
+    );
+    await deleteIfTableExists(
+      pool,
+      `DELETE FROM agent_profile_otps WHERE agent_user_id = :id`,
+      { id },
+    );
+    await deleteIfTableExists(
+      pool,
+      `DELETE FROM agent_onboarding WHERE user_id = :id`,
+      { id },
+    );
+    await deleteIfTableExists(
+      pool,
+      `DELETE FROM oauth_identities WHERE user_id = :id`,
+      { id },
+    );
+
+    await pool.execute(
+      `UPDATE loan_applications SET agent_id = NULL WHERE agent_id = :id`,
+      { id },
+    );
+    await deleteIfTableExists(
+      pool,
+      `UPDATE marketing_leads SET assigned_to = NULL WHERE assigned_to = :id`,
+      { id },
+    );
+    await deleteIfTableExists(
+      pool,
+      `UPDATE leads SET assigned_to = NULL WHERE assigned_to = :id`,
+      { id },
+    );
+    await pool.execute(
+      `UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = :id AND revoked_at IS NULL`,
+      { id },
+    );
+    await pool.execute(`DELETE FROM auth_users WHERE id = :id`, { id });
+    await pool.execute(`DELETE FROM user_profiles WHERE id = :id AND role = 'agent'`, { id });
+    await pool.execute('COMMIT');
+  } catch (err) {
+    try {
+      await pool.execute('ROLLBACK');
+    } catch {
+      /* ignore */
+    }
+    throw err;
+  }
+
+  return {
+    success: true,
+    message: 'Agent deleted permanently',
+    deleted: {
+      id: detail.id,
+      agentName: detail.agentName,
+      email: detail.email,
+      agentCode: detail.agentCode,
+    },
+  };
+}
