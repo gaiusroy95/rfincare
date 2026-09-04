@@ -1,8 +1,8 @@
 -- Agent monthly commission bill submissions (raise bill workflow)
 
 CREATE TABLE IF NOT EXISTS agent_commission_bills (
-  id UUID PRIMARY KEY,
-  agent_user_id UUID NOT NULL REFERENCES user_profiles(id) ON DELETE CASCADE,
+  id CHAR(36) NOT NULL PRIMARY KEY,
+  agent_user_id CHAR(36) NOT NULL REFERENCES user_profiles(id) ON DELETE CASCADE,
   period_start DATE NOT NULL,
   period_end DATE NOT NULL,
   gross_amount NUMERIC(14, 2) NOT NULL DEFAULT 0,

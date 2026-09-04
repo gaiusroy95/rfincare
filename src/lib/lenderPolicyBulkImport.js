@@ -1304,7 +1304,12 @@ export function buildErrorReportCsv(errorReport) {
 export function getTemplateBuffer() {
   const path = resolvePolicyTemplatePath();
   if (path) {
-    return { buffer: readFileSync(path), path, generated: false };
+    try {
+      return { buffer: readFileSync(path), path, generated: false };
+    } catch (err) {
+      // Fall through to generated workbook (e.g. unreadable mount in container).
+      console.warn(`[lenderPolicyBulkImport] template read failed (${path}): ${err?.message || err}`);
+    }
   }
   return { buffer: buildPolicyTemplateWorkbook(), path: null, generated: true };
 }

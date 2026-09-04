@@ -21,6 +21,7 @@ COPY src ./src
 COPY scripts ./scripts
 COPY migrations ./migrations
 COPY data ./data
+COPY assets ./assets
 
 RUN mkdir -p /app/uploads /app/data \
   && addgroup -S rfincare \

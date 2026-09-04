@@ -49,6 +49,11 @@ lenderPolicyImportRouter.get(
   async (_req, res, next) => {
     try {
       const { buffer } = getTemplateBuffer();
+      if (!buffer?.length) {
+        const err = new Error('Template workbook could not be built');
+        err.status = 500;
+        throw err;
+      }
       res.setHeader(
         'Content-Type',
         'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -57,7 +62,8 @@ lenderPolicyImportRouter.get(
         'Content-Disposition',
         'attachment; filename="loan-advisory-lender-product-bulk-upload.xlsx"',
       );
-      res.send(buffer);
+      res.setHeader('Cache-Control', 'no-store');
+      res.send(Buffer.from(buffer));
     } catch (err) {
       next(err);
     }
