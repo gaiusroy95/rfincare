@@ -276,7 +276,13 @@ async function sendWhatsappOtp({ phone, otp, settings }) {
       { phone: maskPhone(phone), provider },
       process.env.LOG_OTP === 'true' ? otp : '(hidden)',
     );
-    return { sent: true, provider: 'console' };
+    return {
+      sent: false,
+      provider: 'console',
+      delivered: false,
+      warning:
+        'WhatsApp operator is set to Console, so no WhatsApp message was sent. Set WhatsApp operator to MSG91 in Admin → OTP settings.',
+    };
   }
   if (provider === 'twilio') {
     return sendViaTwilioWhatsapp({ phone, message });
@@ -285,6 +291,13 @@ async function sendWhatsappOtp({ phone, otp, settings }) {
     if (!isMsg91Configured()) {
       const err = new Error(
         'WhatsApp operator is MSG91 but MSG91_AUTH_KEY is not set on the server.',
+      );
+      err.status = 503;
+      throw err;
+    }
+    if (!isMsg91WhatsappConfigured(settings?.providerConfig)) {
+      const err = new Error(
+        'WhatsApp operator is MSG91 but template name, namespace, or integrated number is incomplete. Fill them in Admin → OTP settings and Save.',
       );
       err.status = 503;
       throw err;
@@ -334,10 +347,13 @@ export async function sendOtpNotification({
     channel === 'email' ||
     channel === 'both' ||
     (!channel && settings.requireEmailOtp);
+  // When Require WhatsApp OTP is on, also fan out WhatsApp for SMS/mobile OTP flows
+  // (application submit, agent/employee profile, etc.) — not only channel=whatsapp.
   const wantWhatsapp =
     channel === 'whatsapp' ||
     channel === 'both' ||
-    (!channel && settings.requireWhatsappOtp);
+    (!channel && settings.requireWhatsappOtp) ||
+    (Boolean(settings.requireWhatsappOtp) && Boolean(phone) && channel !== 'email');
 
   if (wantSms && phone) {
     tasks.push(channelTimeout(sendSmsOtp({ phone, otp, settings }), 'SMS OTP'));
@@ -353,6 +369,18 @@ export async function sendOtpNotification({
   }
 
   if (!tasks.length) {
+    const missing = [];
+    if ((channel === 'sms' || channel === 'whatsapp' || channel === 'both') && !phone) {
+      missing.push('mobile number');
+    }
+    if ((channel === 'email' || channel === 'both') && !email) {
+      missing.push('email');
+    }
+    if (missing.length) {
+      const err = new Error(`Cannot send OTP: missing ${missing.join(' and ')}.`);
+      err.status = 400;
+      throw err;
+    }
     console.log(
       '[otp]',
       { email, phone: maskPhone(phone), channel },
@@ -468,6 +496,23 @@ export async function sendDualChannelOtp({ email, phone, settings: settingsOverr
       if (outcomes.whatsapp?.warning) warnings.push(outcomes.whatsapp.warning);
     } catch (err) {
       warnings.push(err?.message || 'WhatsApp OTP failed');
+      outcomes.whatsapp = { sent: false, delivered: false };
+    }
+  } else if (
+    !smsDelivered
+    && phone
+    && settings.whatsappProvider === 'msg91'
+    && isMsg91WhatsappConfigured(settings?.providerConfig)
+  ) {
+    // Fallback: if SMS did not deliver and WhatsApp MSG91 is fully configured, still try WhatsApp.
+    try {
+      outcomes.whatsapp = await channelTimeout(
+        sendWhatsappOtp({ phone, otp: mobileOtp, settings }),
+        'WhatsApp OTP',
+      );
+      if (outcomes.whatsapp?.warning) warnings.push(outcomes.whatsapp.warning);
+    } catch (err) {
+      warnings.push(err?.message || 'WhatsApp OTP fallback failed');
       outcomes.whatsapp = { sent: false, delivered: false };
     }
   }

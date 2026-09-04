@@ -25,10 +25,15 @@ import {
   updateMarketingSettings,
   getMarketingEventStats,
 } from '../lib/marketingSettings.js';
-import {
-  getMarketplaceVisibility,
+import { getMarketplaceVisibility,
   updateMarketplaceVisibility,
 } from '../lib/marketplaceVisibility.js';
+import {
+  ensureLegalPages,
+  getLegalPageBySlug,
+  listCatalogLegalPages,
+  upsertLegalPage,
+} from '../lib/legalPages.js';
 import { normalizeYoutubeWatchUrl } from '../lib/youtube.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { requireRoles } from '../middleware/requireRoles.js';
@@ -358,9 +363,10 @@ cmsRouter.post('/otp-settings/test', async (req, res, next) => {
     res.json({
       success: true,
       channel,
-      delivered: channelResult?.sent !== false,
+      delivered: channelResult?.sent !== false && channelResult?.delivered !== false,
       provider: channelResult?.provider || (channel === 'whatsapp' ? settings.whatsappProvider : settings.smsProvider),
       warning: channelResult?.warning,
+      requestId: channelResult?.requestId || null,
       ...(process.env.LOG_OTP === 'true'
         || (channel === 'sms' && settings.smsProvider === 'console')
         || (channel === 'whatsapp' && settings.whatsappProvider === 'console')
@@ -554,16 +560,28 @@ cmsRouter.delete('/videos/:id', async (req, res, next) => {
 
 cmsRouter.get('/legal', async (req, res, next) => {
   try {
-    const [rows] = await getPool().query(
+    const pool = getPool();
+    await ensureLegalPages(pool);
+    const [rows] = await pool.query(
       `SELECT slug, title, updated_at FROM legal_pages ORDER BY slug`,
     );
-    res.json(
-      (rows || []).map((row) => ({
-        slug: row.slug,
-        title: row.title,
-        updatedAt: row.updated_at ?? row.updatedat ?? row.updatedAt ?? null,
-      })),
+    const bySlug = new Map(
+      (rows || []).map((row) => [
+        row.slug,
+        {
+          slug: row.slug,
+          title: row.title,
+          updatedAt: row.updated_at ?? row.updatedat ?? row.updatedAt ?? null,
+        },
+      ]),
     );
+    // Return catalog order so admin dropdown and API stay aligned.
+    const ordered = listCatalogLegalPages().map((page) => bySlug.get(page.slug) || {
+      slug: page.slug,
+      title: page.title,
+      updatedAt: null,
+    });
+    res.json(ordered);
   } catch (err) {
     next(err);
   }
@@ -571,17 +589,9 @@ cmsRouter.get('/legal', async (req, res, next) => {
 
 cmsRouter.get('/legal/:slug', async (req, res, next) => {
   try {
-    const [[row]] = await getPool().query(
-      `SELECT slug, title, body_html, updated_at FROM legal_pages WHERE slug = :slug`,
-      { slug: req.params.slug },
-    );
-    if (!row) return res.status(404).json({ error: 'Not found' });
-    res.json({
-      slug: row.slug,
-      title: row.title,
-      bodyHtml: row.body_html ?? row.bodyhtml ?? row.bodyHtml ?? '',
-      updatedAt: row.updated_at ?? row.updatedat ?? row.updatedAt ?? null,
-    });
+    const page = await getLegalPageBySlug(getPool(), req.params.slug, { createIfMissing: true });
+    if (!page) return res.status(404).json({ error: 'Not found' });
+    res.json(page);
   } catch (err) {
     next(err);
   }
@@ -590,27 +600,19 @@ cmsRouter.get('/legal/:slug', async (req, res, next) => {
 cmsRouter.put('/legal/:slug', async (req, res, next) => {
   try {
     const { title, bodyHtml } = z.object({ title: z.string(), bodyHtml: z.string() }).parse(req.body);
-    await getPool().execute(
-      `INSERT INTO legal_pages (slug, title, body_html, updated_by, updated_at)
-       VALUES (:slug, :title, :body, :by, NOW())
-       ON CONFLICT (slug) DO UPDATE SET
-         title = EXCLUDED.title,
-         body_html = EXCLUDED.body_html,
-         updated_by = EXCLUDED.updated_by,
-         updated_at = NOW()`,
-      { slug: req.params.slug, title, body: bodyHtml, by: req.auth.userId },
-    );
-    const [[row]] = await getPool().query(
-      `SELECT slug, title, body_html, updated_at FROM legal_pages WHERE slug = :slug`,
-      { slug: req.params.slug },
-    );
-    res.json({
-      ok: true,
-      slug: row?.slug ?? req.params.slug,
-      title: row?.title ?? title,
-      bodyHtml: row?.body_html ?? row?.bodyhtml ?? bodyHtml,
-      updatedAt: row?.updated_at ?? row?.updatedat ?? null,
+    const catalog = listCatalogLegalPages().find((p) => p.slug === req.params.slug);
+    if (!catalog) {
+      return res.status(400).json({
+        error: `Unknown legal page slug "${req.params.slug}". Use a slug from the Policies & Disclosures catalog.`,
+      });
+    }
+    const page = await upsertLegalPage(getPool(), {
+      slug: req.params.slug,
+      title,
+      bodyHtml,
+      updatedBy: req.auth.userId,
     });
+    res.json({ ok: true, ...page });
   } catch (err) {
     next(err);
   }

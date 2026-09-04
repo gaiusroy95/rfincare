@@ -24,8 +24,11 @@ const MSG91_OTP_URL = 'https://control.msg91.com/api/v5/otp';
 const MSG91_EMAIL_URL = 'https://control.msg91.com/api/v5/email/send';
 const MSG91_FLOW_URL = 'https://control.msg91.com/api/v5/flow/';
 const MSG91_SMS_HTTP_URL = 'https://control.msg91.com/api/sendhttp.php';
-const MSG91_WHATSAPP_URL =
-  'https://control.msg91.com/api/v5/whatsapp/whatsapp-outbound-message/bulk/';
+/** Official WhatsApp bulk endpoint (MSG91 OTP docs). control.msg91.com kept as fallback. */
+const MSG91_WHATSAPP_URLS = [
+  'https://api.msg91.com/api/v5/whatsapp/whatsapp-outbound-message/bulk/',
+  'https://control.msg91.com/api/v5/whatsapp/whatsapp-outbound-message/bulk/',
+];
 
 const MSG91_FETCH_TIMEOUT_MS = Number(process.env.MSG91_FETCH_TIMEOUT_MS || 15000);
 
@@ -90,10 +93,20 @@ export function getMsg91Config(overrides = {}) {
     whatsappLanguage: String(
       overrides.msg91WhatsappLanguage || process.env.MSG91_WHATSAPP_LANGUAGE || 'en',
     ).trim() || 'en',
-    whatsappIncludeButton:
-      overrides.msg91WhatsappIncludeButton === true
-      || overrides.msg91WhatsappIncludeButton === 'true'
-      || process.env.MSG91_WHATSAPP_INCLUDE_BUTTON === 'true',
+    // MSG91 WhatsApp OTP sample always sends body_1 + button_1.
+    // Only omit when Admin checks "template has no button" (msg91WhatsappOmitButton).
+    whatsappIncludeButton: !(
+      overrides.msg91WhatsappOmitButton === true
+      || overrides.msg91WhatsappOmitButton === 'true'
+      || process.env.MSG91_WHATSAPP_OMIT_BUTTON === 'true'
+    ),
+    whatsappButtonSubtype: String(
+      overrides.msg91WhatsappButtonSubtype
+        || process.env.MSG91_WHATSAPP_BUTTON_SUBTYPE
+        || 'url',
+    )
+      .trim()
+      .toLowerCase() || 'url',
     route: process.env.MSG91_ROUTE || '4',
     countryCode: '91',
   };
@@ -167,20 +180,37 @@ async function parseMsg91Response(res) {
     data = { raw: text };
   }
 
+  const nestedErrors =
+    data?.errors
+    || data?.data?.errors
+    || (data?.error && data.error !== false && data.error !== true ? data.error : null)
+    || (data?.data?.error && data.data.error !== false && data.data.error !== true
+      ? data.data.error
+      : null)
+    || null;
+
   const failed =
     !res.ok ||
     data?.type === 'error' ||
     data?.status === 'fail' ||
     data?.hasError === true ||
-    (typeof data?.message === 'string' && /error|fail/i.test(data.message));
+    data?.data?.hasError === true ||
+    (typeof data?.message === 'string'
+      && /error|fail|invalid/i.test(data.message)
+      && data?.type !== 'success'
+      && data?.status !== 'success') ||
+    (Array.isArray(nestedErrors) && nestedErrors.length > 0) ||
+    (typeof nestedErrors === 'string' && nestedErrors.trim() && !/success/i.test(nestedErrors));
 
   if (failed) {
-    const errorsField = data?.errors;
+    const errorsField = nestedErrors;
     const errorsText = Array.isArray(errorsField)
-      ? errorsField.join('; ')
+      ? errorsField.map((e) => (typeof e === 'string' ? e : JSON.stringify(e))).join('; ')
       : typeof errorsField === 'string'
         ? errorsField
-        : null;
+        : errorsField && typeof errorsField === 'object'
+          ? JSON.stringify(errorsField)
+          : null;
     const detail =
       errorsText ||
       data?.message ||
@@ -189,10 +219,58 @@ async function parseMsg91Response(res) {
       `HTTP ${res.status}`;
     const err = new Error(`MSG91: ${String(detail).slice(0, 400)}`);
     err.status = res.status >= 400 && res.status < 500 ? res.status : 502;
+    err.msg91 = data;
     throw err;
   }
 
   return data;
+}
+
+export function buildMsg91WhatsappOtpComponents(
+  otp,
+  { includeButton = true, buttonSubtype = 'url', bodyKey, buttonKey } = {},
+) {
+  const otpValue = String(otp);
+  const resolvedBodyKey = bodyKey || process.env.MSG91_WHATSAPP_OTP_BODY_KEY || 'body_1';
+  const components = {
+    [resolvedBodyKey]: { type: 'text', value: otpValue },
+  };
+
+  if (includeButton !== false) {
+    const resolvedButtonKey = buttonKey || process.env.MSG91_WHATSAPP_OTP_BUTTON_KEY || 'button_1';
+    const subtype = buttonSubtype === 'copy_code' ? 'copy_code' : 'url';
+    components[resolvedButtonKey] = { subtype, type: 'text', value: otpValue };
+  }
+
+  return components;
+}
+
+function buildWhatsappOutboundBody(config, recipient, otp) {
+  return {
+    integrated_number: config.whatsappIntegratedNumber,
+    content_type: 'template',
+    payload: {
+      messaging_product: 'whatsapp',
+      type: 'template',
+      template: {
+        name: config.whatsappTemplateId,
+        language: {
+          code: config.whatsappLanguage,
+          policy: 'deterministic',
+        },
+        namespace: config.whatsappNamespace,
+        to_and_components: [
+          {
+            to: [recipient],
+            components: buildMsg91WhatsappOtpComponents(otp, {
+              includeButton: config.whatsappIncludeButton,
+              buttonSubtype: config.whatsappButtonSubtype,
+            }),
+          },
+        ],
+      },
+    },
+  };
 }
 
 /**
@@ -335,21 +413,6 @@ export async function sendMsg91TransactionalSms({
   return { sent: true, provider: 'msg91', mode: 'transactional_sms', requestId: trimmed };
 }
 
-function buildMsg91WhatsappOtpComponents(otp, includeButton = false) {
-  const otpValue = String(otp);
-  const bodyKey = process.env.MSG91_WHATSAPP_OTP_BODY_KEY || 'body_1';
-  const components = {
-    [bodyKey]: { type: 'text', value: otpValue },
-  };
-
-  if (includeButton) {
-    const buttonKey = process.env.MSG91_WHATSAPP_OTP_BUTTON_KEY || 'button_1';
-    components[buttonKey] = { subtype: 'url', type: 'text', value: otpValue };
-  }
-
-  return components;
-}
-
 /**
  * WhatsApp outbound (MSG91 v5 bulk template API).
  * @see https://msg91.com/help/whatsapp/whatsapp-otp
@@ -383,50 +446,67 @@ export async function sendMsg91Whatsapp({ phone, otp, config: overrides = {} }) 
   }
 
   const mobile = normalizeIndianMobile(phone);
+  if (mobile.length !== 10) {
+    throw new Error('Invalid Indian mobile number (10 digits required) for WhatsApp OTP.');
+  }
   const recipient = `${config.countryCode}${mobile}`;
-  const res = await fetchWithTimeout(
-    MSG91_WHATSAPP_URL,
-    {
-      method: 'POST',
-      headers: {
-        authkey: config.authKey,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: JSON.stringify({
-        integrated_number: config.whatsappIntegratedNumber,
-        content_type: 'template',
-        payload: {
-          messaging_product: 'whatsapp',
-          type: 'template',
-          template: {
-            name: config.whatsappTemplateId,
-            language: {
-              code: config.whatsappLanguage,
-              policy: 'deterministic',
-            },
-            namespace: config.whatsappNamespace,
-            to_and_components: [
-              {
-                to: [recipient],
-                components: buildMsg91WhatsappOtpComponents(otp, config.whatsappIncludeButton),
-              },
-            ],
-          },
-        },
-      }),
-      timeoutMessage: 'MSG91 WhatsApp request timed out.',
-    },
-    MSG91_FETCH_TIMEOUT_MS,
-  );
+  const requestBody = buildWhatsappOutboundBody(config, recipient, otp);
 
-  await parseMsg91Response(res);
+  let lastErr = null;
+  let data = null;
+  let usedUrl = MSG91_WHATSAPP_URLS[0];
+
+  for (const url of MSG91_WHATSAPP_URLS) {
+    usedUrl = url;
+    try {
+      const res = await fetchWithTimeout(
+        url,
+        {
+          method: 'POST',
+          headers: {
+            authkey: config.authKey,
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+          },
+          body: JSON.stringify(requestBody),
+          timeoutMessage: 'MSG91 WhatsApp request timed out.',
+        },
+        MSG91_FETCH_TIMEOUT_MS,
+      );
+      data = await parseMsg91Response(res);
+      lastErr = null;
+      break;
+    } catch (err) {
+      lastErr = err;
+      // Only fall back to the alternate host on transport / upstream failures.
+      const status = Number(err?.status || 0);
+      if (status >= 400 && status < 500 && status !== 404) {
+        throw err;
+      }
+    }
+  }
+
+  if (lastErr) throw lastErr;
+
   return {
     sent: true,
     provider: 'msg91',
     mode: 'whatsapp',
     template: config.whatsappTemplateId,
+    language: config.whatsappLanguage,
+    includeButton: config.whatsappIncludeButton !== false,
     to: recipient,
+    endpoint: usedUrl,
+    requestId:
+      data?.request_id
+      || data?.requestId
+      || data?.data?.request_id
+      || data?.data?.id
+      || null,
+    warning:
+      config.whatsappIncludeButton === false
+        ? 'WhatsApp OTP button component is disabled. Authentication templates usually require button_1 — enable it in Admin → OTP settings if the phone does not receive the message.'
+        : undefined,
   };
 }
 

@@ -15,6 +15,7 @@ import {
   logMarketingEvent,
 } from '../lib/marketingSettings.js';
 import { getMarketplaceVisibility } from '../lib/marketplaceVisibility.js';
+import { getLegalPageBySlug } from '../lib/legalPages.js';
 import { createResumeToken, resolveResumeToken } from '../lib/resumeTokens.js';
 import { resolveFrontendEnvPath } from '../lib/envPaths.js';
 import { entriesToObject, readEnvFile } from '../lib/envFile.js';
@@ -141,19 +142,9 @@ publicContentRouter.get('/marketplace-visibility', async (_req, res, next) => {
 
 publicContentRouter.get('/legal/:slug', async (req, res, next) => {
   try {
-    const pool = getPool();
-    const [[row]] = await pool.query(
-      `SELECT slug, title, body_html, updated_at FROM legal_pages WHERE slug = :slug`,
-      { slug: req.params.slug },
-    );
-    if (!row) return res.status(404).json({ error: 'Not found' });
-    // Postgres folds unquoted aliases to lowercase — map explicitly for the frontend.
-    res.json({
-      slug: row.slug,
-      title: row.title,
-      bodyHtml: row.body_html ?? row.bodyhtml ?? row.bodyHtml ?? '',
-      updatedAt: row.updated_at ?? row.updatedat ?? row.updatedAt ?? null,
-    });
+    const page = await getLegalPageBySlug(getPool(), req.params.slug, { createIfMissing: true });
+    if (!page) return res.status(404).json({ error: 'Not found' });
+    res.json(page);
   } catch (err) {
     next(err);
   }

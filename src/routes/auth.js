@@ -608,7 +608,9 @@ authRouter.post('/password-reset/request-otp', authenticate, async (req, res, ne
       message:
         input.channel === 'email'
           ? 'OTP sent to your registered email'
-          : 'OTP sent to your registered mobile number',
+          : input.channel === 'whatsapp'
+            ? 'OTP sent to your registered WhatsApp number'
+            : 'OTP sent to your registered mobile number',
       expiresInSeconds: 600,
       ...(process.env.LOG_OTP === 'true' ? { devOtp: otp } : {}),
     });
@@ -702,13 +704,53 @@ authRouter.post('/forgot-password/request-otp', async (req, res, next) => {
 
     // Always return success to avoid email enumeration.
     if (!user) {
-      return res.json({ success: true, message: 'If an account exists, an OTP has been sent.', expiresInSeconds: 600 });
+      return res.json({
+        success: true,
+        message: 'If an account exists, an OTP has been sent.',
+        expiresInSeconds: 600,
+      });
+    }
+
+    const phone = user.phone ? String(user.phone).replace(/\D/g, '').slice(-10) : null;
+
+    if (input.channel !== 'email' && !phone) {
+      // Still avoid confirming account existence for wrong channel; fall back to email if possible.
+      if (input.email) {
+        const otp = generateOtp();
+        const id = newId();
+        const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+        await pool.execute(
+          `INSERT INTO lead_otps (id, lead_id, email, phone, otp_hash, purpose, channel, expires_at)
+           VALUES (:id, NULL, :email, NULL, :hash, 'password_reset', 'email', :exp)`,
+          {
+            id,
+            email: input.email.toLowerCase(),
+            hash: hashOtp(otp),
+            exp: expiresAt,
+          },
+        );
+        await sendOtpNotification({
+          email: input.email.toLowerCase(),
+          otp,
+          channel: 'email',
+        });
+        return res.json({
+          success: true,
+          message: 'If an account exists, an OTP has been sent.',
+          expiresInSeconds: 600,
+          ...(process.env.LOG_OTP === 'true' ? { devOtp: otp } : {}),
+        });
+      }
+      return res.json({
+        success: true,
+        message: 'If an account exists, an OTP has been sent.',
+        expiresInSeconds: 600,
+      });
     }
 
     const otp = generateOtp();
     const id = newId();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
-    const phone = user.phone ? String(user.phone).replace(/\D/g, '').slice(-10) : null;
 
     await pool.execute(
       `INSERT INTO lead_otps (id, lead_id, email, phone, otp_hash, purpose, channel, expires_at)
@@ -730,7 +772,12 @@ authRouter.post('/forgot-password/request-otp', async (req, res, next) => {
       channel: input.channel,
     });
 
-    res.json({ success: true, message: 'OTP sent', expiresInSeconds: 600 });
+    res.json({
+      success: true,
+      message: 'If an account exists, an OTP has been sent.',
+      expiresInSeconds: 600,
+      ...(process.env.LOG_OTP === 'true' ? { devOtp: otp } : {}),
+    });
   } catch (err) {
     if (err?.name === 'ZodError') {
       err.status = 400;
