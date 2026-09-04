@@ -435,7 +435,35 @@ adminRouter.patch(
   authorize({ resource: "agents", action: "update" }),
   async (req, res, next) => {
     try {
-      const detail = await updateAgentDetails(req.params.id, req.body);
+      const body = req.body || {};
+      const wantsPermanentDelete = Boolean(
+        body.permanentDelete || body.permanent_delete || body.deletePermanently || body.action === "delete" || body.action === "permanent_delete"
+      );
+      if (wantsPermanentDelete) {
+        const agentId = String(req.params.id || "").trim();
+        if (!agentId) {
+          return res.status(400).json({ error: "Agent id is required" });
+        }
+        if (agentId === req.auth.userId) {
+          return res.status(400).json({ error: "You cannot delete your own account" });
+        }
+        const result = await deleteAgentPermanently(agentId);
+        await writeAuditLog({
+          userId: req.auth.userId,
+          actionType: "delete",
+          tableName: "user_profiles",
+          recordId: agentId,
+          oldValues: result.deleted || null,
+          newValues: { scope: "admin_agent_delete_via_patch" }
+        });
+        return res.json({
+          success: true,
+          permanentlyDeleted: true,
+          message: result.message || "Agent deleted permanently",
+          deleted: result.deleted
+        });
+      }
+      const detail = await updateAgentDetails(req.params.id, body);
       await writeAuditLog({
         userId: req.auth.userId,
         actionType: "update",
