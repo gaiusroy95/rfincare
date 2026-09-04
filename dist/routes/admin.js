@@ -25,7 +25,8 @@ import {
   updateEmployeeDetails,
   resetStaffPassword,
   terminateEmployee,
-  deleteAgentPermanently
+  deleteAgentPermanently,
+  deleteCustomerPermanently
 } from "../lib/adminStaffManage.js";
 import { parseCsvToRows } from "../lib/parseCsv.js";
 import { buildFunnelAnalytics, buildProductConversionRows } from "../lib/funnelAnalytics.js";
@@ -748,7 +749,9 @@ adminRouter.get(
           FROM marketing_leads
           GROUP BY phone
         ) lead ON lead.phone = up.phone
-        WHERE up.role = 'customer'`;
+        WHERE up.role = 'customer'
+          AND COALESCE(up.account_status, '') <> 'deleted'
+          AND COALESCE(up.email, '') NOT LIKE '%@rfincare.deleted'`;
       const params = {};
       if (search) {
         sql += ` AND (
@@ -851,69 +854,51 @@ adminRouter.delete(
   authorize({ resource: "customers", action: "manage" }),
   async (req, res, next) => {
     try {
-      await ensureMilestone3Schema();
-      const pool = getPool();
-      const [[before]] = await pool.execute(
-        `SELECT * FROM user_profiles WHERE id = :id AND role = 'customer' LIMIT 1`,
-        { id: req.params.id }
-      );
-      if (!before) {
-        const e = new Error("Customer not found");
-        e.status = 404;
-        throw e;
+      const customerId = String(req.params.id || "").trim();
+      if (!customerId) {
+        return res.status(400).json({ error: "Customer id is required" });
       }
-      const [[apps]] = await pool.execute(
-        `SELECT COUNT(*)::int AS c FROM loan_applications WHERE customer_id = :id`,
-        { id: req.params.id }
-      );
-      const appCount = Number(apps?.c || 0);
-      const hardDelete = req.query.hard === "1" || req.body?.hard === true;
-      if (hardDelete && appCount > 0) {
-        const e = new Error(
-          "Cannot hard-delete a customer with applications. Deactivate/anonymize instead, or archive applications first."
-        );
-        e.status = 409;
-        throw e;
+      if (customerId === req.auth.userId) {
+        return res.status(400).json({ error: "You cannot delete your own account" });
       }
-      if (hardDelete) {
-        await pool.execute(`DELETE FROM auth_users WHERE id = :id`, { id: req.params.id });
-        await writeAuditLog({
-          userId: req.auth.userId,
-          actionType: "delete",
-          tableName: "user_profiles",
-          recordId: req.params.id,
-          oldValues: { email: before.email, full_name: before.full_name, hard: true }
-        });
-        return res.json({ success: true, mode: "hard_deleted" });
-      }
-      const anonEmail = `deleted+${req.params.id.slice(0, 8)}@rfincare.deleted`;
-      await pool.execute(
-        `UPDATE user_profiles SET
-           full_name = 'Deleted Customer',
-           email = :email,
-           phone = NULL,
-           avatar_url = NULL,
-           is_active = FALSE,
-           account_status = 'deleted'
-         WHERE id = :id AND role = 'customer'`,
-        { id: req.params.id, email: anonEmail }
-      );
-      try {
-        await pool.execute(`UPDATE auth_users SET email = :email WHERE id = :id`, {
-          id: req.params.id,
-          email: anonEmail
-        });
-      } catch {
-      }
+      const result = await deleteCustomerPermanently(customerId);
       await writeAuditLog({
         userId: req.auth.userId,
         actionType: "delete",
         tableName: "user_profiles",
-        recordId: req.params.id,
-        oldValues: { email: before.email, full_name: before.full_name },
-        newValues: { mode: "anonymized", account_status: "deleted" }
+        recordId: customerId,
+        oldValues: result.deleted || null,
+        newValues: { scope: "admin_customer_delete", mode: "hard_deleted" }
       });
-      res.json({ success: true, mode: "anonymized", applicationCount: appCount });
+      res.json(result);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+adminRouter.post(
+  "/customers/:id/delete",
+  authenticate,
+  authorize({ resource: "customers", action: "manage" }),
+  async (req, res, next) => {
+    try {
+      const customerId = String(req.params.id || "").trim();
+      if (!customerId) {
+        return res.status(400).json({ error: "Customer id is required" });
+      }
+      if (customerId === req.auth.userId) {
+        return res.status(400).json({ error: "You cannot delete your own account" });
+      }
+      const result = await deleteCustomerPermanently(customerId);
+      await writeAuditLog({
+        userId: req.auth.userId,
+        actionType: "delete",
+        tableName: "user_profiles",
+        recordId: customerId,
+        oldValues: result.deleted || null,
+        newValues: { scope: "admin_customer_delete", mode: "hard_deleted" }
+      });
+      res.json(result);
     } catch (err) {
       next(err);
     }

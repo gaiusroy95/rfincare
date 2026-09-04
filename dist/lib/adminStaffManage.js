@@ -420,8 +420,123 @@ async function deleteAgentPermanently(agentId) {
     }
   };
 }
+async function deleteCustomerPermanently(customerId) {
+  const pool = getPool();
+  const id = String(customerId || "").trim();
+  if (!id) {
+    const e = new Error("Customer id is required");
+    e.status = 400;
+    throw e;
+  }
+  const [[before]] = await pool.execute(
+    `SELECT id, email, full_name, phone, customer_code, account_status
+     FROM user_profiles
+     WHERE id = :id AND role = 'customer'
+     LIMIT 1`,
+    { id }
+  );
+  if (!before) {
+    const e = new Error("Customer not found");
+    e.status = 404;
+    throw e;
+  }
+  await pool.execute("BEGIN");
+  try {
+    try {
+      await pool.execute(
+        `ALTER TABLE loan_applications ALTER COLUMN customer_id DROP NOT NULL`
+      );
+    } catch {
+    }
+    await deleteIfTableExists(
+      pool,
+      `DELETE FROM oauth_identities WHERE user_id = :id`,
+      { id }
+    );
+    await deleteIfTableExists(
+      pool,
+      `DELETE FROM customer_support_messages WHERE customer_id = :id`,
+      { id }
+    );
+    await deleteIfTableExists(
+      pool,
+      `DELETE FROM customer_financial_goals WHERE customer_id = :id`,
+      { id }
+    );
+    await deleteIfTableExists(
+      pool,
+      `DELETE FROM customer_registrations
+       WHERE (:email <> '' AND LOWER(email) = LOWER(:email))
+          OR (:phone <> '' AND phone = :phone)`,
+      {
+        email: before.email || "",
+        phone: before.phone || ""
+      }
+    );
+    await deleteIfTableExists(
+      pool,
+      `DELETE FROM cibil_checks WHERE customer_id = :id`,
+      { id }
+    );
+    await deleteIfTableExists(
+      pool,
+      `UPDATE marketing_leads SET customer_id = NULL WHERE customer_id = :id`,
+      { id }
+    );
+    await deleteIfTableExists(
+      pool,
+      `UPDATE eligibility_assessments SET customer_id = NULL WHERE customer_id = :id`,
+      { id }
+    );
+    try {
+      await pool.execute(
+        `UPDATE loan_applications SET customer_id = NULL WHERE customer_id = :id`,
+        { id }
+      );
+    } catch (err) {
+      if (err?.code === "23502") {
+        await pool.execute(`DELETE FROM loan_applications WHERE customer_id = :id`, { id });
+      } else {
+        throw err;
+      }
+    }
+    try {
+      await pool.execute(
+        `UPDATE documents SET customer_id = NULL WHERE customer_id = :id`,
+        { id }
+      );
+    } catch {
+      await deleteIfTableExists(pool, `DELETE FROM documents WHERE customer_id = :id`, { id });
+    }
+    await pool.execute(
+      `UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = :id AND revoked_at IS NULL`,
+      { id }
+    );
+    await pool.execute(`DELETE FROM auth_users WHERE id = :id`, { id });
+    await pool.execute(`DELETE FROM user_profiles WHERE id = :id AND role = 'customer'`, { id });
+    await pool.execute("COMMIT");
+  } catch (err) {
+    try {
+      await pool.execute("ROLLBACK");
+    } catch {
+    }
+    throw err;
+  }
+  return {
+    success: true,
+    permanentlyDeleted: true,
+    message: "Customer deleted permanently",
+    deleted: {
+      id: before.id,
+      email: before.email,
+      fullName: before.full_name,
+      customerCode: before.customer_code
+    }
+  };
+}
 export {
   deleteAgentPermanently,
+  deleteCustomerPermanently,
   fetchAgentDetail,
   fetchEmployeeDetail,
   resetStaffPassword,
