@@ -146,7 +146,7 @@ authRouter.post('/login', async (req, res, next) => {
     }
 
     const [[profile]] = await pool.execute(
-      `SELECT id, role, account_status, is_active, failed_login_attempts, locked_until
+      `SELECT id, role, account_status, is_active, failed_login_attempts, locked_until, full_name, customer_code
        FROM user_profiles WHERE id = :id LIMIT 1`,
       { id: userRow.id },
     );
@@ -234,7 +234,13 @@ authRouter.post('/login', async (req, res, next) => {
       buildMobileAuthJson(req, {
         accessJwt,
         refreshJwt,
-        user: { id: profile.id, email: userRow.email, role: profile.role },
+        user: {
+          id: profile.id,
+          email: userRow.email,
+          role: profile.role,
+          fullName: profile.full_name || null,
+          customerCode: profile.customer_code || null,
+        },
       }),
     );
   } catch (err) {
