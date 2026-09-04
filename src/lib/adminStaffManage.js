@@ -5,6 +5,11 @@ import { ensureOnboardingSchema } from '../db/ensureOnboardingSchema.js';
 import { sendStaffWelcomeEmail, sendEmployeeTerminationEmail } from './email.js';
 import { ensureAgentCodeForUser } from './agentCode.js';
 import { sqlCastParam, sqlCoalescePatch, sqlLiteralEquals, sqlParamEqualsLower } from './sqlCollation.js';
+import {
+  hardDeleteApplications,
+  listApplicationIdsForAgent,
+  listApplicationIdsForCustomer,
+} from './hardDeleteApplications.js';
 
 function pick(body, ...keys) {
   for (const key of keys) {
@@ -350,14 +355,14 @@ async function deleteIfTableExists(pool, sql, params) {
   try {
     await pool.execute(sql, params);
   } catch (err) {
-    if (err?.code === '42P01') return; // undefined_table
+    if (err?.code === '42P01' || err?.code === '42703') return; // undefined_table / undefined_column
     throw err;
   }
 }
 
 /**
- * Permanently remove an agent account and related staff/CMS rows.
- * Loan applications keep history with agent_id cleared (not deleted).
+ * Permanently remove an agent and ALL corresponding data
+ * (applications sourced by the agent, documents, commissions, hierarchy, auth).
  */
 export async function deleteAgentPermanently(agentId) {
   await ensureOnboardingSchema();
@@ -370,9 +375,15 @@ export async function deleteAgentPermanently(agentId) {
   }
 
   const detail = await fetchAgentDetail(id);
+  const agentCode = detail.agentCode || null;
 
   await pool.execute('BEGIN');
   try {
+    const applicationIds = await listApplicationIdsForAgent(pool, id, agentCode);
+    if (applicationIds.length) {
+      await hardDeleteApplications(pool, applicationIds);
+    }
+
     await deleteIfTableExists(
       pool,
       `DELETE FROM agent_commission_config WHERE agent_user_id = :id`,
@@ -413,21 +424,27 @@ export async function deleteAgentPermanently(agentId) {
       `DELETE FROM oauth_identities WHERE user_id = :id`,
       { id },
     );
+    await deleteIfTableExists(
+      pool,
+      `DELETE FROM notifications WHERE user_id = :id`,
+      { id },
+    );
+    await deleteIfTableExists(
+      pool,
+      `DELETE FROM staff_messages WHERE sender_id = :id OR recipient_id = :id`,
+      { id },
+    );
+    await deleteIfTableExists(
+      pool,
+      `DELETE FROM marketing_leads WHERE assigned_to = :id`,
+      { id },
+    );
+    await deleteIfTableExists(
+      pool,
+      `DELETE FROM leads WHERE assigned_to = :id`,
+      { id },
+    );
 
-    await pool.execute(
-      `UPDATE loan_applications SET agent_id = NULL WHERE agent_id = :id`,
-      { id },
-    );
-    await deleteIfTableExists(
-      pool,
-      `UPDATE marketing_leads SET assigned_to = NULL WHERE assigned_to = :id`,
-      { id },
-    );
-    await deleteIfTableExists(
-      pool,
-      `UPDATE leads SET assigned_to = NULL WHERE assigned_to = :id`,
-      { id },
-    );
     await pool.execute(
       `UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = :id AND revoked_at IS NULL`,
       { id },
@@ -446,7 +463,8 @@ export async function deleteAgentPermanently(agentId) {
 
   return {
     success: true,
-    message: 'Agent deleted permanently',
+    permanentlyDeleted: true,
+    message: 'Agent and all corresponding data deleted permanently',
     deleted: {
       id: detail.id,
       agentName: detail.agentName,
@@ -457,8 +475,8 @@ export async function deleteAgentPermanently(agentId) {
 }
 
 /**
- * Permanently remove a customer account from the database.
- * Loan applications are retained with customer_id cleared when possible.
+ * Permanently remove a customer and ALL corresponding data
+ * (loan applications, documents, leads, assessments, auth).
  */
 export async function deleteCustomerPermanently(customerId) {
   const pool = getPool();
@@ -484,13 +502,9 @@ export async function deleteCustomerPermanently(customerId) {
 
   await pool.execute('BEGIN');
   try {
-    // Allow orphaned application history after profile removal.
-    try {
-      await pool.execute(
-        `ALTER TABLE loan_applications ALTER COLUMN customer_id DROP NOT NULL`,
-      );
-    } catch {
-      /* already nullable or unsupported — continue */
+    const applicationIds = await listApplicationIdsForCustomer(pool, id);
+    if (applicationIds.length) {
+      await hardDeleteApplications(pool, applicationIds);
     }
 
     await deleteIfTableExists(
@@ -525,37 +539,39 @@ export async function deleteCustomerPermanently(customerId) {
     );
     await deleteIfTableExists(
       pool,
-      `UPDATE marketing_leads SET customer_id = NULL WHERE customer_id = :id`,
+      `DELETE FROM customer_documents WHERE customer_id = :id`,
       { id },
     );
     await deleteIfTableExists(
       pool,
-      `UPDATE eligibility_assessments SET customer_id = NULL WHERE customer_id = :id`,
+      `DELETE FROM documents WHERE customer_id = :id`,
       { id },
     );
-
-    try {
-      await pool.execute(
-        `UPDATE loan_applications SET customer_id = NULL WHERE customer_id = :id`,
-        { id },
-      );
-    } catch (err) {
-      // If customer_id remains NOT NULL, remove the customer's applications so profile can go.
-      if (err?.code === '23502') {
-        await pool.execute(`DELETE FROM loan_applications WHERE customer_id = :id`, { id });
-      } else {
-        throw err;
-      }
-    }
-
-    try {
-      await pool.execute(
-        `UPDATE documents SET customer_id = NULL WHERE customer_id = :id`,
-        { id },
-      );
-    } catch {
-      await deleteIfTableExists(pool, `DELETE FROM documents WHERE customer_id = :id`, { id });
-    }
+    await deleteIfTableExists(
+      pool,
+      `DELETE FROM marketing_leads WHERE customer_id = :id`,
+      { id },
+    );
+    await deleteIfTableExists(
+      pool,
+      `DELETE FROM eligibility_assessments WHERE customer_id = :id`,
+      { id },
+    );
+    await deleteIfTableExists(
+      pool,
+      `DELETE FROM application_form_drafts WHERE customer_id = :id OR user_id = :id`,
+      { id },
+    );
+    await deleteIfTableExists(
+      pool,
+      `DELETE FROM notifications WHERE user_id = :id`,
+      { id },
+    );
+    await deleteIfTableExists(
+      pool,
+      `DELETE FROM staff_messages WHERE sender_id = :id OR recipient_id = :id`,
+      { id },
+    );
 
     await pool.execute(
       `UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = :id AND revoked_at IS NULL`,
@@ -576,7 +592,7 @@ export async function deleteCustomerPermanently(customerId) {
   return {
     success: true,
     permanentlyDeleted: true,
-    message: 'Customer deleted permanently',
+    message: 'Customer and all corresponding data deleted permanently',
     deleted: {
       id: before.id,
       email: before.email,
@@ -584,4 +600,31 @@ export async function deleteCustomerPermanently(customerId) {
       customerCode: before.customer_code,
     },
   };
+}
+
+/**
+ * Remove leftover anonymized ("Deleted Customer") profiles and their applications.
+ * Used to clean Document Management after older soft-deletes.
+ */
+export async function purgeAnonymizedCustomerResidue() {
+  const pool = getPool();
+  const [rows] = await pool.execute(
+    `SELECT id FROM user_profiles
+     WHERE role = 'customer'
+       AND (
+         account_status = 'deleted'
+         OR email LIKE '%@rfincare.deleted'
+         OR full_name = 'Deleted Customer'
+       )`,
+  );
+  const ids = (rows || []).map((r) => r.id);
+  const results = [];
+  for (const id of ids) {
+    try {
+      results.push(await deleteCustomerPermanently(id));
+    } catch (err) {
+      results.push({ id, error: err?.message || 'purge failed' });
+    }
+  }
+  return { purged: results.filter((r) => r.permanentlyDeleted).length, results };
 }

@@ -1,6 +1,5 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { unlink } from 'node:fs/promises';
 
 import { getPool, isNoSuchTableError } from '../db/pool.js';
 import { newId } from '../lib/ids.js';
@@ -27,8 +26,10 @@ import {
   autoAssignApplicationsForEmployeeVerification,
   fetchEmployeeOwnedApplicationIds,
 } from '../lib/employeeApplicationAssignment.js';
+import { hardDeleteApplications } from '../lib/hardDeleteApplications.js';
 
 export const loanApplicationsRouter = Router();
+export { hardDeleteApplications };
 
 const STAFF_ROLES = new Set(['admin', 'super_admin', 'employee']);
 const ADMIN_DELETE_ROLES = new Set(['admin', 'super_admin']);
@@ -62,52 +63,6 @@ const BANK_APPROVAL_STAGE_OPTIONS = new Set([
 
 function canDeleteApplications(role) {
   return ADMIN_DELETE_ROLES.has(role) || hasPermission(role, 'delete:loan_applications');
-}
-
-async function hardDeleteApplications(pool, applicationIds) {
-  if (!applicationIds.length) return { deleted: 0 };
-
-  const params = {};
-  const placeholders = applicationIds.map((id, i) => {
-    const key = `id${i}`;
-    params[key] = id;
-    return `:${key}`;
-  });
-  const inClause = placeholders.join(', ');
-
-  const [docs] = await pool.execute(
-    `SELECT id, file_path FROM customer_documents WHERE application_id IN (${inClause})`,
-    params,
-  );
-
-  for (const doc of docs) {
-    if (doc.file_path) {
-      try {
-        await unlink(doc.file_path);
-      } catch {
-        /* file may already be gone */
-      }
-    }
-  }
-
-  await pool.execute(`DELETE FROM customer_documents WHERE application_id IN (${inClause})`, params);
-  await pool.execute(`DELETE FROM application_consents WHERE application_id IN (${inClause})`, params);
-  await pool.execute(`DELETE FROM otp_verifications WHERE application_id IN (${inClause})`, params);
-  await pool.execute(
-    `UPDATE marketing_leads SET application_id = NULL WHERE application_id IN (${inClause})`,
-    params,
-  );
-  await pool.execute(
-    `UPDATE application_form_drafts SET application_id = NULL WHERE application_id IN (${inClause})`,
-    params,
-  );
-
-  const [result] = await pool.execute(
-    `DELETE FROM loan_applications WHERE id IN (${inClause})`,
-    params,
-  );
-
-  return { deleted: result.affectedRows ?? applicationIds.length };
 }
 
 function parseJson(value) {

@@ -28,6 +28,7 @@ import {
   terminateEmployee,
   deleteAgentPermanently,
   deleteCustomerPermanently,
+  purgeAnonymizedCustomerResidue,
 } from '../lib/adminStaffManage.js';
 import { parseCsvToRows } from '../lib/parseCsv.js';
 import { buildFunnelAnalytics, buildProductConversionRows } from '../lib/funnelAnalytics.js';
@@ -926,6 +927,27 @@ adminRouter.patch(
       });
 
       res.json(mapCustomerRow(row));
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+adminRouter.post(
+  '/customers/purge-anonymized',
+  authenticate,
+  authorize({ resource: 'customers', action: 'manage' }),
+  async (req, res, next) => {
+    try {
+      const result = await purgeAnonymizedCustomerResidue();
+      await writeAuditLog({
+        userId: req.auth.userId,
+        actionType: 'delete',
+        tableName: 'user_profiles',
+        recordId: 'purge-anonymized',
+        newValues: { scope: 'admin_customer_purge_anonymized', purged: result.purged },
+      });
+      res.json(result);
     } catch (err) {
       next(err);
     }

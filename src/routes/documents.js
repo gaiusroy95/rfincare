@@ -308,6 +308,14 @@ documentsRouter.get(
         Object.assign(params, await resolveAgentScopeParams(pool, req.auth.userId));
       }
 
+      // Hide soft-deleted / anonymized customer residue from Document Management.
+      const activeCustomerClause = `
+        AND up.id IS NOT NULL
+        AND COALESCE(up.account_status, '') <> 'deleted'
+        AND COALESCE(up.email, '') NOT LIKE '%@rfincare.deleted'
+        AND COALESCE(up.full_name, '') <> 'Deleted Customer'
+      `;
+
       const [rows] = await pool.execute(
         `SELECT
            la.id AS application_id,
@@ -333,7 +341,7 @@ documentsRouter.get(
          FROM loan_applications la
          LEFT JOIN user_profiles up ON up.id = la.customer_id
          LEFT JOIN customer_documents cd ON cd.application_id = la.id
-         WHERE 1=1 ${employeeClause} ${agentClause} ${searchClause}
+         WHERE 1=1 ${employeeClause} ${agentClause} ${searchClause} ${activeCustomerClause}
          GROUP BY la.id, la.customer_id, la.application_number, la.status, la.created_at,
                   la.sourced_agent_code, up.full_name, up.email, up.phone
          ${having}
