@@ -8,6 +8,7 @@ import {
   buildAgentCommissionReport,
   commissionReportToCsv,
   commissionReportToPdf,
+  commissionBillToPdf,
   commissionReportToXlsx,
   summarizeCommissionReport,
 } from '../lib/commissionReportService.js';
@@ -16,6 +17,27 @@ import { ensureMilestone4Schema } from '../db/ensureMilestone4Schema.js';
 export const portalAgentMilestone4Router = Router();
 
 portalAgentMilestone4Router.use(authenticate);
+
+function downloadBlob(res, buffer, { mime, filename }) {
+  res.setHeader('Content-Type', mime);
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  return res.send(buffer);
+}
+
+async function loadAgentBillMeta(pool, agentId) {
+  const [[row]] = await pool.execute(
+    `SELECT up.full_name, ao.agent_name, ao.agent_code
+     FROM user_profiles up
+     LEFT JOIN agent_onboarding ao ON ao.user_id = up.id
+     WHERE up.id = :id
+     LIMIT 1`,
+    { id: agentId },
+  );
+  return {
+    agentName: row?.full_name || row?.agent_name || 'Agent',
+    agentCode: row?.agent_code || null,
+  };
+}
 
 portalAgentMilestone4Router.get('/notifications', async (req, res, next) => {
   try {
@@ -146,7 +168,12 @@ portalAgentMilestone4Router.post('/commission-bills', async (req, res, next) => 
     const to = String(req.body?.to || '').trim();
     const notes = String(req.body?.notes || '').trim() || null;
     if (!from || !to) {
-      return res.status(400).json({ error: 'from and to dates are required (YYYY-MM-DD)' });
+      return res.status(400).json({
+        error: 'Select From and To dates before raising a bill (YYYY-MM-DD).',
+      });
+    }
+    if (from > to) {
+      return res.status(400).json({ error: 'From date must be on or before To date.' });
     }
 
     const report = await buildAgentCommissionReport(agentId, {
@@ -158,10 +185,23 @@ portalAgentMilestone4Router.post('/commission-bills', async (req, res, next) => 
     });
     const summary = summarizeCommissionReport(report);
     if (!summary.entryCount) {
-      return res.status(400).json({ error: 'No commission rows found for this period' });
+      return res.status(400).json({
+        error: 'No commission rows found for this period. Adjust the dates and try again.',
+      });
     }
 
+    const agentMeta = await loadAgentBillMeta(pool, agentId);
     const id = randomUUID();
+    const snapshot = {
+      generatedAt: report.generatedAt,
+      entryCount: summary.entryCount,
+      filters: { from, to },
+      agent: agentMeta,
+      notes,
+      summary,
+      entries: report.entries,
+    };
+
     await pool.execute(
       `INSERT INTO agent_commission_bills
        (id, agent_user_id, period_start, period_end, gross_amount, tds_amount, net_amount, status, notes, report_snapshot)
@@ -175,9 +215,26 @@ portalAgentMilestone4Router.post('/commission-bills', async (req, res, next) => 
         tds: summary.tds,
         net: summary.net,
         notes,
-        snapshot: JSON.stringify({ generatedAt: report.generatedAt, entryCount: summary.entryCount }),
+        snapshot: JSON.stringify(snapshot),
       },
     );
+
+    const wantPdf =
+      String(req.query.format || req.body?.format || '').toLowerCase() === 'pdf'
+      || String(req.headers.accept || '').includes('application/pdf');
+
+    if (wantPdf) {
+      const pdf = commissionBillToPdf(report, {
+        periodStart: from,
+        periodEnd: to,
+        notes,
+        ...agentMeta,
+      });
+      return downloadBlob(res, pdf, {
+        mime: 'application/pdf',
+        filename: `commission-bill-${from}_to_${to}.pdf`,
+      });
+    }
 
     res.status(201).json({
       id,
@@ -189,7 +246,74 @@ portalAgentMilestone4Router.post('/commission-bills', async (req, res, next) => 
       status: 'submitted',
       notes,
       entryCount: summary.entryCount,
-      message: 'Monthly commission bill submitted for admin review',
+      pdfPath: `/portal/agent/reports/commission-bills/${id}/pdf`,
+      message:
+        'Monthly commission bill generated. Download the PDF and email it to the Accounts Team for processing.',
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+portalAgentMilestone4Router.get('/commission-bills/:id/pdf', async (req, res, next) => {
+  try {
+    if (req.auth.role !== 'agent' && !['admin', 'super_admin'].includes(req.auth.role)) {
+      return res.status(403).json({ error: 'Agent access only' });
+    }
+    await ensureMilestone4Schema();
+    const pool = getPool();
+    const [[row]] = await pool.execute(
+      `SELECT id, agent_user_id, period_start, period_end, notes, report_snapshot, created_at
+       FROM agent_commission_bills
+       WHERE id = :id
+       LIMIT 1`,
+      { id: req.params.id },
+    );
+    if (!row) {
+      return res.status(404).json({ error: 'Commission bill not found' });
+    }
+    if (req.auth.role === 'agent' && row.agent_user_id !== req.auth.userId) {
+      return res.status(403).json({ error: 'Cannot download another agent bill' });
+    }
+
+    let snapshot = row.report_snapshot;
+    if (typeof snapshot === 'string') {
+      try {
+        snapshot = JSON.parse(snapshot);
+      } catch {
+        snapshot = null;
+      }
+    }
+
+    const periodStart = String(row.period_start).slice(0, 10);
+    const periodEnd = String(row.period_end).slice(0, 10);
+    let report;
+    if (snapshot?.entries?.length) {
+      report = {
+        generatedAt: snapshot.generatedAt || row.created_at,
+        filters: snapshot.filters || { from: periodStart, to: periodEnd },
+        entries: snapshot.entries,
+      };
+    } else {
+      report = await buildAgentCommissionReport(row.agent_user_id, {
+        from: periodStart,
+        to: periodEnd,
+        applicationStatus: 'all',
+        commissionStatus: 'all',
+        loanType: 'all',
+      });
+    }
+
+    const agentMeta = snapshot?.agent || (await loadAgentBillMeta(pool, row.agent_user_id));
+    const pdf = commissionBillToPdf(report, {
+      periodStart,
+      periodEnd,
+      notes: row.notes,
+      ...agentMeta,
+    });
+    return downloadBlob(res, pdf, {
+      mime: 'application/pdf',
+      filename: `commission-bill-${periodStart}_to_${periodEnd}.pdf`,
     });
   } catch (err) {
     next(err);

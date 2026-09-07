@@ -153,6 +153,34 @@ function commissionReportToPdf(report) {
   ];
   return buildSimpleTextPdf(lines);
 }
+function commissionBillToPdf(report, meta = {}) {
+  const summary = summarizeCommissionReport(report);
+  const periodStart = meta.periodStart || report.filters?.from || "—";
+  const periodEnd = meta.periodEnd || report.filters?.to || "—";
+  const lines = [
+    "Rfincare — Monthly Commission Bill",
+    `Period: ${periodStart} to ${periodEnd}`,
+    `Generated: ${report.generatedAt || (/* @__PURE__ */ new Date()).toISOString()}`,
+    meta.agentName ? `Agent: ${meta.agentName}` : "",
+    meta.agentCode ? `Agent code: ${meta.agentCode}` : "",
+    meta.notes ? `Notes: ${meta.notes}` : "",
+    "",
+    `Entries: ${summary.entryCount}`,
+    `Gross commission: INR ${Number(summary.gross || 0).toLocaleString("en-IN")}`,
+    `TDS (10%): INR ${Number(summary.tds || 0).toLocaleString("en-IN")}`,
+    `Net payable: INR ${Number(summary.net || 0).toLocaleString("en-IN")}`,
+    "",
+    "Line items",
+    "----------",
+    ...(report.entries || []).map(
+      (e, i) => `${i + 1}. ${e.applicationNumber} | ${e.customerName} | ${e.loanType} | ${e.commissionStatus} | Disbursed ${e.disbursedAmount} | Gross ${e.grossCommission} | TDS ${e.tdsAmount} | Net ${e.netPayout}`
+    ),
+    "",
+    "Instruction: Download this PDF and email it to the Accounts Team",
+    "for commission processing and reconciliation."
+  ].filter((line) => line !== "");
+  return buildSimpleTextPdf(lines);
+}
 function commissionReportToXlsx(report) {
   const rows = (report.entries || []).map((e) => ({
     application_number: e.applicationNumber,
@@ -183,6 +211,7 @@ function summarizeCommissionReport(report) {
 }
 export {
   buildAgentCommissionReport,
+  commissionBillToPdf,
   commissionReportToCsv,
   commissionReportToPdf,
   commissionReportToXlsx,
