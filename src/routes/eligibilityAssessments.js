@@ -107,12 +107,20 @@ eligibilityAssessmentsRouter.post('/', async (req, res, next) => {
 
     if (customerId) {
       const scoreLabel = score != null ? `${Math.round(score)}%` : 'ready';
+      const loanType = calcInput.loanType || body.loanType || body.loan_type || null;
+      const comparisonPath = loanType
+        ? `/product-comparison?loanType=${encodeURIComponent(loanType)}#bank-comparison`
+        : '/product-comparison#bank-comparison';
       await createCustomerNotification(pool, {
         customerId,
         title: 'Eligibility check complete',
         message: `Your loan eligibility result is ${scoreLabel}. Open the app to compare bank offers.`,
         type: 'eligibility',
-        data: { assessmentId: id },
+        data: {
+          assessmentId: id,
+          loanType,
+          path: comparisonPath,
+        },
       }).catch(() => {});
     }
 

@@ -25,6 +25,7 @@ import {
   mapLedgerEntryToCommission
 } from "../lib/agentCommissionLedger.js";
 import { buildAgentRecentActivities } from "../lib/agentRecentActivities.js";
+import { getNextCommissionPayoutDateIso } from "../lib/commissionPayoutCycle.js";
 import {
   autoAssignApplicationsForEmployeeVerification,
   fetchEmployeeOwnedApplicationIds
@@ -115,7 +116,7 @@ portalDashboardsRouter.get("/agent/dashboard", authenticate, async (req, res, ne
     const agentId = req.auth.userId;
     await ensureAgentProfileSchema();
     const [[profile]] = await pool.execute(
-      `SELECT up.*, ao.agent_code, ao.username
+      `SELECT up.*, ao.agent_code, ao.username, ao.agent_name
        FROM user_profiles up
        LEFT JOIN agent_onboarding ao ON ao.user_id = up.id
        WHERE up.id = :id LIMIT 1`,
@@ -445,9 +446,22 @@ portalDashboardsRouter.get("/agent/dashboard", authenticate, async (req, res, ne
       name: row.name,
       earnings: row.earnings
     }));
+    const rawFullName = String(profile?.full_name || "").trim();
+    const rawAgentName = String(profile?.agent_name || "").trim();
+    const placeholderNames = /* @__PURE__ */ new Set(["agent", "agent user", "user"]);
+    const displayName = (rawFullName && !placeholderNames.has(rawFullName.toLowerCase()) ? rawFullName : null) || rawAgentName || rawFullName || "Agent";
+    if (profile?.id && rawAgentName && (!rawFullName || placeholderNames.has(rawFullName.toLowerCase())) && rawAgentName.toLowerCase() !== rawFullName.toLowerCase()) {
+      pool.execute(`UPDATE user_profiles SET full_name = :name WHERE id = :id`, {
+        name: rawAgentName,
+        id: profile.id
+      }).catch(() => {
+      });
+    }
     res.json({
       profile: {
-        name: profile?.full_name || "Agent",
+        name: displayName,
+        fullName: displayName,
+        agentName: rawAgentName || displayName,
         agentId: agentCode || "—",
         tier: profile?.is_active ? "Active Agent" : "Pending",
         totalClients: total,
@@ -536,7 +550,8 @@ portalDashboardsRouter.get("/agent/dashboard", authenticate, async (req, res, ne
           lastPayout: lastPaid?.amount || Math.round(commissionEstimate * 0.75) || 0,
           lastPayoutDate: lastPaid?.date || null,
           nextPayout: pendingCommission,
-          nextPayoutDate: null
+          // Last month's work is paid on the 15th of the following month.
+          nextPayoutDate: getNextCommissionPayoutDateIso()
         },
         submissionVsDisbursement: {
           submitted: submittedApps,

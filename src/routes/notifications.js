@@ -5,6 +5,7 @@ import { getPool } from '../db/pool.js';
 import { newId } from '../lib/ids.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { ensurePushNotificationSchema } from '../db/ensurePushNotificationSchema.js';
+import { ensureCustomerNotificationSchema } from '../db/ensureCustomerNotificationSchema.js';
 import {
   getUserNotificationPreferences,
   registerPushToken,
@@ -15,13 +16,28 @@ import {
 
 export const notificationsRouter = Router();
 
+function parseDataJson(value) {
+  if (!value) return {};
+  if (typeof value === 'object') return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return {};
+  }
+}
+
 function formatNotification(row) {
+  const data = parseDataJson(row.data_json);
+  const path = row.action_path || data.path || null;
   return {
     id: row.id,
     customer_id: row.customer_id,
     customerId: row.customer_id,
     title: row.title,
     message: row.message,
+    type: row.notification_type || data.type || 'general',
+    path,
+    data: { ...data, path: path || data.path || null },
     is_read: !!row.is_read,
     isRead: !!row.is_read,
     created_at: row.created_at,
@@ -45,18 +61,65 @@ function formatStaffNotification(row) {
   };
 }
 
+async function listCustomerNotifications(customerId) {
+  await ensureCustomerNotificationSchema();
+  const pool = getPool();
+  const [rows] = await pool.execute(
+    `SELECT id, customer_id, title, message, is_read, created_at,
+            notification_type, action_path, data_json
+     FROM customer_notifications
+     WHERE customer_id = :customerId
+     ORDER BY created_at DESC
+     LIMIT 100`,
+    { customerId },
+  );
+
+  const mapped = rows.map(formatNotification);
+
+  // Backfill deep-links for older eligibility alerts that only stored title/message.
+  const needsLoanType = mapped.filter(
+    (n) =>
+      !n.path
+      && (n.type === 'eligibility'
+        || /eligibility check complete/i.test(String(n.title || ''))),
+  );
+  if (needsLoanType.length) {
+    const [[latest]] = await pool
+      .execute(
+        `SELECT id, loan_type FROM eligibility_assessments
+         WHERE customer_id = :customerId
+         ORDER BY created_at DESC
+         LIMIT 1`,
+        { customerId },
+      )
+      .catch(() => [[null]]);
+    if (latest?.loan_type) {
+      const path = `/product-comparison?loanType=${encodeURIComponent(latest.loan_type)}#bank-comparison`;
+      for (const n of needsLoanType) {
+        n.path = path;
+        n.type = n.type === 'general' ? 'eligibility' : n.type || 'eligibility';
+        n.data = {
+          ...(n.data || {}),
+          path,
+          loanType: latest.loan_type,
+          assessmentId: latest.id,
+        };
+      }
+    } else {
+      for (const n of needsLoanType) {
+        n.path = '/product-comparison#bank-comparison';
+        n.type = n.type === 'general' ? 'eligibility' : n.type || 'eligibility';
+        n.data = { ...(n.data || {}), path: n.path };
+      }
+    }
+  }
+
+  return mapped;
+}
+
 notificationsRouter.get('/me', authenticate, async (req, res, next) => {
   try {
-    const pool = getPool();
-    const [rows] = await pool.execute(
-      `SELECT id, customer_id, title, message, is_read, created_at
-       FROM customer_notifications
-       WHERE customer_id = :customerId
-       ORDER BY created_at DESC
-       LIMIT 100`,
-      { customerId: req.auth.userId },
-    );
-    res.json(rows.map(formatNotification));
+    res.json(await listCustomerNotifications(req.auth.userId));
   } catch (err) {
     next(err);
   }
@@ -95,16 +158,7 @@ notificationsRouter.get('/customers/:customerId', authenticate, async (req, res,
       e.status = 403;
       throw e;
     }
-    const pool = getPool();
-    const [rows] = await pool.execute(
-      `SELECT id, customer_id, title, message, is_read, created_at
-       FROM customer_notifications
-       WHERE customer_id = :customerId
-       ORDER BY created_at DESC
-       LIMIT 100`,
-      { customerId: req.params.customerId },
-    );
-    res.json(rows.map(formatNotification));
+    res.json(await listCustomerNotifications(req.params.customerId));
   } catch (err) {
     next(err);
   }
@@ -227,17 +281,35 @@ export async function createCustomerNotification(
   pool,
   { customerId, title, message, type = 'general', data = {} },
 ) {
+  await ensureCustomerNotificationSchema();
   const id = newId();
+  const payload = data && typeof data === 'object' ? { ...data } : {};
+  const actionPath = payload.path || null;
+  if (type && !payload.type) payload.type = type;
+
   await pool.execute(
-    `INSERT INTO customer_notifications (id, customer_id, title, message, is_read)
-     VALUES (:id, :customer_id, :title, :message, 0)`,
-    { id, customer_id: customerId, title, message },
+    `INSERT INTO customer_notifications (
+       id, customer_id, title, message, is_read,
+       notification_type, action_path, data_json
+     ) VALUES (
+       :id, :customer_id, :title, :message, 0,
+       :notification_type, :action_path, :data_json
+     )`,
+    {
+      id,
+      customer_id: customerId,
+      title,
+      message,
+      notification_type: type || null,
+      action_path: actionPath,
+      data_json: JSON.stringify(payload),
+    },
   );
 
   sendExpoPushToUser(customerId, {
     title,
     body: message,
-    data: { type, notificationId: id, ...data },
+    data: { type, notificationId: id, ...payload },
   }).catch(() => {});
 
   return id;

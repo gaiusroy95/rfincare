@@ -37,7 +37,7 @@ function requireAgent(req) {
 async function loadAgentContext(pool, userId) {
   const [[row]] = await pool.execute(
     `SELECT up.id, up.email, up.full_name, up.phone, up.avatar_url, up.is_active, up.account_status,
-            ao.agent_code, ao.username, ao.mobile_number, ao.account_number, ao.bank_name, ao.ifsc_code,
+            ao.agent_code, ao.username, ao.agent_name, ao.mobile_number, ao.account_number, ao.bank_name, ao.ifsc_code,
             ao.account_proof_path, ao.onboarding_status
      FROM user_profiles up
      LEFT JOIN agent_onboarding ao ON ao.user_id = up.id
@@ -144,10 +144,14 @@ portalAgentProfileRouter.get("/", async (req, res, next) => {
     const row = await loadAgentContext(pool, req.auth.userId);
     const agentCode = await ensureAgentCodeForUser(pool, req.auth.userId) || row.agent_code;
     const mobile = row.mobile_number || row.phone;
+    const displayName = row.full_name || row.agent_name || null;
+    const placeholderNames = /* @__PURE__ */ new Set(["agent", "agent user", "user"]);
+    const resolvedName = (displayName && !placeholderNames.has(String(displayName).toLowerCase()) ? displayName : null) || row.agent_name || row.full_name || null;
     res.json({
       profile: {
         id: row.id,
-        fullName: row.full_name,
+        fullName: resolvedName,
+        agentName: row.agent_name || resolvedName,
         email: row.email,
         phone: row.phone,
         avatarUrl: row.avatar_url,

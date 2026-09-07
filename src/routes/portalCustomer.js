@@ -337,19 +337,20 @@ portalCustomerRouter.get('/financial-snapshot', authenticate, async (req, res, n
     }, 0);
 
     const totalInsuranceCover = insurancePolicies.reduce((sum, p) => {
-      const premium = Number(p.premium_amount) || 0;
-      return sum + (premium > 0 ? premium * 100 : 500000);
+      const cover = Number(p.sum_assured || p.coverage_amount || 0);
+      if (Number.isFinite(cover) && cover > 0) return sum + cover;
+      return sum;
     }, 0);
 
-    const equityValue = mfSipOrders.reduce((sum, o) => sum + (Number(o.sip_amount) || 0) * 24, 0)
-      + sipLeads.length * 50000;
-    const debtValue = fixedDepositLeads.length * 100000;
-    const goldValue = Math.max(0, sipLeads.length * 25000);
-    const fdValue = fixedDepositLeads.length * 150000;
-    const otherValue = Math.max(
-      0,
-      (creditCardLeads.length + insuranceLeads.length) * 30000,
-    );
+    // Only real invested corpus — never invent amounts from marketplace leads.
+    const equityValue = mfSipOrders.reduce((sum, o) => {
+      const invested = Number(o.invested_amount || o.total_invested || o.corpus || 0);
+      return sum + (Number.isFinite(invested) && invested > 0 ? invested : 0);
+    }, 0);
+    const debtValue = 0;
+    const goldValue = 0;
+    const fdValue = 0;
+    const otherValue = 0;
     const totalInvestments = equityValue + debtValue + goldValue + fdValue + otherValue;
 
     const portfolioAllocation = [
@@ -433,9 +434,9 @@ portalCustomerRouter.get('/financial-snapshot', authenticate, async (req, res, n
         abandonedSips: customer360.counts?.abandonedSips ?? 0,
         totalInvestments,
         totalLoansOutstanding,
-        totalInsuranceCover: totalInsuranceCover || insurancePolicies.length * 1000000,
+        totalInsuranceCover,
         monthlySavings,
-        investmentReturnsPct: totalInvestments > 0 ? 12.45 : 0,
+        investmentReturnsPct: null,
       },
       portfolioAllocation,
       financialGoals,
