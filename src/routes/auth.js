@@ -25,6 +25,15 @@ const SignupSchema = z.object({
   fullName: z.string().min(1).optional(),
   phone: z.string().min(6).optional(),
   role: z.enum(['customer', 'agent', 'employee', 'admin', 'super_admin']).optional(),
+  referralCode: z.string().trim().max(64).optional(),
+  referral_code: z.string().trim().max(64).optional(),
+  referralProgram: z.enum(['agent', 'customer']).optional(),
+  referral_program: z.enum(['agent', 'customer']).optional(),
+  referralId: z.string().trim().max(64).optional(),
+  referral_id: z.string().trim().max(64).optional(),
+  referralSessionToken: z.string().trim().max(64).optional(),
+  sourcedAgentCode: z.string().trim().max(64).optional(),
+  sourced_agent_code: z.string().trim().max(64).optional(),
 });
 
 const LoginSchema = z.object({
@@ -108,6 +117,33 @@ authRouter.post('/signup', async (req, res, next) => {
 
     if (role === 'customer') {
       await assignUniqueCustomerCode(pool, userId);
+    }
+
+    try {
+      const { attachAttributionToUser } = await import('../lib/referralEngine.js');
+      await attachAttributionToUser(pool, userId, {
+        ...input,
+        email: input.email,
+        phone: input.phone,
+      });
+    } catch {
+      /* referral stamp is best-effort */
+    }
+
+    if (role === 'customer' && (input.email || input.phone)) {
+      try {
+        const { upsertMarketingLead } = await import('../lib/marketingLeads.js');
+        await upsertMarketingLead(pool, {
+          fullName: input.fullName || null,
+          email: input.email,
+          phone: input.phone || null,
+          source: 'signup',
+          consentAccepted: true,
+          status: 'new',
+        });
+      } catch {
+        /* lead capture is best-effort */
+      }
     }
 
     const { accessJwt, refreshJwt } = await issueTokens({ userId, email: input.email, role, req });
@@ -437,6 +473,20 @@ authRouter.post('/register-portal', async (req, res, next) => {
         account_name: data.accountName || data.account_name || null,
       }
     );
+
+    try {
+      const { upsertMarketingLead } = await import('../lib/marketingLeads.js');
+      await upsertMarketingLead(pool, {
+        fullName: data.fullName || data.full_name || null,
+        email: data.email,
+        phone: data.phone || null,
+        source: 'portal_registration',
+        consentAccepted: true,
+        status: 'new',
+      });
+    } catch {
+      /* lead capture is best-effort */
+    }
 
     res.status(201).json({ id, status: 'pending' });
   } catch (err) {

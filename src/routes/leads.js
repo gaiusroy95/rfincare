@@ -19,6 +19,21 @@ import {
 import { normalizeAgentCode } from '../lib/agentAttribution.js';
 import { ensureAgentCodeForUser } from '../lib/agentCode.js';
 import { applyReferralToLead, ensureReferralSchema } from '../lib/referralTracking.js';
+import {
+  ensureLeadAssignmentSchema,
+  ensureLeadTatClock,
+  enrichLeadTatFields,
+  getLeadAssignmentSettings,
+  getLeadPerformanceReport,
+  listLeadActivities,
+  listRedZoneLeads,
+  processTatMissReassignments,
+  recordLeadActivity,
+  recordLeadContact,
+  refreshOverdueTatStatuses,
+  resolveEmployeeLeadScope,
+  updateLeadAssignmentSettings,
+} from '../lib/leadAssignmentEngine.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { verifyAccessToken } from '../lib/jwt.js';
 import { hasPermission } from '../auth/permissions.js';
@@ -56,7 +71,9 @@ function csvEscape(value) {
   return normalized;
 }
 
-function formatLead(row) {
+function formatLead(row, settings = null) {
+  if (!row) return null;
+  const tat = enrichLeadTatFields(row, settings);
   return {
     id: row.id,
     fullName: row.full_name,
@@ -65,6 +82,9 @@ function formatLead(row) {
     phone: row.phone,
     loanType: row.loan_type,
     loan_type: row.loan_type,
+    loanAmount: tat.loanAmount,
+    employmentType: tat.employmentType,
+    locationCity: tat.locationCity,
     source: row.source,
     status: row.status,
     consentAccepted: !!row.consent_accepted,
@@ -80,6 +100,9 @@ function formatLead(row) {
     assignedToName: row.assignee_name || null,
     assignedToCode: row.assignee_code || null,
     assignedToRole: row.assignee_role || null,
+    previousAssignedTo: tat.previousAssignedTo,
+    previousAssigneeName: row.previous_assignee_name || null,
+    previousAssigneeCode: row.previous_assignee_code || null,
     sourcedAgentCode: row.sourced_agent_code || null,
     referralCode: row.referral_code || null,
     referralProgram: row.referral_program || null,
@@ -88,6 +111,23 @@ function formatLead(row) {
     sessionKey: row.session_key,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    assignedAt: tat.assignedAt,
+    firstContactAt: tat.firstContactAt,
+    firstContactDueAt: tat.firstContactDueAt,
+    firstContactChannel: tat.firstContactChannel,
+    tatMinutes: tat.tatMinutes,
+    tatStatus: tat.tatStatus,
+    tatZone: tat.tatZone,
+    tatRemainingSeconds: tat.tatRemainingSeconds,
+    assignmentMethod: tat.assignmentMethod,
+    redZone: tat.redZone,
+    reassignmentCount: tat.reassignmentCount,
+    contactAttemptedAt: tat.contactAttemptedAt,
+    contactConnectedAt: tat.contactConnectedAt,
+    callAttemptCount: tat.callAttemptCount,
+    whatsappMessageCount: tat.whatsappMessageCount,
+    nextFollowUpAt: tat.nextFollowUpAt,
+    employeeRemarks: tat.employeeRemarks,
   };
 }
 
@@ -220,6 +260,8 @@ leadsRouter.post('/', async (req, res, next) => {
       consentAccepted: Boolean(body.consentAccepted || body.consent_accepted),
       sessionKey,
       status: 'new',
+      // Staff-captured leads are assigned below; skip queue so they don't bounce to another L1.
+      skipAutoAssign: Boolean(agentUserId || employeeUserId || body.assignedTo || body.assigned_to),
     });
 
     await applyAgentCodeToLead(pool, row?.id, body);
@@ -271,6 +313,10 @@ leadsRouter.post('/', async (req, res, next) => {
                status = CASE WHEN :assignee IS NOT NULL THEN 'assigned' ELSE status END,
                sourced_agent_code = COALESCE(:code, sourced_agent_code),
                source = COALESCE(NULLIF(TRIM(source), ''), :source),
+               assignment_method = CASE
+                 WHEN :assignee IS NOT NULL THEN COALESCE(assignment_method, 'manual')
+                 ELSE assignment_method
+               END,
                updated_at = NOW()
            WHERE id = :id`,
           {
@@ -280,6 +326,9 @@ leadsRouter.post('/', async (req, res, next) => {
             source,
           },
         );
+        if (assigneeId) {
+          await ensureLeadTatClock(pool, row.id).catch(() => {});
+        }
       } catch {
         /* ignore */
       }
@@ -317,6 +366,118 @@ leadsRouter.get('/otp-settings', async (_req, res, next) => {
       smsProvider: settings.smsProvider,
       emailProvider: settings.emailProvider,
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+leadsRouter.get('/assignment-settings', authenticate, async (req, res, next) => {
+  try {
+    if (!canReadLeads(req.auth.role)) {
+      const e = new Error('Insufficient permissions');
+      e.status = 403;
+      throw e;
+    }
+    const pool = getPool();
+    const settings = await getLeadAssignmentSettings(pool);
+    let leadScope = null;
+    if (req.auth.role === 'employee') {
+      leadScope = await resolveEmployeeLeadScope(pool, req.auth.userId);
+    }
+    res.json({ ...settings, leadScope });
+  } catch (err) {
+    next(err);
+  }
+});
+
+leadsRouter.put('/assignment-settings', authenticate, async (req, res, next) => {
+  try {
+    if (!canManageLeads(req.auth.role)) {
+      const e = new Error('Insufficient permissions');
+      e.status = 403;
+      throw e;
+    }
+    const pool = getPool();
+    const settings = await updateLeadAssignmentSettings(pool, {
+      firstContactTatMinutes: req.body?.firstContactTatMinutes ?? req.body?.first_contact_tat_minutes,
+      roundRobinEnabled: req.body?.roundRobinEnabled ?? req.body?.round_robin_enabled,
+      amberWarningMinutes: req.body?.amberWarningMinutes ?? req.body?.amber_warning_minutes,
+      redZoneMinutes: req.body?.redZoneMinutes ?? req.body?.red_zone_minutes,
+      autoReassignEnabled: req.body?.autoReassignEnabled ?? req.body?.auto_reassign_enabled,
+      maxReassignments: req.body?.maxReassignments ?? req.body?.max_reassignments,
+      notifyEmailEnabled: req.body?.notifyEmailEnabled ?? req.body?.notify_email_enabled,
+      notifyWhatsappEnabled: req.body?.notifyWhatsappEnabled ?? req.body?.notify_whatsapp_enabled,
+    });
+    res.json(settings);
+  } catch (err) {
+    next(err);
+  }
+});
+
+leadsRouter.get('/red-zone', authenticate, async (req, res, next) => {
+  try {
+    if (!canReadLeads(req.auth.role)) {
+      const e = new Error('Insufficient permissions');
+      e.status = 403;
+      throw e;
+    }
+    const pool = getPool();
+    const settings = await getLeadAssignmentSettings(pool);
+    await processTatMissReassignments(pool, { limit: 25 }).catch(() => null);
+    const rows = await listRedZoneLeads(pool, { limit: Number(req.query.limit) || 100 });
+    res.json(rows.map((r) => formatLead(r, settings)));
+  } catch (err) {
+    next(err);
+  }
+});
+
+leadsRouter.get('/performance-report', authenticate, async (req, res, next) => {
+  try {
+    if (!canManageLeads(req.auth.role) && req.auth.role !== 'employee') {
+      const e = new Error('Insufficient permissions');
+      e.status = 403;
+      throw e;
+    }
+    if (req.auth.role === 'employee') {
+      const pool = getPool();
+      const scope = await resolveEmployeeLeadScope(pool, req.auth.userId);
+      if (scope.scope !== 'team') {
+        const e = new Error('Insufficient permissions');
+        e.status = 403;
+        throw e;
+      }
+    }
+    const pool = getPool();
+    const report = await getLeadPerformanceReport(pool);
+    res.json(report);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** Cron / ops hook: process TAT misses and reassign. */
+leadsRouter.post('/cron/tat-reassign', async (req, res, next) => {
+  try {
+    const secret = process.env.LEAD_TAT_CRON_SECRET || process.env.ENGAGEMENT_CRON_SECRET;
+    const header = req.get('X-Lead-Tat-Cron-Secret') || req.get('X-Engagement-Cron-Secret') || req.query.secret;
+    const isAuthedStaff = (() => {
+      try {
+        const auth = req.headers.authorization || '';
+        if (!auth.startsWith('Bearer ')) return false;
+        const payload = verifyAccessToken(auth.slice(7));
+        return payload && canManageLeads(payload.role);
+      } catch {
+        return false;
+      }
+    })();
+    if ((!secret || header !== secret) && !isAuthedStaff) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    const pool = getPool();
+    const result = await processTatMissReassignments(pool, {
+      limit: Math.min(200, Math.max(1, parseInt(req.body?.limit || req.query.limit, 10) || 50)),
+    });
+    res.json({ ok: true, ...result });
   } catch (err) {
     next(err);
   }
@@ -935,6 +1096,12 @@ leadsRouter.get('/export.csv', authenticate, async (req, res, next) => {
       'Assigned To',
       'Assigned Code',
       'Assigned Role',
+      'Assignment Method',
+      'First Contact Due At',
+      'First Contact At',
+      'First Contact Channel',
+      'TAT Minutes',
+      'TAT Status',
       'Consent Accepted',
       'Consent Verified At',
       'Created At',
@@ -954,6 +1121,12 @@ leadsRouter.get('/export.csv', authenticate, async (req, res, next) => {
       row.assignee_name,
       row.assignee_code,
       row.assignee_role,
+      row.assignment_method,
+      row.first_contact_due_at,
+      row.first_contact_at,
+      row.first_contact_channel,
+      row.tat_minutes,
+      row.tat_status,
       row.consent_accepted ? 'Yes' : 'No',
       row.consent_verified_at,
       row.created_at,
@@ -981,6 +1154,10 @@ leadsRouter.get('/', authenticate, async (req, res, next) => {
 
     await ensureOnboardingSchema();
     const pool = getPool();
+    await ensureLeadAssignmentSchema(pool).catch(() => {});
+    await processTatMissReassignments(pool, { limit: 25 }).catch(() => null);
+    const tatSettings = await getLeadAssignmentSettings(pool).catch(() => null);
+
     const assignedFilter = req.query.assignedTo || req.query.assigned_to;
     const monthFilter = String(req.query.month || '').trim();
     const dateFrom = String(req.query.dateFrom || req.query.date_from || '').trim();
@@ -997,13 +1174,26 @@ leadsRouter.get('/', authenticate, async (req, res, next) => {
         e.status = 400;
         throw e;
       }
+    } else if (assignedFilter === 'team' && role === 'employee') {
+      // L2/L3 supervisors see all leads (same visibility as admin for ops follow-up).
+      const scope = await resolveEmployeeLeadScope(pool, req.auth.userId);
+      if (scope.scope !== 'team') {
+        where.push('ml.assigned_to = :userId');
+        params.userId = req.auth.userId;
+      }
+    } else if (!assignedFilter && role === 'employee') {
+      // Default employee view: L1 = mine; L2/L3 = all (shared visibility with admin).
+      const scope = await resolveEmployeeLeadScope(pool, req.auth.userId);
+      if (scope.scope === 'assigned') {
+        where.push('ml.assigned_to = :userId');
+        params.userId = req.auth.userId;
+      }
     }
 
     if (monthFilter) {
       if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(monthFilter)) {
         return res.status(400).json({ error: 'month must be in YYYY-MM format' });
       }
-      // Calendar month in India time — matches the admin date pickers users expect.
       where.push(
         `to_char(GREATEST(ml.created_at, ml.updated_at) AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM') = :monthFilter`,
       );
@@ -1030,7 +1220,7 @@ leadsRouter.get('/', authenticate, async (req, res, next) => {
       params.dateTo = dateTo;
     }
     const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
-    const limitSql = canManageLeads(role) ? 'LIMIT 5000' : 'LIMIT 200';
+    const limitSql = canManageLeads(role) ? 'LIMIT 5000' : 'LIMIT 500';
 
     const [rows] = await pool.execute(
       `SELECT ml.*,
@@ -1046,13 +1236,22 @@ leadsRouter.get('/', authenticate, async (req, res, next) => {
        ${limitSql}`,
       params,
     );
-    res.json(rows.map(formatLead));
+    res.json(rows.map((row) => formatLead(row, tatSettings)));
   } catch (err) {
     next(err);
   }
 });
 
-const EMPLOYEE_LEAD_STATUSES = new Set(['contacted', 'converted', 'closed', 'in_progress']);
+const EMPLOYEE_LEAD_STATUSES = new Set([
+  'contacted',
+  'interested',
+  'follow_up',
+  'documents_required',
+  'converted',
+  'closed',
+  'in_progress',
+  'lost',
+]);
 
 leadsRouter.patch('/:id/status', authenticate, async (req, res, next) => {
   try {
@@ -1070,7 +1269,12 @@ leadsRouter.patch('/:id/status', authenticate, async (req, res, next) => {
 
     const isAdmin = role === 'admin' || role === 'super_admin' || hasPermission(role, 'manage:*');
     const isAssignee = lead.assigned_to === req.auth.userId;
-    if (!isAdmin && !(role === 'employee' && isAssignee)) {
+    let teamAccess = false;
+    if (role === 'employee' && !isAssignee) {
+      const scope = await resolveEmployeeLeadScope(pool, req.auth.userId);
+      teamAccess = scope.scope === 'team';
+    }
+    if (!isAdmin && !(role === 'employee' && (isAssignee || teamAccess))) {
       const e = new Error('Insufficient permissions');
       e.status = 403;
       throw e;
@@ -1109,6 +1313,7 @@ leadsRouter.patch('/:id/assign', authenticate, async (req, res, next) => {
     }
     const assigneeId = req.body?.assignedTo || req.body?.assigned_to || null;
     const pool = getPool();
+    await ensureLeadAssignmentSchema(pool).catch(() => {});
 
     let sourcedAgentCode = null;
     if (assigneeId) {
@@ -1138,7 +1343,8 @@ leadsRouter.patch('/:id/assign', authenticate, async (req, res, next) => {
         `UPDATE marketing_leads
          SET assigned_to = :assignee,
              status = 'assigned',
-             sourced_agent_code = :code
+             sourced_agent_code = :code,
+             assignment_method = 'manual'
          WHERE id = :id`,
         { id: req.params.id, assignee: assigneeId, code: sourcedAgentCode },
       );
@@ -1146,10 +1352,23 @@ leadsRouter.patch('/:id/assign', authenticate, async (req, res, next) => {
       await pool.execute(
         `UPDATE marketing_leads
          SET assigned_to = :assignee,
-             status = CASE WHEN :assignee IS NULL THEN status ELSE 'assigned' END
+             status = CASE WHEN :assignee IS NULL THEN status ELSE 'assigned' END,
+             assignment_method = CASE WHEN :assignee IS NULL THEN assignment_method ELSE 'manual' END
          WHERE id = :id`,
         { id: req.params.id, assignee: assigneeId },
       );
+    }
+
+    if (assigneeId) {
+      await ensureLeadTatClock(pool, req.params.id).catch(() => {});
+      await recordLeadActivity(pool, {
+        leadId: req.params.id,
+        actorUserId: req.auth.userId,
+        activityType: 'assigned',
+        channel: 'manual',
+        notes: 'Manually assigned',
+        meta: { assigneeId },
+      }).catch(() => {});
     }
 
     const [[row]] = await pool.execute(
@@ -1165,6 +1384,96 @@ leadsRouter.patch('/:id/assign', authenticate, async (req, res, next) => {
       { id: req.params.id },
     );
     res.json(formatLead(row));
+  } catch (err) {
+    next(err);
+  }
+});
+
+async function assertLeadOpsAccess(pool, auth, lead) {
+  const role = auth.role;
+  if (role === 'admin' || role === 'super_admin' || hasPermission(role, 'manage:*')) return;
+  if (role === 'employee') {
+    if (lead.assigned_to === auth.userId) return;
+    const scope = await resolveEmployeeLeadScope(pool, auth.userId);
+    if (scope.scope === 'team') return;
+  }
+  if (role === 'agent' && lead.assigned_to === auth.userId) return;
+  const e = new Error('Insufficient permissions');
+  e.status = 403;
+  throw e;
+}
+
+leadsRouter.post('/:id/contact', authenticate, async (req, res, next) => {
+  try {
+    const role = req.auth.role;
+    if (!canReadLeads(role)) {
+      const e = new Error('Insufficient permissions');
+      e.status = 403;
+      throw e;
+    }
+    const channel = String(req.body?.channel || '').toLowerCase();
+    const notes = req.body?.notes ? String(req.body.notes).slice(0, 2000) : null;
+    const outcome = req.body?.outcome || 'attempted';
+    const templateUsed = req.body?.templateUsed || req.body?.template_used || null;
+    const pool = getPool();
+    const [[lead]] = await pool.execute(`SELECT * FROM marketing_leads WHERE id = :id`, {
+      id: req.params.id,
+    });
+    if (!lead) return res.status(404).json({ error: 'Lead not found' });
+    await assertLeadOpsAccess(pool, req.auth, lead);
+
+    const fresh = await recordLeadContact(pool, {
+      leadId: req.params.id,
+      actorUserId: req.auth.userId,
+      channel,
+      notes,
+      outcome,
+      templateUsed,
+    });
+    const settings = await getLeadAssignmentSettings(pool).catch(() => null);
+    res.json(formatLead(fresh, settings));
+  } catch (err) {
+    next(err);
+  }
+});
+
+leadsRouter.get('/:id/activities', authenticate, async (req, res, next) => {
+  try {
+    const role = req.auth.role;
+    if (!canReadLeads(role)) {
+      const e = new Error('Insufficient permissions');
+      e.status = 403;
+      throw e;
+    }
+    const pool = getPool();
+    const [[lead]] = await pool.execute(`SELECT * FROM marketing_leads WHERE id = :id`, {
+      id: req.params.id,
+    });
+    if (!lead) return res.status(404).json({ error: 'Lead not found' });
+    await assertLeadOpsAccess(pool, req.auth, lead);
+
+    const rows = await listLeadActivities(pool, req.params.id, {
+      limit: Number(req.query.limit) || 50,
+    });
+    res.json(
+      (rows || []).map((r) => ({
+        id: r.id,
+        leadId: r.lead_id,
+        actorUserId: r.actor_user_id,
+        actorName: r.actor_name || null,
+        actorRole: r.actor_role || null,
+        activityType: r.activity_type,
+        channel: r.channel,
+        notes: r.notes,
+        meta:
+          typeof r.meta_json === 'object'
+            ? r.meta_json
+            : r.meta_json
+              ? JSON.parse(r.meta_json)
+              : null,
+        createdAt: r.created_at,
+      })),
+    );
   } catch (err) {
     next(err);
   }

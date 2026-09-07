@@ -1,5 +1,6 @@
 import { newId } from './ids.js';
 import { sqlCastParam, sqlCoalescePatch, sqlParamEquals, sqlParamEqualsLower } from './sqlCollation.js';
+import { autoAssignLeadRoundRobin, ensureLeadAssignmentSchema } from './leadAssignmentEngine.js';
 
 export function normalizeLeadEmail(email) {
   return String(email || '').trim().toLowerCase();
@@ -50,8 +51,11 @@ export async function upsertMarketingLead(
     sessionKey = null,
     status = null,
     applicationId = null,
+    skipAutoAssign = false,
   },
 ) {
+  await ensureLeadAssignmentSchema(pool).catch(() => {});
+
   const normalizedEmail = normalizeLeadEmail(email);
   const normalizedPhone = normalizeLeadPhone(phone);
   const trimmedName = String(fullName || '').trim();
@@ -92,6 +96,10 @@ export async function upsertMarketingLead(
       },
     );
 
+    if (!skipAutoAssign && !existing.assigned_to) {
+      await autoAssignLeadRoundRobin(pool, existing.id).catch(() => null);
+    }
+
     const [[row]] = await pool.execute(`SELECT * FROM marketing_leads WHERE id = :id`, {
       id: existing.id,
     });
@@ -128,6 +136,10 @@ export async function upsertMarketingLead(
       application_id: applicationId || null,
     },
   );
+
+  if (!skipAutoAssign) {
+    await autoAssignLeadRoundRobin(pool, id).catch(() => null);
+  }
 
   const [[row]] = await pool.execute(`SELECT * FROM marketing_leads WHERE id = :id`, { id });
   return { row, created: true };

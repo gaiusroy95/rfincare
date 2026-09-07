@@ -3,7 +3,7 @@ import { resolve } from 'node:path';
 
 import { getPool } from '../db/pool.js';
 import { getUploadDir } from './uploadPaths.js';
-import { buildSimpleTextPdf } from './simplePdf.js';
+import { buildBankLoanApplicationFormPdf } from './bankLoanApplicationFormPdf.js';
 import { sendEmail } from './email.js';
 import { sendMsg91TransactionalSms } from './msg91.js';
 import { writeAuditLog } from './audit.js';
@@ -25,18 +25,6 @@ function field(data, camel, snake) {
   return data[camel] ?? data[snake];
 }
 
-function formatInr(value) {
-  const n = Number.parseFloat(value);
-  if (!Number.isFinite(n)) return '—';
-  return `₹${Math.round(n).toLocaleString('en-IN')}`;
-}
-
-function formatYesNo(value) {
-  if (value === 'yes' || value === true) return 'Yes';
-  if (value === 'no' || value === false) return 'No';
-  return value == null || value === '' ? '—' : String(value);
-}
-
 function applicantName(data, row) {
   const parts = [
     field(data, 'title', 'title'),
@@ -46,104 +34,6 @@ function applicantName(data, row) {
   ].filter(Boolean);
   if (parts.length) return parts.join(' ');
   return row.customer_full_name || '—';
-}
-
-function buildApplicationPdfLines({ row, data, documents, consents }) {
-  const submittedAt = row.submitted_at
-    ? new Date(row.submitted_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
-    : new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
-
-  const lines = [
-    'Rfincare — Loan Application Package',
-    'CONFIDENTIAL — Generated on final submission',
-    '',
-    'APPLICATION REFERENCE',
-    `Application ID: ${row.application_number || row.id}`,
-    `Internal ID: ${row.id}`,
-    `Status: Submitted Successfully`,
-    `Submitted at: ${submittedAt}`,
-    `Tracking ref: ${row.application_number || row.id}`,
-    '',
-    'APPLICANT DETAILS',
-    `Name: ${applicantName(data, row)}`,
-    `Email: ${field(data, 'email', 'email') || row.customer_email || '—'}`,
-    `Phone: ${field(data, 'phone', 'phone') || '—'}`,
-    `Date of birth: ${field(data, 'dateOfBirth', 'date_of_birth') || '—'}`,
-    `PAN: ${field(data, 'pan', 'pan_number') || field(data, 'panNumber', 'pan_number') || '—'}`,
-    `Aadhaar: ${field(data, 'aadhaar', 'aadhaar_number') || '—'}`,
-    '',
-    'ADDRESS',
-    `Line 1: ${field(data, 'addressLine1', 'address_line1') || '—'}`,
-    `Line 2: ${field(data, 'addressLine2', 'address_line2') || '—'}`,
-    `City: ${field(data, 'city', 'city') || '—'}`,
-    `District: ${field(data, 'district', 'district') || '—'}`,
-    `State: ${field(data, 'state', 'state') || '—'}`,
-    `PIN: ${field(data, 'pinCode', 'pin_code') || '—'}`,
-    '',
-    'EMPLOYMENT & INCOME',
-    `Employment type: ${field(data, 'employmentType', 'employment_type') || '—'}`,
-    `Employer / Business: ${field(data, 'employerName', 'employer_name') || '—'}`,
-    `Job title: ${field(data, 'jobTitle', 'job_title') || '—'}`,
-    `Annual income: ${formatInr(field(data, 'annualIncome', 'annual_income'))}`,
-    `Monthly income: ${formatInr(field(data, 'monthlyIncome', 'monthly_income'))}`,
-    '',
-    'LOAN / PRODUCT DETAILS',
-    `Loan purpose: ${field(data, 'loanPurpose', 'loan_purpose') || row.loan_type || '—'}`,
-    `Requested amount: ${formatInr(
-      field(data, 'loanAmount', 'loan_amount')
-        ?? field(data, 'requestedLoanAmount', 'requested_loan_amount'),
-    )}`,
-    `Credit score range: ${field(data, 'creditScoreRange', 'credit_score_range') || '—'}`,
-    `Total monthly EMI: ${formatInr(field(data, 'monthlyDebtPayments', 'monthly_debt_payments'))}`,
-    `Preferred bank: ${field(data, 'preferredBankName', 'preferred_bank_name') || '—'}`,
-    '',
-    'DECLARATIONS & CONSENTS',
-    `Certify accuracy: ${formatYesNo(field(data, 'certifyAccuracy', 'certify_accuracy'))}`,
-    `Authorize credit check: ${formatYesNo(field(data, 'authorizeCredit', 'authorize_credit'))}`,
-    `Agree to terms: ${formatYesNo(field(data, 'agreeTerms', 'agree_terms'))}`,
-    `Electronic signature: ${formatYesNo(field(data, 'consentSignatureAgreed', 'consent_signature_agreed'))}`,
-    `Signature method: ${field(data, 'signatureMethod', 'signature_method') || field(data, 'submitAuthMethod', 'submit_auth_method') || '—'}`,
-    `Signed by: ${field(data, 'signatureName', 'signature_name') || applicantName(data, row)}`,
-    `Signed at: ${field(data, 'signatureSignedAt', 'signature_signed_at') || submittedAt}`,
-  ];
-
-  if (row.sourced_agent_code || row.agent_id) {
-    lines.push('', 'AGENT / PARTNER');
-    lines.push(`Agent code: ${row.sourced_agent_code || '—'}`);
-    lines.push(`Agent ID: ${row.agent_id || '—'}`);
-  }
-
-  const existingLoans = data.existing_loans || data.existingLoans;
-  if (Array.isArray(existingLoans) && existingLoans.length) {
-    lines.push('', 'EXISTING LOANS / EMI');
-    existingLoans.forEach((loan, index) => {
-      lines.push(
-        `${index + 1}. ${loan.loan_type || loan.loanType || 'Loan'} — EMI ${formatInr(loan.emi_amount ?? loan.emiAmount)}`,
-      );
-    });
-  }
-
-  if (consents?.length) {
-    lines.push('', 'RECORDED CONSENTS');
-    consents.forEach((c) => {
-      lines.push(`- ${c.consent_type}: ${c.is_granted ? 'Yes' : 'No'}`);
-    });
-  }
-
-  if (documents?.length) {
-    lines.push('', 'UPLOADED SUPPORTING DOCUMENTS');
-    documents.forEach((doc) => {
-      lines.push(`- ${doc.document_type}: ${doc.document_name || 'uploaded'}`);
-    });
-  }
-
-  lines.push(
-    '',
-    '— End of application package —',
-    'For assistance: support@rfincare.com | +91-7696664657',
-  );
-
-  return lines;
 }
 
 export async function finalizeApplicationSubmission({
@@ -178,8 +68,12 @@ export async function finalizeApplicationSubmission({
     { id: applicationId },
   );
 
-  const pdfLines = buildApplicationPdfLines({ row, data, documents, consents });
-  const pdfBuffer = buildSimpleTextPdf(pdfLines);
+  const pdfBuffer = await buildBankLoanApplicationFormPdf({
+    row,
+    data,
+    documents,
+    consents,
+  });
 
   const packageDir = resolve(getUploadDir(), 'application-packages');
   mkdirSync(packageDir, { recursive: true });
