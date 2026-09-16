@@ -913,7 +913,9 @@ authRouter.post('/forgot-password/request-otp', async (req, res, next) => {
       ...generic,
       channel,
       destination,
-      ...(process.env.LOG_OTP === 'true' ? { devOtp: otp } : {}),
+      ...(process.env.LOG_OTP === 'true' && process.env.NODE_ENV !== 'production'
+        ? { devOtp: otp }
+        : {}),
     });
   } catch (err) {
     if (err?.name === 'ZodError') {
