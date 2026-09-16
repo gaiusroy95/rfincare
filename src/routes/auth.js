@@ -731,78 +731,156 @@ authRouter.post('/password-reset/confirm', authenticate, async (req, res, next) 
   }
 });
 
+const ForgotPasswordLookupSchema = z.object({
+  email: z.string().email(),
+  portal: z.enum(['customer', 'agent', 'employee', 'admin']).optional(),
+});
+
 const ForgotPasswordRequestSchema = z.object({
   email: z.string().email(),
   channel: z.enum(['email', 'sms', 'whatsapp']).default('email'),
+  portal: z.enum(['customer', 'agent', 'employee', 'admin']).optional(),
 });
 
 const ForgotPasswordConfirmSchema = z.object({
   email: z.string().email(),
-  otp: z.string().length(6),
+  otp: z.string().regex(/^\d{6}$/, 'OTP must be 6 digits'),
   newPassword: z.string().min(8),
+  portal: z.enum(['customer', 'agent', 'employee', 'admin']).optional(),
 });
 
 /**
  * PUBLIC FORGOT PASSWORD (unauthenticated)
+ * 1) lookup → available channels (email / SMS / WhatsApp) with masked destinations
+ * 2) request-otp → send OTP on chosen channel
+ * 3) confirm → verify OTP + set new password
  */
-authRouter.post('/forgot-password/request-otp', async (req, res, next) => {
+authRouter.post('/forgot-password/lookup', async (req, res, next) => {
   try {
-    const input = ForgotPasswordRequestSchema.parse(req.body);
+    const {
+      normalizeForgotEmail,
+      normalizeForgotPhone,
+      portalAllowsRole,
+      buildForgotChannels,
+      maskEmail,
+    } = await import('../lib/forgotPassword.js');
+
+    const input = ForgotPasswordLookupSchema.parse(req.body);
+    const email = normalizeForgotEmail(input.email);
     const pool = getPool();
 
     const [[user]] = await pool.execute(
-      `SELECT au.id, up.phone
+      `SELECT au.id, up.phone, up.role, up.is_active, up.account_status
        FROM auth_users au
        LEFT JOIN user_profiles up ON up.id = au.id
-       WHERE au.email = :email LIMIT 1`,
-      { email: input.email.toLowerCase() },
+       WHERE LOWER(au.email) = :email
+       LIMIT 1`,
+      { email },
     );
 
-    // Always return success to avoid email enumeration.
-    if (!user) {
-      return res.json({
-        success: true,
-        message: 'If an account exists, an OTP has been sent.',
-        expiresInSeconds: 600,
-      });
-    }
+    const inactive =
+      user
+      && (
+        user.is_active === false
+        || user.is_active === 0
+        || ['suspended', 'inactive', 'terminated', 'locked'].includes(
+          String(user.account_status || '').toLowerCase(),
+        )
+      );
 
-    const phone = user.phone ? String(user.phone).replace(/\D/g, '').slice(-10) : null;
+    const roleOk = user && portalAllowsRole(input.portal, user.role);
+    const usable = Boolean(user && roleOk && !inactive);
+    const phone = usable ? normalizeForgotPhone(user.phone) : '';
 
-    if (input.channel !== 'email' && !phone) {
-      // Still avoid confirming account existence for wrong channel; fall back to email if possible.
-      if (input.email) {
-        const otp = generateOtp();
-        const id = newId();
-        const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
-        await pool.execute(
-          `INSERT INTO lead_otps (id, lead_id, email, phone, otp_hash, purpose, channel, expires_at)
-           VALUES (:id, NULL, :email, NULL, :hash, 'password_reset', 'email', :exp)`,
+    // Anti-enumeration: always return a channel list. Unknown/wrong-role accounts
+    // only expose email (masked from the typed address).
+    const channels = usable
+      ? buildForgotChannels({ email, phone })
+      : [
           {
-            id,
-            email: input.email.toLowerCase(),
-            hash: hashOtp(otp),
-            exp: expiresAt,
+            id: 'email',
+            label: 'Email',
+            description: 'Send OTP to registered email',
+            masked: maskEmail(email),
           },
-        );
-        await sendOtpNotification({
-          email: input.email.toLowerCase(),
-          otp,
-          channel: 'email',
-        });
-        return res.json({
-          success: true,
-          message: 'If an account exists, an OTP has been sent.',
-          expiresInSeconds: 600,
-          ...(process.env.LOG_OTP === 'true' ? { devOtp: otp } : {}),
-        });
-      }
-      return res.json({
-        success: true,
-        message: 'If an account exists, an OTP has been sent.',
-        expiresInSeconds: 600,
-      });
+        ];
+
+    res.json({
+      success: true,
+      email,
+      channels,
+      message: 'Choose where we should send your verification OTP.',
+    });
+  } catch (err) {
+    if (err?.name === 'ZodError') {
+      err.status = 400;
+      err.message = err.issues?.[0]?.message || 'Invalid request';
     }
+    next(err);
+  }
+});
+
+authRouter.post('/forgot-password/request-otp', async (req, res, next) => {
+  try {
+    const {
+      normalizeForgotEmail,
+      normalizeForgotPhone,
+      portalAllowsRole,
+      assertForgotRequestAllowed,
+      maskEmail,
+      maskPhone,
+    } = await import('../lib/forgotPassword.js');
+
+    const input = ForgotPasswordRequestSchema.parse(req.body);
+    const email = normalizeForgotEmail(input.email);
+    const pool = getPool();
+
+    assertForgotRequestAllowed(email);
+
+    const [[user]] = await pool.execute(
+      `SELECT au.id, up.phone, up.role, up.is_active, up.account_status
+       FROM auth_users au
+       LEFT JOIN user_profiles up ON up.id = au.id
+       WHERE LOWER(au.email) = :email
+       LIMIT 1`,
+      { email },
+    );
+
+    const generic = {
+      success: true,
+      message: 'If an account exists for this portal, an OTP has been sent.',
+      expiresInSeconds: 600,
+    };
+
+    const inactive =
+      user
+      && (
+        user.is_active === false
+        || user.is_active === 0
+        || ['suspended', 'inactive', 'terminated', 'locked'].includes(
+          String(user.account_status || '').toLowerCase(),
+        )
+      );
+
+    if (!user || !portalAllowsRole(input.portal, user.role) || inactive) {
+      return res.json(generic);
+    }
+
+    const phone = normalizeForgotPhone(user.phone);
+    let channel = input.channel;
+    if (channel !== 'email' && !phone) {
+      channel = 'email';
+    }
+
+    // Invalidate prior unused reset OTPs for this email.
+    await pool.execute(
+      `UPDATE lead_otps
+       SET verified_at = NOW()
+       WHERE email = :email
+         AND purpose = 'password_reset'
+         AND verified_at IS NULL`,
+      { email },
+    ).catch(() => {});
 
     const otp = generateOtp();
     const id = newId();
@@ -813,25 +891,28 @@ authRouter.post('/forgot-password/request-otp', async (req, res, next) => {
        VALUES (:id, NULL, :email, :phone, :hash, 'password_reset', :channel, :exp)`,
       {
         id,
-        email: input.email.toLowerCase(),
-        phone,
+        email,
+        phone: phone || null,
         hash: hashOtp(otp),
-        channel: input.channel,
+        channel,
         exp: expiresAt,
       },
     );
 
     await sendOtpNotification({
-      email: input.email.toLowerCase(),
-      phone,
+      email,
+      phone: phone || undefined,
       otp,
-      channel: input.channel,
+      channel,
     });
 
+    const destination =
+      channel === 'email' ? maskEmail(email) : maskPhone(phone) || maskEmail(email);
+
     res.json({
-      success: true,
-      message: 'If an account exists, an OTP has been sent.',
-      expiresInSeconds: 600,
+      ...generic,
+      channel,
+      destination,
       ...(process.env.LOG_OTP === 'true' ? { devOtp: otp } : {}),
     });
   } catch (err) {
@@ -845,15 +926,27 @@ authRouter.post('/forgot-password/request-otp', async (req, res, next) => {
 
 authRouter.post('/forgot-password/confirm', async (req, res, next) => {
   try {
+    const {
+      normalizeForgotEmail,
+      portalAllowsRole,
+      assertPasswordStrength,
+      assertForgotConfirmAllowed,
+      clearForgotConfirmAttempts,
+    } = await import('../lib/forgotPassword.js');
+
     const input = ForgotPasswordConfirmSchema.parse(req.body);
+    const email = normalizeForgotEmail(input.email);
     const pool = getPool();
+
+    assertPasswordStrength(input.newPassword);
+    assertForgotConfirmAllowed(email);
 
     const [[otpRow]] = await pool.execute(
       `SELECT id FROM lead_otps
        WHERE email = :email AND otp_hash = :hash
          AND purpose = 'password_reset' AND verified_at IS NULL AND expires_at > NOW()
        ORDER BY created_at DESC LIMIT 1`,
-      { email: input.email.toLowerCase(), hash: hashOtp(input.otp) },
+      { email, hash: hashOtp(input.otp) },
     );
 
     if (!otpRow) {
@@ -861,11 +954,15 @@ authRouter.post('/forgot-password/confirm', async (req, res, next) => {
     }
 
     const [[user]] = await pool.execute(
-      `SELECT id FROM auth_users WHERE email = :email LIMIT 1`,
-      { email: input.email.toLowerCase() },
+      `SELECT au.id, up.role, up.is_active, up.account_status
+       FROM auth_users au
+       LEFT JOIN user_profiles up ON up.id = au.id
+       WHERE LOWER(au.email) = :email
+       LIMIT 1`,
+      { email },
     );
-    if (!user) {
-      return res.status(404).json({ error: 'Account not found' });
+    if (!user || !portalAllowsRole(input.portal, user.role)) {
+      return res.status(404).json({ error: 'Account not found for this portal' });
     }
 
     const hashed = await bcrypt.hash(input.newPassword, 12);
@@ -873,13 +970,34 @@ authRouter.post('/forgot-password/confirm', async (req, res, next) => {
       ph: hashed,
       id: user.id,
     });
-    await pool.execute(`UPDATE lead_otps SET verified_at = NOW() WHERE id = :id`, { id: otpRow.id });
+    await pool.execute(
+      `UPDATE lead_otps SET verified_at = NOW()
+       WHERE email = :email AND purpose = 'password_reset' AND verified_at IS NULL`,
+      { email },
+    );
     await pool.execute(
       `UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = :id AND revoked_at IS NULL`,
       { id: user.id },
-    );
+    ).catch(() => {});
 
-    res.json({ success: true, message: 'Password reset successfully. Please sign in with your new password.' });
+    clearForgotConfirmAttempts(email);
+
+    try {
+      await writeAuditLog({
+        userId: user.id,
+        actionType: 'password_reset_forgot',
+        tableName: 'auth_users',
+        recordId: user.id,
+        newValues: { portal: input.portal || null, method: 'otp' },
+      });
+    } catch {
+      /* audit is best-effort */
+    }
+
+    res.json({
+      success: true,
+      message: 'Password reset successfully. Please sign in with your new password.',
+    });
   } catch (err) {
     if (err?.name === 'ZodError') {
       err.status = 400;
