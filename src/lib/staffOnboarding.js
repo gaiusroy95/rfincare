@@ -8,6 +8,7 @@ import { sendStaffWelcomeEmail } from './email.js';
 import { reserveUniqueAgentCode } from './agentCode.js';
 import { ensureAgentOnboardingQcSchema } from '../db/ensureMilestone4Schema.js';
 import { releaseRejectedAgentCredentials } from './releaseRejectedStaffCredentials.js';
+import { upsertAgentHierarchyMatrix } from './hierarchyMatrix.js';
 
 const baseStaffFields = {
   username: z.string().min(3).max(128),
@@ -54,6 +55,11 @@ function normalizeBody(body = {}) {
     employeeCode: body.employeeCode ?? body.employee_code,
     panNumber: body.panNumber ?? body.pan_number,
     photoDataUrl: body.photoDataUrl ?? body.photo_data_url,
+    level1EmployeeUserId: body.level1EmployeeUserId ?? body.level1_employee_user_id,
+    level2EmployeeUserId: body.level2EmployeeUserId ?? body.level2_employee_user_id,
+    level3EmployeeUserId: body.level3EmployeeUserId ?? body.level3_employee_user_id,
+    level4EmployeeUserId: body.level4EmployeeUserId ?? body.level4_employee_user_id,
+    hierarchyNotes: body.hierarchyNotes ?? body.hierarchy_notes ?? body.notes,
   };
 }
 
@@ -121,6 +127,25 @@ export async function createAgentAccount(input, createdByUserId, options = {}) {
     );
 
     await conn.commit();
+
+    const levelEmployees = {
+      1: data.level1EmployeeUserId || null,
+      2: data.level2EmployeeUserId || null,
+      3: data.level3EmployeeUserId || null,
+      4: data.level4EmployeeUserId || null,
+    };
+    if (Object.values(levelEmployees).some(Boolean)) {
+      try {
+        await upsertAgentHierarchyMatrix(pool, {
+          agentUserId: userId,
+          levelEmployees,
+          notes: data.hierarchyNotes || null,
+          createdBy: createdByUserId,
+        });
+      } catch (hierErr) {
+        console.warn('[createAgentAccount] hierarchy mapping skipped:', hierErr.message || hierErr);
+      }
+    }
 
     const [[row]] = await pool.execute(
       `SELECT up.*, ao.agent_code, ao.username, ao.onboarding_status AS ao_status
