@@ -177,6 +177,20 @@ portalAgentApplicationsRouter.post("/applications", async (req, res, next) => {
        WHERE la.id = :id LIMIT 1`,
       { id }
     );
+    try {
+      const { attachAttributionToApplication, attachAttributionToUser } = await import("../lib/referralEngine.js");
+      await attachAttributionToUser(pool, customerId, {
+        referralCode: meta.agentCode,
+        referralProgram: "customer",
+        sourcedAgentCode: meta.agentCode
+      });
+      await attachAttributionToApplication(pool, id, {
+        referralCode: meta.agentCode,
+        sourcedAgentCode: meta.agentCode,
+        customerId
+      });
+    } catch {
+    }
     res.status(201).json({
       id: row.id,
       applicationNumber: row.application_number,
@@ -218,6 +232,18 @@ portalAgentApplicationsRouter.patch("/applications/:id", async (req, res, next) 
         data: JSON.stringify({ ...mergedData, ...rest })
       }
     );
+    try {
+      const statusLower = String(status || "").toLowerCase();
+      if (statusLower === "disbursed" || statusLower === "approved") {
+        const { evaluateReferralPayout } = await import("../lib/referralEngine.js");
+        await evaluateReferralPayout(pool, req.params.id);
+      } else if (statusLower === "submitted") {
+        const { attachAttributionToApplication, advanceAttributionLifecycle } = await import("../lib/referralEngine.js");
+        const attr = await attachAttributionToApplication(pool, req.params.id, {});
+        if (attr?.id) await advanceAttributionLifecycle(pool, attr.id, "submitted");
+      }
+    } catch {
+    }
     res.json({ ok: true, id: req.params.id });
   } catch (err) {
     next(err);
@@ -254,6 +280,12 @@ portalAgentApplicationsRouter.post("/applications/:id/submit", async (req, res, 
       submittedByRole: "agent",
       clientIp
     });
+    try {
+      const { attachAttributionToApplication, advanceAttributionLifecycle } = await import("../lib/referralEngine.js");
+      const attr = await attachAttributionToApplication(pool, req.params.id, {});
+      if (attr?.id) await advanceAttributionLifecycle(pool, attr.id, "submitted");
+    } catch {
+    }
     res.json({ ok: true, id: req.params.id, status: "submitted", confirmation });
   } catch (err) {
     next(err);

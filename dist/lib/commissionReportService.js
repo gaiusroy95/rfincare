@@ -80,11 +80,12 @@ async function buildAgentCommissionReport(agentId, filters = {}) {
     params
   );
   const generatedAt = (/* @__PURE__ */ new Date()).toISOString();
-  const entries = rows.map((row) => {
+  const appEntries = rows.map((row) => {
     const data = parseJson(row.data);
     const loanType = data.loan_type || data.loan_purpose || row.loan_type;
     const comm = computeRowCommission(row, config);
     return {
+      source: "loan_application",
       applicationNumber: row.application_number,
       customerName: row.customer_name,
       loanType,
@@ -102,7 +103,59 @@ async function buildAgentCommissionReport(agentId, filters = {}) {
       generatedAt
     };
   });
-  return { generatedAt, entries, config };
+  let ledgerEntries = [];
+  try {
+    const { ensureReferralEngineSchema, listReferralTransactions } = await import("./referralEngine.js");
+    await ensureReferralEngineSchema(pool);
+    const ledgerRows = await listReferralTransactions(pool, {
+      referrerUserId: agentId,
+      referralType: "agent",
+      from: filters.from || void 0,
+      to: filters.to || void 0,
+      limit: 1e3
+    });
+    const billable = ledgerRows.filter(
+      (r) => ["approved", "payable", "paid"].includes(String(r.payment_status || ""))
+    );
+    const allLedger = ledgerRows;
+    const appNumbers = new Set(appEntries.map((e) => e.applicationNumber).filter(Boolean));
+    ledgerEntries = billable.filter((r) => !r.application_number || !appNumbers.has(r.application_number)).map((r) => ({
+      source: "referral_ledger",
+      applicationNumber: r.application_number || r.public_id,
+      customerName: r.referrer_name || "Referral",
+      loanType: r.product || "referral",
+      applicationStatus: "disbursed",
+      commissionStatus: r.payment_status === "paid" ? "paid" : "payable",
+      disbursedAmount: Number(r.disbursed_amount || 0),
+      disbursedAt: r.created_at,
+      commissionRatePercent: r.commission_rate != null ? Number(r.commission_rate) : 0,
+      grossCommission: Number(r.commission_amount || 0),
+      tdsAmount: Number(r.tds_amount || 0),
+      netPayout: Number(r.net_amount || 0),
+      agentCode: null,
+      agentName: null,
+      createdAt: r.created_at,
+      generatedAt,
+      paymentStatus: r.payment_status,
+      referralTransactionId: r.id
+    }));
+    const ledgerByApp = new Map(
+      allLedger.filter((r) => r.application_number).map((r) => [r.application_number, r])
+    );
+    for (const entry of appEntries) {
+      const lr = ledgerByApp.get(entry.applicationNumber);
+      if (!lr) continue;
+      entry.source = "referral_ledger";
+      entry.grossCommission = Number(lr.commission_amount || entry.grossCommission);
+      entry.tdsAmount = Number(lr.tds_amount || entry.tdsAmount);
+      entry.netPayout = Number(lr.net_amount || entry.netPayout);
+      entry.disbursedAmount = Number(lr.disbursed_amount || entry.disbursedAmount);
+      entry.commissionStatus = lr.payment_status === "paid" ? "paid" : ["approved", "payable"].includes(lr.payment_status) ? "payable" : entry.commissionStatus;
+      entry.referralTransactionId = lr.id;
+    }
+  } catch {
+  }
+  return { generatedAt, entries: [...appEntries, ...ledgerEntries], config, filters };
 }
 function commissionReportToCsv(report) {
   const header = [

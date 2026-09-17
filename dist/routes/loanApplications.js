@@ -11,6 +11,7 @@ import { writeAuditLog } from "../lib/audit.js";
 import { requireSuccessfulCibilForSubmit } from "../lib/cibilService.js";
 import { dispatchFileUpdateNotification } from "../lib/fileNotificationService.js";
 import { buildSimpleTextPdf } from "../lib/simplePdf.js";
+import { buildBankLoanApplicationFormPdf } from "../lib/bankLoanApplicationFormPdf.js";
 import { finalizeApplicationSubmission } from "../lib/applicationSubmissionService.js";
 import {
   assertEmployeeAccess,
@@ -659,6 +660,30 @@ loanApplicationsRouter.post(
         }
       );
       const row = await fetchApplicationById(pool, id);
+      try {
+        const { attachAttributionToApplication } = await import("../lib/referralEngine.js");
+        await attachAttributionToApplication(pool, id, body);
+      } catch {
+      }
+      try {
+        const [[profile]] = await pool.execute(
+          `SELECT full_name, email, phone FROM user_profiles WHERE id = :id LIMIT 1`,
+          { id: customerId }
+        );
+        const dataObj = typeof payload === "object" ? payload : {};
+        const { upsertMarketingLead } = await import("../lib/marketingLeads.js");
+        await upsertMarketingLead(pool, {
+          fullName: profile?.full_name || dataObj.full_name || dataObj.fullName || null,
+          email: profile?.email || dataObj.email || null,
+          phone: profile?.phone || dataObj.phone || dataObj.mobile || null,
+          loanType: dataObj.loan_type || dataObj.loanType || body.loan_type || null,
+          source: "application_start",
+          consentAccepted: true,
+          status: "application_in_progress",
+          applicationId: id
+        });
+      } catch {
+      }
       res.status(201).json(formatApplication(row));
     } catch (err) {
       next(err);
@@ -837,6 +862,26 @@ loanApplicationsRouter.patch(
         await autoAssignApplicationsForEmployeeVerification(pool);
       }
       const row = await fetchApplicationById(pool, req.params.id);
+      try {
+        const statusLower = String(statusValue || row.status || "").toLowerCase();
+        if (statusValue) {
+          const { attachAttributionToApplication, advanceAttributionLifecycle, evaluateReferralPayout } = await import("../lib/referralEngine.js");
+          await attachAttributionToApplication(pool, req.params.id, {
+            sourcedAgentCode: sourced_agent_code || row.sourced_agent_code
+          });
+          if (row.referral_id) {
+            if (statusLower === "submitted" || statusLower === "under_review") {
+              await advanceAttributionLifecycle(pool, row.referral_id, "submitted");
+            } else if (statusLower === "approved") {
+              await advanceAttributionLifecycle(pool, row.referral_id, "approved");
+            }
+          }
+          if (statusLower === "disbursed" || statusLower === "approved") {
+            await evaluateReferralPayout(pool, req.params.id);
+          }
+        }
+      } catch {
+      }
       if ((document_stage_status || bank_approval_status) && existing.status === "submitted" && existing.submitted_at) {
         dispatchFileUpdateNotification("application_stage_after_bank", {
           applicationId: req.params.id,
@@ -876,53 +921,70 @@ loanApplicationsRouter.get("/:id/summary-pdf", authenticate, async (req, res, ne
     if (!row) return res.status(404).json({ error: "Not found" });
     const isOwner = row.customer_id === req.auth.userId;
     const isStaff = STAFF_ROLES.has(req.auth.role);
-    if (!isOwner && !isStaff) return res.status(403).json({ error: "Forbidden" });
+    const isAgent = req.auth.role === "agent" && row.agent_id === req.auth.userId;
+    if (!isOwner && !isStaff && !isAgent) return res.status(403).json({ error: "Forbidden" });
     const data = parseJson(row.data);
-    if (data.application_package_pdf) {
-      const { resolveUploadFilePath } = await import("../lib/uploadPaths.js");
-      const { createReadStream, existsSync } = await import("node:fs");
-      const filePath = resolveUploadFilePath(data.application_package_pdf.replace(/^\/uploads\//, ""));
-      if (existsSync(filePath)) {
-        res.setHeader("Content-Type", "application/pdf");
-        res.setHeader(
-          "Content-Disposition",
-          `inline; filename="application-${row.application_number || row.id}.pdf"`
-        );
-        const stream = createReadStream(filePath);
-        stream.on("error", (streamErr) => {
-          console.warn("[summary-pdf] stored package read failed, will not retry:", streamErr.message);
-          if (!res.headersSent) {
-            next(streamErr);
-          } else {
-            res.destroy(streamErr);
-          }
-        });
-        return stream.pipe(res);
-      }
-      console.warn(
-        `[summary-pdf] stored package missing for application ${row.id}; falling back to generated summary`
-      );
+    const [documents] = await pool.execute(
+      `SELECT document_type, document_name, mime_type, created_at
+       FROM customer_documents WHERE application_id = :id ORDER BY created_at ASC`,
+      { id: row.id }
+    ).catch(() => [[]]);
+    const [consents] = await pool.execute(
+      `SELECT consent_type, is_granted, granted_at
+       FROM application_consents WHERE application_id = :id ORDER BY granted_at ASC`,
+      { id: row.id }
+    ).catch(() => [[]]);
+    let pdf;
+    try {
+      pdf = await buildBankLoanApplicationFormPdf({
+        row,
+        data,
+        documents: documents || [],
+        consents: consents || []
+      });
+    } catch (pdfErr) {
+      console.warn("[summary-pdf] bank form generation failed, falling back:", pdfErr.message);
+      const lines = [
+        "Rfincare — Loan Application Summary (Read-only)",
+        `Application: ${row.application_number || row.id}`,
+        `Status: ${row.status}`,
+        `Submitted: ${row.submitted_at || "—"}`,
+        "",
+        `Name: ${data.firstName || ""} ${data.lastName || ""}`.trim(),
+        `Email: ${data.email || row.customer_email || "—"}`,
+        `Phone: ${data.phone || data.mobile || "—"}`,
+        `Loan type: ${data.loan_type || data.loan_purpose || "—"}`,
+        `Amount: ${data.loan_amount || data.requested_loan_amount || "—"}`
+      ];
+      pdf = buildSimpleTextPdf(lines);
     }
-    const lines = [
-      "Rfincare — Loan Application Summary (Read-only)",
-      `Application: ${row.application_number || row.id}`,
-      `Status: ${row.status}`,
-      `Submitted: ${row.submitted_at || "—"}`,
-      "",
-      "NON-EDITABLE FINAL SUBMITTED DETAILS",
-      "For changes contact our helpline or write to support@rfincare.com",
-      "",
-      `Name: ${data.firstName || ""} ${data.lastName || ""}`.trim(),
-      `Email: ${data.email || row.customer_email || "—"}`,
-      `Phone: ${data.phone || data.mobile || "—"}`,
-      `Loan type: ${data.loan_type || data.loan_purpose || "—"}`,
-      `Amount: ${data.loan_amount || data.requested_loan_amount || "—"}`
-    ];
-    const pdf = buildSimpleTextPdf(lines);
+    try {
+      const { mkdirSync, writeFileSync } = await import("node:fs");
+      const { resolve } = await import("node:path");
+      const { getUploadDir } = await import("../lib/uploadPaths.js");
+      const packageDir = resolve(getUploadDir(), "application-packages");
+      mkdirSync(packageDir, { recursive: true });
+      const safeNumber = String(row.application_number || row.id).replace(/[^\w-]/g, "_");
+      const fileName = `${safeNumber}.pdf`;
+      writeFileSync(resolve(packageDir, fileName), pdf);
+      const publicPath = `/uploads/application-packages/${fileName}`;
+      const merged = {
+        ...data,
+        application_package_pdf: publicPath,
+        application_package_generated_at: (/* @__PURE__ */ new Date()).toISOString(),
+        application_package_format: "bank_loan_application_form_v1"
+      };
+      await pool.execute(
+        `UPDATE loan_applications SET data = :data WHERE id = :id`,
+        { id: row.id, data: JSON.stringify(merged) }
+      );
+    } catch (persistErr) {
+      console.warn("[summary-pdf] could not persist package:", persistErr.message);
+    }
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader(
       "Content-Disposition",
-      `inline; filename="application-${row.application_number || row.id}.pdf"`
+      `attachment; filename="Rfincare_Bank_Loan_Application_Form-${row.application_number || row.id}.pdf"`
     );
     res.send(pdf);
   } catch (err) {

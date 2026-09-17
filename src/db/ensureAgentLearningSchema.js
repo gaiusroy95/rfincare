@@ -30,6 +30,8 @@ export async function ensureAgentLearningSchema() {
     )`,
     `ALTER TABLE agent_learning_content ADD COLUMN IF NOT EXISTS audience VARCHAR(16) NOT NULL DEFAULT 'agent'`,
     `ALTER TABLE agent_learning_content ADD COLUMN IF NOT EXISTS category_label VARCHAR(64) NULL`,
+    `ALTER TABLE agent_learning_content ADD COLUMN IF NOT EXISTS file_size_bytes BIGINT NULL`,
+    `ALTER TABLE agent_learning_content ADD COLUMN IF NOT EXISTS thumbnail_url TEXT NULL`,
     `UPDATE agent_learning_content SET audience = 'agent' WHERE audience IS NULL OR TRIM(audience) = ''`,
     `CREATE TABLE IF NOT EXISTS agent_learning_progress (
       id CHAR(36) NOT NULL,

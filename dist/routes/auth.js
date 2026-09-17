@@ -21,7 +21,16 @@ const SignupSchema = z.object({
   password: z.string().min(8),
   fullName: z.string().min(1).optional(),
   phone: z.string().min(6).optional(),
-  role: z.enum(["customer", "agent", "employee", "admin", "super_admin"]).optional()
+  role: z.enum(["customer", "agent", "employee", "admin", "super_admin"]).optional(),
+  referralCode: z.string().trim().max(64).optional(),
+  referral_code: z.string().trim().max(64).optional(),
+  referralProgram: z.enum(["agent", "customer"]).optional(),
+  referral_program: z.enum(["agent", "customer"]).optional(),
+  referralId: z.string().trim().max(64).optional(),
+  referral_id: z.string().trim().max(64).optional(),
+  referralSessionToken: z.string().trim().max(64).optional(),
+  sourcedAgentCode: z.string().trim().max(64).optional(),
+  sourced_agent_code: z.string().trim().max(64).optional()
 });
 const LoginSchema = z.object({
   email: z.string().email(),
@@ -88,6 +97,29 @@ authRouter.post("/signup", async (req, res, next) => {
     );
     if (role === "customer") {
       await assignUniqueCustomerCode(pool, userId);
+    }
+    try {
+      const { attachAttributionToUser } = await import("../lib/referralEngine.js");
+      await attachAttributionToUser(pool, userId, {
+        ...input,
+        email: input.email,
+        phone: input.phone
+      });
+    } catch {
+    }
+    if (role === "customer" && (input.email || input.phone)) {
+      try {
+        const { upsertMarketingLead } = await import("../lib/marketingLeads.js");
+        await upsertMarketingLead(pool, {
+          fullName: input.fullName || null,
+          email: input.email,
+          phone: input.phone || null,
+          source: "signup",
+          consentAccepted: true,
+          status: "new"
+        });
+      } catch {
+      }
     }
     const { accessJwt, refreshJwt } = await issueTokens({ userId, email: input.email, role, req });
     setRefreshCookie(res, refreshJwt);
@@ -371,6 +403,18 @@ authRouter.post("/register-portal", async (req, res, next) => {
         account_name: data.accountName || data.account_name || null
       }
     );
+    try {
+      const { upsertMarketingLead } = await import("../lib/marketingLeads.js");
+      await upsertMarketingLead(pool, {
+        fullName: data.fullName || data.full_name || null,
+        email: data.email,
+        phone: data.phone || null,
+        source: "portal_registration",
+        consentAccepted: true,
+        status: "new"
+      });
+    } catch {
+    }
     res.status(201).json({ id, status: "pending" });
   } catch (err) {
     next(err);
@@ -563,67 +607,116 @@ authRouter.post("/password-reset/confirm", authenticate, async (req, res, next) 
     next(err);
   }
 });
+const ForgotPasswordLookupSchema = z.object({
+  email: z.string().email(),
+  portal: z.enum(["customer", "agent", "employee", "admin"]).optional()
+});
 const ForgotPasswordRequestSchema = z.object({
   email: z.string().email(),
-  channel: z.enum(["email", "sms", "whatsapp"]).default("email")
+  channel: z.enum(["email", "sms", "whatsapp"]).default("email"),
+  portal: z.enum(["customer", "agent", "employee", "admin"]).optional()
 });
 const ForgotPasswordConfirmSchema = z.object({
   email: z.string().email(),
-  otp: z.string().length(6),
-  newPassword: z.string().min(8)
+  otp: z.string().regex(/^\d{6}$/, "OTP must be 6 digits"),
+  newPassword: z.string().min(8),
+  portal: z.enum(["customer", "agent", "employee", "admin"]).optional()
+});
+authRouter.post("/forgot-password/lookup", async (req, res, next) => {
+  try {
+    const {
+      normalizeForgotEmail,
+      normalizeForgotPhone,
+      portalAllowsRole,
+      buildForgotChannels,
+      maskEmail
+    } = await import("../lib/forgotPassword.js");
+    const input = ForgotPasswordLookupSchema.parse(req.body);
+    const email = normalizeForgotEmail(input.email);
+    const pool = getPool();
+    const [[user]] = await pool.execute(
+      `SELECT au.id, up.phone, up.role, up.is_active, up.account_status
+       FROM auth_users au
+       LEFT JOIN user_profiles up ON up.id = au.id
+       WHERE LOWER(au.email) = :email
+       LIMIT 1`,
+      { email }
+    );
+    const inactive = user && (user.is_active === false || user.is_active === 0 || ["suspended", "inactive", "terminated", "locked"].includes(
+      String(user.account_status || "").toLowerCase()
+    ));
+    const roleOk = user && portalAllowsRole(input.portal, user.role);
+    const usable = Boolean(user && roleOk && !inactive);
+    const phone = usable ? normalizeForgotPhone(user.phone) : "";
+    const channels = usable ? buildForgotChannels({ email, phone }) : [
+      {
+        id: "email",
+        label: "Email",
+        description: "Send OTP to registered email",
+        masked: maskEmail(email)
+      }
+    ];
+    res.json({
+      success: true,
+      email,
+      channels,
+      message: "Choose where we should send your verification OTP."
+    });
+  } catch (err) {
+    if (err?.name === "ZodError") {
+      err.status = 400;
+      err.message = err.issues?.[0]?.message || "Invalid request";
+    }
+    next(err);
+  }
 });
 authRouter.post("/forgot-password/request-otp", async (req, res, next) => {
   try {
+    const {
+      normalizeForgotEmail,
+      normalizeForgotPhone,
+      portalAllowsRole,
+      assertForgotRequestAllowed,
+      maskEmail,
+      maskPhone
+    } = await import("../lib/forgotPassword.js");
     const input = ForgotPasswordRequestSchema.parse(req.body);
+    const email = normalizeForgotEmail(input.email);
     const pool = getPool();
+    assertForgotRequestAllowed(email);
     const [[user]] = await pool.execute(
-      `SELECT au.id, up.phone
+      `SELECT au.id, up.phone, up.role, up.is_active, up.account_status
        FROM auth_users au
        LEFT JOIN user_profiles up ON up.id = au.id
-       WHERE au.email = :email LIMIT 1`,
-      { email: input.email.toLowerCase() }
+       WHERE LOWER(au.email) = :email
+       LIMIT 1`,
+      { email }
     );
-    if (!user) {
-      return res.json({
-        success: true,
-        message: "If an account exists, an OTP has been sent.",
-        expiresInSeconds: 600
-      });
+    const generic = {
+      success: true,
+      message: "If an account exists for this portal, an OTP has been sent.",
+      expiresInSeconds: 600
+    };
+    const inactive = user && (user.is_active === false || user.is_active === 0 || ["suspended", "inactive", "terminated", "locked"].includes(
+      String(user.account_status || "").toLowerCase()
+    ));
+    if (!user || !portalAllowsRole(input.portal, user.role) || inactive) {
+      return res.json(generic);
     }
-    const phone = user.phone ? String(user.phone).replace(/\D/g, "").slice(-10) : null;
-    if (input.channel !== "email" && !phone) {
-      if (input.email) {
-        const otp2 = generateOtp();
-        const id2 = newId();
-        const expiresAt2 = new Date(Date.now() + 10 * 60 * 1e3);
-        await pool.execute(
-          `INSERT INTO lead_otps (id, lead_id, email, phone, otp_hash, purpose, channel, expires_at)
-           VALUES (:id, NULL, :email, NULL, :hash, 'password_reset', 'email', :exp)`,
-          {
-            id: id2,
-            email: input.email.toLowerCase(),
-            hash: hashOtp(otp2),
-            exp: expiresAt2
-          }
-        );
-        await sendOtpNotification({
-          email: input.email.toLowerCase(),
-          otp: otp2,
-          channel: "email"
-        });
-        return res.json({
-          success: true,
-          message: "If an account exists, an OTP has been sent.",
-          expiresInSeconds: 600,
-          ...process.env.LOG_OTP === "true" ? { devOtp: otp2 } : {}
-        });
-      }
-      return res.json({
-        success: true,
-        message: "If an account exists, an OTP has been sent.",
-        expiresInSeconds: 600
-      });
+    const phone = normalizeForgotPhone(user.phone);
+    let channel = input.channel;
+    if (channel !== "email" && !phone) {
+      channel = "email";
     }
+    await pool.execute(
+      `UPDATE lead_otps
+       SET verified_at = NOW()
+       WHERE email = :email
+         AND purpose = 'password_reset'
+         AND verified_at IS NULL`,
+      { email }
+    ).catch(() => {
+    });
     const otp = generateOtp();
     const id = newId();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1e3);
@@ -632,24 +725,25 @@ authRouter.post("/forgot-password/request-otp", async (req, res, next) => {
        VALUES (:id, NULL, :email, :phone, :hash, 'password_reset', :channel, :exp)`,
       {
         id,
-        email: input.email.toLowerCase(),
-        phone,
+        email,
+        phone: phone || null,
         hash: hashOtp(otp),
-        channel: input.channel,
+        channel,
         exp: expiresAt
       }
     );
     await sendOtpNotification({
-      email: input.email.toLowerCase(),
-      phone,
+      email,
+      phone: phone || void 0,
       otp,
-      channel: input.channel
+      channel
     });
+    const destination = channel === "email" ? maskEmail(email) : maskPhone(phone) || maskEmail(email);
     res.json({
-      success: true,
-      message: "If an account exists, an OTP has been sent.",
-      expiresInSeconds: 600,
-      ...process.env.LOG_OTP === "true" ? { devOtp: otp } : {}
+      ...generic,
+      channel,
+      destination,
+      ...process.env.LOG_OTP === "true" && process.env.NODE_ENV !== "production" ? { devOtp: otp } : {}
     });
   } catch (err) {
     if (err?.name === "ZodError") {
@@ -661,36 +755,69 @@ authRouter.post("/forgot-password/request-otp", async (req, res, next) => {
 });
 authRouter.post("/forgot-password/confirm", async (req, res, next) => {
   try {
+    const {
+      normalizeForgotEmail,
+      portalAllowsRole,
+      assertPasswordStrength,
+      assertForgotConfirmAllowed,
+      clearForgotConfirmAttempts
+    } = await import("../lib/forgotPassword.js");
     const input = ForgotPasswordConfirmSchema.parse(req.body);
+    const email = normalizeForgotEmail(input.email);
     const pool = getPool();
+    assertPasswordStrength(input.newPassword);
+    assertForgotConfirmAllowed(email);
     const [[otpRow]] = await pool.execute(
       `SELECT id FROM lead_otps
        WHERE email = :email AND otp_hash = :hash
          AND purpose = 'password_reset' AND verified_at IS NULL AND expires_at > NOW()
        ORDER BY created_at DESC LIMIT 1`,
-      { email: input.email.toLowerCase(), hash: hashOtp(input.otp) }
+      { email, hash: hashOtp(input.otp) }
     );
     if (!otpRow) {
       return res.status(401).json({ error: "Invalid or expired OTP" });
     }
     const [[user]] = await pool.execute(
-      `SELECT id FROM auth_users WHERE email = :email LIMIT 1`,
-      { email: input.email.toLowerCase() }
+      `SELECT au.id, up.role, up.is_active, up.account_status
+       FROM auth_users au
+       LEFT JOIN user_profiles up ON up.id = au.id
+       WHERE LOWER(au.email) = :email
+       LIMIT 1`,
+      { email }
     );
-    if (!user) {
-      return res.status(404).json({ error: "Account not found" });
+    if (!user || !portalAllowsRole(input.portal, user.role)) {
+      return res.status(404).json({ error: "Account not found for this portal" });
     }
     const hashed = await bcrypt.hash(input.newPassword, 12);
     await pool.execute(`UPDATE auth_users SET password_hash = :ph WHERE id = :id`, {
       ph: hashed,
       id: user.id
     });
-    await pool.execute(`UPDATE lead_otps SET verified_at = NOW() WHERE id = :id`, { id: otpRow.id });
+    await pool.execute(
+      `UPDATE lead_otps SET verified_at = NOW()
+       WHERE email = :email AND purpose = 'password_reset' AND verified_at IS NULL`,
+      { email }
+    );
     await pool.execute(
       `UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = :id AND revoked_at IS NULL`,
       { id: user.id }
-    );
-    res.json({ success: true, message: "Password reset successfully. Please sign in with your new password." });
+    ).catch(() => {
+    });
+    clearForgotConfirmAttempts(email);
+    try {
+      await writeAuditLog({
+        userId: user.id,
+        actionType: "password_reset_forgot",
+        tableName: "auth_users",
+        recordId: user.id,
+        newValues: { portal: input.portal || null, method: "otp" }
+      });
+    } catch {
+    }
+    res.json({
+      success: true,
+      message: "Password reset successfully. Please sign in with your new password."
+    });
   } catch (err) {
     if (err?.name === "ZodError") {
       err.status = 400;

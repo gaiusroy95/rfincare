@@ -17,6 +17,7 @@ import {
   getReferrerPerformanceMetrics,
   getReferralSettings,
   recordReferralClick,
+  createInviteLeadAttribution,
 } from '../lib/referralEngine.js';
 
 export const referralsRouter = Router();
@@ -128,7 +129,25 @@ referralsRouter.post('/invites', authenticate, async (req, res, next) => {
       referredPhone: String(input.phone || '').replace(/\D/g, '').slice(-10) || null,
       channel: input.channel || 'share',
     });
-    res.status(201).json(invite);
+    try {
+      await createInviteLeadAttribution(pool, {
+        referrerUserId: req.auth.userId,
+        referrerCode: invite.referralCode,
+        program: invite.program || input.program,
+        referredName: input.name,
+        referredEmail: input.email || null,
+        referredPhone: String(input.phone || '').replace(/\D/g, '').slice(-10) || null,
+        channel: input.channel || 'share',
+      });
+    } catch {
+      /* attribution is best-effort; invite row is the source of truth for share actions */
+    }
+    const metrics = await getReferrerPerformanceMetrics(
+      pool,
+      req.auth.userId,
+      invite.program || input.program,
+    );
+    res.status(201).json({ ...invite, metrics });
   } catch (err) {
     next(err);
   }

@@ -12,6 +12,7 @@ export const FLASH_TILE_CATEGORIES = [
   { id: 'investment', label: 'Investment', icon: 'Gem' },
   { id: 'retirement_planning', label: 'Retirement Planning', icon: 'Clock' },
   { id: 'wealth_management', label: 'Wealth Management', icon: 'Briefcase' },
+  { id: 'customer_referral_scheme', label: 'Customer Referral scheme', icon: 'Gift' },
 ];
 
 const CATEGORY_IDS = new Set(FLASH_TILE_CATEGORIES.map((c) => c.id));
@@ -54,6 +55,16 @@ const DEFAULT_SEED = {
       buttonText: 'Get Quotes',
       displayOrder: 2,
       bannerImageUrl: '',
+    },
+  ],
+  customer_referral_scheme: [
+    {
+      title: 'Refer & Earn Rewards',
+      subtitle: 'Invite friends to RFINCARE and earn rewards when they complete their loan journey',
+      buttonText: 'Refer Now',
+      displayOrder: 1,
+      bannerImageUrl: '',
+      ctaUrl: '#referral-share-form',
     },
   ],
 };
@@ -107,6 +118,10 @@ export function normalizeFlashCategory(raw) {
     government: 'government_schemes',
     retirement: 'retirement_planning',
     wealth: 'wealth_management',
+    customer_referral: 'customer_referral_scheme',
+    customer_referral_schemes: 'customer_referral_scheme',
+    referral_scheme: 'customer_referral_scheme',
+    referral_schemes: 'customer_referral_scheme',
   };
   const mapped = aliases[key] || key;
   return CATEGORY_IDS.has(mapped) ? mapped : null;
@@ -139,9 +154,9 @@ async function seedDefaultsIfEmpty(pool, category) {
   for (const seed of seeds) {
     await pool.execute(
       `INSERT INTO homepage_flash_tiles
-        (id, category, title, subtitle, button_text, banner_image_url, is_active, display_order)
+        (id, category, title, subtitle, button_text, banner_image_url, cta_url, is_active, display_order)
        VALUES
-        (:id, :category, :title, :subtitle, :button_text, :banner_image_url, TRUE, :display_order)`,
+        (:id, :category, :title, :subtitle, :button_text, :banner_image_url, :cta_url, TRUE, :display_order)`,
       {
         id: newId(),
         category,
@@ -149,6 +164,7 @@ async function seedDefaultsIfEmpty(pool, category) {
         subtitle: seed.subtitle || null,
         button_text: seed.buttonText || 'View',
         banner_image_url: seed.bannerImageUrl || null,
+        cta_url: seed.ctaUrl || null,
         display_order: seed.displayOrder || 0,
       },
     );

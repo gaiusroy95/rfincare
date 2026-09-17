@@ -70,6 +70,7 @@ import { calculatorsRouter } from "./routes/calculators.js";
 import { loanCompareRouter } from "./routes/loanCompare.js";
 import { portalCustomerRouter } from "./routes/portalCustomer.js";
 import { referralsRouter } from "./routes/referrals.js";
+import { adminReferralsRouter } from "./routes/adminReferrals.js";
 import { engagementRouter } from "./routes/engagement.js";
 import { mutualFundSipsRouter } from "./routes/mutualFundSips.js";
 import { getCorsOptions } from "./lib/corsOptions.js";
@@ -106,6 +107,8 @@ function createApp({ serveStatic = true } = {}) {
   app.use("/admin/employee-learning", adminEmployeeLearningRouter);
   app.use("/admin/milestone4", milestone4AdminRouter);
   app.use("/admin/document-requirements", documentRequirementsRouter);
+  app.use("/admin/referrals", adminReferralsRouter);
+  app.use("/api/admin/referrals", adminReferralsRouter);
   app.use("/admin", adminRouter);
   app.use("/api/loan-applications", loanApplicationsRouter);
   app.use("/api/admin", adminRouter);

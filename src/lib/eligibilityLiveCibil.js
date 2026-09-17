@@ -60,7 +60,11 @@ export async function resolveLiveCibilForCustomerEligibility(customerId, input =
     if (input.panNumber) {
       demographics.panNumber = String(input.panNumber).trim().toUpperCase();
     }
-    const pull = await pullCibilForCustomer(customerId, { demographics });
+    // Eligibility page: use Experian / Equifax / CRIF (not TransUnion). Report download stays on dashboard.
+    const pull = await pullCibilForCustomer(customerId, {
+      demographics,
+      preferredVendorKeys: ['experian', 'equifax', 'crif_high_mark'],
+    });
     if (pull?.creditScore) {
       return {
         creditScore: pull.creditScore,
@@ -70,6 +74,7 @@ export async function resolveLiveCibilForCustomerEligibility(customerId, input =
           source: pull.sandboxMode ? 'live_sandbox' : 'live',
           checkedAt: new Date().toISOString(),
           vendorName: pull.vendorName,
+          vendorKey: pull.vendorKey,
           sandboxMode: Boolean(pull.sandboxMode),
           band: numericScoreToRangeKey(pull.creditScore),
         },

@@ -766,6 +766,46 @@ portalDashboardsRouter.get('/employee/dashboard', authenticate, async (req, res,
     const canDocuments = employeeHasModulePermission(access, 'documents', 'read');
     const canReports = employeeHasModulePermission(access, 'reports', 'read');
 
+    // Quality score from lead first-contact TAT (met vs missed).
+    let qualityScore = null;
+    let tatStats = {
+      assigned: 0,
+      withinTat: 0,
+      tatMissed: 0,
+      contacted: 0,
+    };
+    try {
+      const [[tat]] = await pool.execute(
+        `SELECT
+           COUNT(ml.id)::int AS assigned,
+           COUNT(ml.id) FILTER (WHERE ml.first_contact_at IS NOT NULL)::int AS contacted,
+           COUNT(ml.id) FILTER (
+             WHERE ml.first_contact_at IS NOT NULL
+               AND ml.first_contact_due_at IS NOT NULL
+               AND ml.first_contact_at <= ml.first_contact_due_at
+           )::int AS within_tat,
+           COUNT(ml.id) FILTER (
+             WHERE ml.tat_status IN ('breached', 'breached_contacted')
+                OR (ml.first_contact_at IS NULL AND ml.first_contact_due_at < NOW())
+           )::int AS tat_missed
+         FROM marketing_leads ml
+         WHERE ml.assigned_to = :id`,
+        { id: employeeId },
+      );
+      const withinTat = Number(tat?.within_tat || 0);
+      const tatMissed = Number(tat?.tat_missed || 0);
+      const scored = withinTat + tatMissed;
+      tatStats = {
+        assigned: Number(tat?.assigned || 0),
+        withinTat,
+        tatMissed,
+        contacted: Number(tat?.contacted || 0),
+      };
+      qualityScore = scored > 0 ? Math.round((100 * withinTat) / scored) : null;
+    } catch {
+      /* lead TAT columns may be unavailable */
+    }
+
     res.json({
       access,
       stats: {
@@ -782,6 +822,8 @@ portalDashboardsRouter.get('/employee/dashboard', authenticate, async (req, res,
               return d.toDateString() === today.toDateString();
             }).length
           : 0,
+        qualityScore,
+        tatStats,
       },
       learningResources,
       applications: canApplications

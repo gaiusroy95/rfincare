@@ -218,11 +218,13 @@ function buildReferralShareLinks(code, program) {
       partnerLogin: `${base}/agent-login?aref=${encoded}`
     };
   }
+  const looksLikeAgent = /^RFA([-\s]|$)/i.test(String(code || ""));
+  const param = looksLikeAgent ? "aref" : "cref";
   return {
-    homepage: `${base}/?ref=${encoded}`,
-    insurance: `${base}/insurance-marketplace?ref=${encoded}`,
-    mutualFunds: `${base}/mutual-fund-marketplace?ref=${encoded}`,
-    calculators: `${base}/resources/calculators?ref=${encoded}`
+    homepage: `${base}/?${param}=${encoded}`,
+    insurance: `${base}/insurance-marketplace?${param}=${encoded}`,
+    mutualFunds: `${base}/mutual-fund-marketplace?${param}=${encoded}`,
+    calculators: `${base}/resources/calculators?${param}=${encoded}`
   };
 }
 async function applyReferralToLead(pool, leadId, body = {}) {
@@ -294,11 +296,23 @@ async function applyReferralToLead(pool, leadId, body = {}) {
     ).catch(() => {
     });
   }
+  let attribution = null;
+  try {
+    const { attachAttributionToLead } = await import("./referralEngine.js");
+    attribution = await attachAttributionToLead(pool, leadId, {
+      ...body,
+      referralCode: resolved.code,
+      referralProgram: program
+    });
+  } catch {
+  }
   return {
     referralCode: resolved.code,
     referralProgram: program,
     referredByUserId: resolved.ownerUserId,
-    sourcedAgentCode
+    sourcedAgentCode,
+    attributionId: attribution?.id || null,
+    referralId: attribution?.id || null
   };
 }
 async function createReferralInvite(pool, {

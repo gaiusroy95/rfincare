@@ -2,11 +2,11 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { getPool } from '../db/pool.js';
 import { newId } from '../lib/ids.js';
-import { sendEmail } from '../lib/email.js';
+import { sendEmail, publicEmailDeliveryMessage } from '../lib/email.js';
 import { getSiteContactSettings } from '../lib/siteContactSettings.js';
 import { buildIcsInvite } from '../lib/ics.js';
 import { createGoogleCalendarEvent, googleCalendarConfigured } from '../lib/googleCalendar.js';
-import { hashOtp, sendDualChannelOtp } from '../lib/otp.js';
+import { hashOtp, sendDualChannelOtp, toPublicOtpMessage } from '../lib/otp.js';
 import { getOtpProviderSettings } from '../lib/otpProviderSettings.js';
 import { sendMsg91TransactionalSms } from '../lib/msg91.js';
 
@@ -219,11 +219,20 @@ appointmentsRouter.post('/otp/request', async (req, res, next) => {
     }
 
     const settings = await getOtpProviderSettings();
-    const otpResult = await sendDualChannelOtp({
-      phone: input.phone,
-      email: input.email,
-      settings,
-    });
+    let otpResult;
+    try {
+      otpResult = await sendDualChannelOtp({
+        phone: input.phone,
+        email: input.email,
+        settings,
+        publicFacing: true,
+      });
+    } catch (otpErr) {
+      console.error('[appointments:otp]', otpErr?.message || otpErr);
+      return res.status(502).json({
+        error: toPublicOtpMessage(otpErr?.message),
+      });
+    }
 
     const pool = getPool();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
@@ -254,13 +263,13 @@ appointmentsRouter.post('/otp/request', async (req, res, next) => {
       );
     }
 
+    // Same privacy model as forgot-password: never return provider warnings to the customer.
     res.json({
       success: true,
-      message: 'OTP sent successfully.',
+      message: 'OTP sent. Please verify to confirm your appointment.',
       expiresInSeconds: 600,
       requireMobileOtp: otpResult.requireMobileOtp,
       requireEmailOtp: otpResult.requireEmailOtp,
-      warnings: Array.isArray(otpResult.warnings) && otpResult.warnings.length ? otpResult.warnings : undefined,
       ...(process.env.LOG_OTP === 'true'
         ? {
             devMobileOtp: otpResult.mobileOtp || undefined,
@@ -442,6 +451,7 @@ appointmentsRouter.post('/', async (req, res, next) => {
         text: customerText,
         html: `<pre style="font-family:sans-serif;white-space:pre-wrap">${customerText}</pre>`,
         attachments: [icsAttachment],
+        recipientName: input.fullName,
       }),
       sendEmail({
         to: salesEmail,
@@ -449,10 +459,18 @@ appointmentsRouter.post('/', async (req, res, next) => {
         text: salesText,
         html: `<pre style="font-family:sans-serif;white-space:pre-wrap">${salesText}</pre>`,
         attachments: [icsAttachment],
+        recipientName: 'Rfincare Sales',
       }),
     ]);
 
-    // Best-effort SMS confirmation (only if MSG91 is configured; otherwise we return a warning).
+    if (customerMail?.warningInternal) {
+      console.error('[appointments:email:customer]', customerMail.warningInternal);
+    }
+    if (salesMail?.warningInternal) {
+      console.error('[appointments:email:sales]', salesMail.warningInternal);
+    }
+
+    // Best-effort SMS confirmation (never surface MSG91 internals to the customer).
     let sms = { sent: false, reason: 'sms_not_sent' };
     try {
       const smsText = [
@@ -467,17 +485,16 @@ appointmentsRouter.post('/', async (req, res, next) => {
         message: smsText,
       });
     } catch (smsErr) {
+      console.error('[appointments:sms]', smsErr?.message || smsErr);
       sms = {
         sent: false,
-        reason: smsErr?.message || 'sms_error',
-        warning: smsErr?.message || 'SMS could not be sent.',
+        reason: 'sms_error',
       };
     }
 
-    const emailWarnings = [
-      customerMail?.sent === false ? customerMail?.warning || customerMail?.reason : null,
-      salesMail?.sent === false ? salesMail?.warning || salesMail?.reason : null,
-    ].filter(Boolean);
+    const customerEmailSent = customerMail?.sent === true;
+    const salesEmailSent = salesMail?.sent === true;
+    const anyEmailFailed = !customerEmailSent || !salesEmailSent;
 
     await pool.execute(
       `UPDATE appointment_otp_verifications SET used_at = NOW() WHERE id = :id`,
@@ -494,21 +511,25 @@ appointmentsRouter.post('/', async (req, res, next) => {
         configured: googleCalendarConfigured(),
         synced: Boolean(google.created),
         eventLink: google.htmlLink || null,
-        reason: google.reason || null,
       },
       emails: {
-        customer: customerMail,
-        sales: salesMail,
+        customer: { sent: customerEmailSent, channel: customerMail?.channel || null },
+        sales: { sent: salesEmailSent, channel: salesMail?.channel || null },
         salesEmail,
       },
-      sms,
-      message:
-        emailWarnings.length || sms?.sent === false
-          ? 'Appointment booked, but some notifications may not have been delivered. Please check the warnings.'
-          : 'Appointment booked. Confirmation emails sent to you and our sales team.',
+      sms: { sent: Boolean(sms?.sent) },
+      message: anyEmailFailed
+        ? 'Appointment booked. If you do not receive a confirmation email shortly, our team will still contact you at the scheduled time.'
+        : 'Appointment booked. Confirmation emails sent to you and our sales team.',
+      // Customer-safe notices only (no SMTP/MSG91 credential text).
       notificationWarnings: {
-        emailWarnings,
-        smsWarning: sms?.sent === false ? sms?.warning || sms?.reason : null,
+        emailWarnings: [
+          customerEmailSent ? null : publicEmailDeliveryMessage(customerMail),
+          salesEmailSent ? null : publicEmailDeliveryMessage(salesMail),
+        ].filter(Boolean),
+        smsWarning: sms?.sent
+          ? null
+          : 'SMS confirmation could not be sent right now. Your appointment is still confirmed.',
       },
     });
   } catch (err) {

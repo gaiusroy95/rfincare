@@ -17,12 +17,46 @@ import { ensureAgentCodeForUser } from '../lib/agentCode.js';
 
 export const portalAgentApplicationsRouter = Router();
 
+function requireStaffAssist(req) {
+  if (!['agent', 'employee', 'admin', 'super_admin'].includes(req.auth.role)) {
+    const e = new Error('Staff access only');
+    e.status = 403;
+    throw e;
+  }
+}
+
 function requireAgent(req) {
   if (req.auth.role !== 'agent' && !['admin', 'super_admin'].includes(req.auth.role)) {
     const e = new Error('Agent access only');
     e.status = 403;
     throw e;
   }
+}
+
+async function assertStaffOwnsApplication(pool, userId, role, applicationId) {
+  const [[byEmployee]] = await pool.execute(
+    `SELECT * FROM loan_applications
+     WHERE id = :id AND CAST(COALESCE(assigned_employee_id, '') AS TEXT) = CAST(:userId AS TEXT)
+     LIMIT 1`,
+    { id: applicationId, userId },
+  );
+  if (byEmployee) return byEmployee;
+
+  if (role === 'admin' || role === 'super_admin') {
+    const [[any]] = await pool.execute(
+      `SELECT * FROM loan_applications WHERE id = :id LIMIT 1`,
+      { id: applicationId },
+    );
+    if (any) return any;
+  }
+
+  if (role === 'employee') {
+    const e = new Error('Application not found or not assigned to you');
+    e.status = 404;
+    throw e;
+  }
+
+  return assertAgentOwnsApplication(pool, userId, applicationId);
 }
 
 async function resolveAgentMeta(pool, userId, { requireCode = false } = {}) {
@@ -113,17 +147,17 @@ const ProvisionSchema = z.object({
 
 portalAgentApplicationsRouter.post('/provision-customer', async (req, res, next) => {
   try {
-    requireAgent(req);
+    requireStaffAssist(req);
     const input = ProvisionSchema.parse(req.body);
     const pool = getPool();
     const result = await provisionCustomerForAgent(pool, input);
 
     await writeAuditLog({
       userId: req.auth.userId,
-      actionType: 'agent_provision_customer',
+      actionType: 'staff_provision_customer',
       tableName: 'user_profiles',
       recordId: result.customerId,
-      newValues: { email: input.email, created: result.created },
+      newValues: { email: input.email, created: result.created, byRole: req.auth.role },
     });
 
     res.status(result.created ? 201 : 200).json({
@@ -138,32 +172,57 @@ portalAgentApplicationsRouter.post('/provision-customer', async (req, res, next)
 
 portalAgentApplicationsRouter.post('/applications', async (req, res, next) => {
   try {
-    requireAgent(req);
+    requireStaffAssist(req);
     const pool = getPool();
     await ensureStaffMessagingSchema();
-    const agentId = req.auth.userId;
-    const meta = await resolveAgentMeta(pool, agentId, { requireCode: true });
+    const staffId = req.auth.userId;
+    const role = req.auth.role;
     const body = req.body || {};
+    const isEmployee =
+      role === 'employee'
+      || body.submission_channel === 'employee_assisted'
+      || body.assisted_by_employee === true
+      || body.assistedByEmployee === true;
     const customerId = body.customer_id || body.customerId;
     if (!customerId) {
       return res.status(400).json({ error: 'customerId is required' });
     }
 
-    const [[primaryMap]] = await pool.execute(
-      `SELECT employee_user_id FROM agent_employee_hierarchy
-       WHERE agent_user_id = :agentId AND is_primary = 1
-       ORDER BY hierarchy_level ASC LIMIT 1`,
-      { agentId },
-    );
+    let agentId = null;
+    let agentCode = null;
+    let agentName = null;
+    let assignedEmployeeId = body.assigned_employee_id || body.assignedEmployeeId || null;
 
+    if (isEmployee) {
+      assignedEmployeeId = assignedEmployeeId || staffId;
+    } else {
+      const meta = await resolveAgentMeta(pool, staffId, { requireCode: true });
+      agentId = staffId;
+      agentCode = meta.agentCode;
+      agentName = meta.agentName;
+      if (!assignedEmployeeId) {
+        const [[primaryMap]] = await pool.execute(
+          `SELECT employee_user_id FROM agent_employee_hierarchy
+           WHERE agent_user_id = :agentId AND is_primary = 1
+           ORDER BY hierarchy_level ASC LIMIT 1`,
+          { agentId: staffId },
+        );
+        assignedEmployeeId = primaryMap?.employee_user_id || null;
+      }
+    }
+
+    const leadId = body.lead_id || body.leadId || null;
     const id = newId();
     const payload = {
       ...body,
       customer_id: customerId,
       agent_id: agentId,
-      sourced_agent_code: meta.agentCode,
-      sourced_by_agent_name: meta.agentName,
-      submission_channel: 'agent_assisted',
+      assigned_employee_id: assignedEmployeeId,
+      sourced_agent_code: agentCode,
+      sourced_by_agent_name: agentName,
+      submission_channel: isEmployee ? 'employee_assisted' : 'agent_assisted',
+      lead_id: leadId,
+      eligibility_check_id: body.eligibility_check_id || body.eligibilityCheckId || null,
     };
 
     await pool.execute(
@@ -179,20 +238,31 @@ portalAgentApplicationsRouter.post('/applications', async (req, res, next) => {
         application_number: body.application_number || `RFC${Date.now()}`,
         customer_id: customerId,
         agent_id: agentId,
-        sourced_agent_code: meta.agentCode,
-        assigned_employee_id:
-          body.assigned_employee_id
-          || body.assignedEmployeeId
-          || primaryMap?.employee_user_id
-          || null,
+        sourced_agent_code: agentCode,
+        assigned_employee_id: assignedEmployeeId,
         selected_bank_id: body.selected_bank_id || body.selectedBankId || null,
         status: body.status || 'draft',
         document_stage_status: 'documents_pending',
         bank_approval_status: 'submitted_to_bank',
-        eligibility_status: body.eligibility_status || null,
+        eligibility_status: body.eligibility_status || body.eligibilityStatus || null,
         data: JSON.stringify(payload),
       },
     );
+
+    if (leadId) {
+      try {
+        await pool.execute(
+          `UPDATE marketing_leads SET
+             application_id = :app_id,
+             status = 'application_in_progress',
+             updated_at = NOW()
+           WHERE id = :lead_id`,
+          { app_id: id, lead_id: leadId },
+        );
+      } catch {
+        /* best-effort journey link */
+      }
+    }
 
     const [[row]] = await pool.execute(
       `SELECT la.*, c.full_name AS customer_full_name
@@ -202,20 +272,22 @@ portalAgentApplicationsRouter.post('/applications', async (req, res, next) => {
       { id },
     );
 
-    try {
-      const { attachAttributionToApplication, attachAttributionToUser } = await import('../lib/referralEngine.js');
-      await attachAttributionToUser(pool, customerId, {
-        referralCode: meta.agentCode,
-        referralProgram: 'customer',
-        sourcedAgentCode: meta.agentCode,
-      });
-      await attachAttributionToApplication(pool, id, {
-        referralCode: meta.agentCode,
-        sourcedAgentCode: meta.agentCode,
-        customerId,
-      });
-    } catch {
-      /* best-effort */
+    if (agentCode) {
+      try {
+        const { attachAttributionToApplication, attachAttributionToUser } = await import('../lib/referralEngine.js');
+        await attachAttributionToUser(pool, customerId, {
+          referralCode: agentCode,
+          referralProgram: 'customer',
+          sourcedAgentCode: agentCode,
+        });
+        await attachAttributionToApplication(pool, id, {
+          referralCode: agentCode,
+          sourcedAgentCode: agentCode,
+          customerId,
+        });
+      } catch {
+        /* best-effort */
+      }
     }
 
     res.status(201).json({
@@ -223,9 +295,11 @@ portalAgentApplicationsRouter.post('/applications', async (req, res, next) => {
       applicationNumber: row.application_number,
       customerId: row.customer_id,
       agentId: row.agent_id,
+      assignedEmployeeId: row.assigned_employee_id,
       sourcedAgentCode: row.sourced_agent_code,
       status: row.status,
       customerName: row.customer_full_name,
+      leadId: leadId || null,
     });
   } catch (err) {
     next(err);
@@ -234,10 +308,14 @@ portalAgentApplicationsRouter.post('/applications', async (req, res, next) => {
 
 portalAgentApplicationsRouter.patch('/applications/:id', async (req, res, next) => {
   try {
-    requireAgent(req);
+    requireStaffAssist(req);
     const pool = getPool();
-    const agentId = req.auth.userId;
-    const existing = await assertAgentOwnsApplication(pool, agentId, req.params.id);
+    const existing = await assertStaffOwnsApplication(
+      pool,
+      req.auth.userId,
+      req.auth.role,
+      req.params.id,
+    );
     const body = req.body || {};
     const mergedData = { ...parseJson(existing.data), ...body };
     const {
@@ -285,10 +363,10 @@ portalAgentApplicationsRouter.patch('/applications/:id', async (req, res, next) 
 
 portalAgentApplicationsRouter.post('/applications/:id/submit', async (req, res, next) => {
   try {
-    requireAgent(req);
+    requireStaffAssist(req);
     const pool = getPool();
-    const agentId = req.auth.userId;
-    await assertAgentOwnsApplication(pool, agentId, req.params.id);
+    const staffId = req.auth.userId;
+    const existing = await assertStaffOwnsApplication(pool, staffId, req.auth.role, req.params.id);
 
     await pool.execute(
       `UPDATE loan_applications
@@ -306,7 +384,10 @@ portalAgentApplicationsRouter.post('/applications/:id/submit', async (req, res, 
       {
         id: newId(),
         application_id: req.params.id,
-        message: 'Application submitted by agent on behalf of customer',
+        message:
+          req.auth.role === 'employee'
+            ? 'Application submitted by employee on behalf of customer'
+            : 'Application submitted by agent on behalf of customer',
       },
     );
 
@@ -317,10 +398,29 @@ portalAgentApplicationsRouter.post('/applications/:id/submit', async (req, res, 
 
     const confirmation = await finalizeApplicationSubmission({
       applicationId: req.params.id,
-      submittedByUserId: agentId,
-      submittedByRole: 'agent',
+      submittedByUserId: staffId,
+      submittedByRole: req.auth.role === 'employee' ? 'employee' : 'agent',
       clientIp,
     });
+
+    const leadId =
+      parseJson(existing.data)?.lead_id
+      || parseJson(existing.data)?.leadId
+      || null;
+    if (leadId) {
+      try {
+        await pool.execute(
+          `UPDATE marketing_leads SET
+             application_id = COALESCE(application_id, :app_id),
+             status = 'application_submitted',
+             updated_at = NOW()
+           WHERE id = :lead_id`,
+          { app_id: req.params.id, lead_id: leadId },
+        );
+      } catch {
+        /* best-effort */
+      }
+    }
 
     try {
       const { attachAttributionToApplication, advanceAttributionLifecycle } =

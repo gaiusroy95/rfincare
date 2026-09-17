@@ -15,6 +15,12 @@ import {
   listCustomerSupportMessages,
   replyAsSupport
 } from "../lib/customerSupportChat.js";
+import {
+  listAgentHierarchyMatrix,
+  upsertAgentHierarchyMatrix,
+  deleteAgentHierarchyMatrix,
+  ensureHierarchyMatrixSchema
+} from "../lib/hierarchyMatrix.js";
 const staffCommunicationRouter = Router();
 const adminHierarchyRouter = Router();
 const STAFF_ROLES = /* @__PURE__ */ new Set(["admin", "super_admin", "employee", "agent"]);
@@ -261,36 +267,124 @@ adminHierarchyRouter.get(
     try {
       await ensureStaffMessagingSchema();
       const pool = getPool();
-      const [rows] = await pool.execute(
-        `SELECT h.*,
-                ag.full_name AS agent_name, ag.email AS agent_email, ao.agent_code,
-                em.full_name AS employee_name, em.email AS employee_email, eo.employee_code
-         FROM agent_employee_hierarchy h
-         LEFT JOIN user_profiles ag ON ag.id = h.agent_user_id
-         LEFT JOIN agent_onboarding ao ON ao.user_id = h.agent_user_id
-         LEFT JOIN user_profiles em ON em.id = h.employee_user_id
-         LEFT JOIN employee_onboarding eo ON eo.user_id = h.employee_user_id
-         ORDER BY h.is_primary DESC, h.hierarchy_level ASC, ag.full_name ASC`
-      );
-      res.json(
-        rows.map((r) => ({
-          id: r.id,
-          agentUserId: r.agent_user_id,
-          employeeUserId: r.employee_user_id,
-          agentName: r.agent_name,
-          agentEmail: r.agent_email,
-          agentCode: r.agent_code,
-          employeeName: r.employee_name,
-          employeeEmail: r.employee_email,
-          employeeCode: r.employee_code,
-          communicationEmail: r.communication_email,
-          hierarchyLevel: r.hierarchy_level,
-          isPrimary: Boolean(r.is_primary),
-          notes: r.notes,
-          createdAt: r.created_at,
-          updatedAt: r.updated_at
-        }))
-      );
+      if (String(req.query.flat || "") === "1") {
+        const [rows] = await pool.execute(
+          `SELECT h.*,
+                  ag.full_name AS agent_name, ag.email AS agent_email, ao.agent_code,
+                  em.full_name AS employee_name, em.email AS employee_email, eo.employee_code
+           FROM agent_employee_hierarchy h
+           LEFT JOIN user_profiles ag ON ag.id = h.agent_user_id
+           LEFT JOIN agent_onboarding ao ON ao.user_id = h.agent_user_id
+           LEFT JOIN user_profiles em ON em.id = h.employee_user_id
+           LEFT JOIN employee_onboarding eo ON eo.user_id = h.employee_user_id
+           ORDER BY h.is_primary DESC, h.hierarchy_level ASC, ag.full_name ASC`
+        );
+        return res.json(
+          rows.map((r) => ({
+            id: r.id,
+            agentUserId: r.agent_user_id,
+            employeeUserId: r.employee_user_id,
+            agentName: r.agent_name,
+            agentEmail: r.agent_email,
+            agentCode: r.agent_code,
+            employeeName: r.employee_name,
+            employeeEmail: r.employee_email,
+            employeeCode: r.employee_code,
+            communicationEmail: r.communication_email,
+            hierarchyLevel: r.hierarchy_level,
+            isPrimary: Boolean(r.is_primary),
+            notes: r.notes,
+            createdAt: r.created_at,
+            updatedAt: r.updated_at
+          }))
+        );
+      }
+      const matrix = await listAgentHierarchyMatrix(pool);
+      res.json(matrix);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+adminHierarchyRouter.get(
+  "/matrix",
+  authenticate,
+  authorize({ resource: "agents", action: "read" }),
+  async (_req, res, next) => {
+    try {
+      await ensureStaffMessagingSchema();
+      const matrix = await listAgentHierarchyMatrix(getPool());
+      res.json(matrix);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+const HierarchyMatrixSchema = z.object({
+  agentUserId: z.string().min(1),
+  level1EmployeeUserId: z.string().optional().nullable(),
+  level2EmployeeUserId: z.string().optional().nullable(),
+  level3EmployeeUserId: z.string().optional().nullable(),
+  level4EmployeeUserId: z.string().optional().nullable(),
+  communicationEmail: z.string().email().optional().nullable(),
+  notes: z.string().optional().nullable()
+});
+adminHierarchyRouter.put(
+  "/matrix",
+  authenticate,
+  authorize({ resource: "agents", action: "update" }),
+  async (req, res, next) => {
+    try {
+      await ensureStaffMessagingSchema();
+      await ensureHierarchyMatrixSchema(getPool());
+      const input = HierarchyMatrixSchema.parse(req.body || {});
+      const levelEmployees = {
+        1: input.level1EmployeeUserId || null,
+        2: input.level2EmployeeUserId || null,
+        3: input.level3EmployeeUserId || null,
+        4: input.level4EmployeeUserId || null
+      };
+      if (!Object.values(levelEmployees).some(Boolean)) {
+        return res.status(400).json({ error: "Select at least one employee for Level-1 to Level-4" });
+      }
+      const results = await upsertAgentHierarchyMatrix(getPool(), {
+        agentUserId: input.agentUserId,
+        levelEmployees,
+        communicationEmail: input.communicationEmail || null,
+        notes: input.notes || null,
+        createdBy: req.auth.userId
+      });
+      await writeAuditLog({
+        userId: req.auth.userId,
+        actionType: "upsert",
+        tableName: "agent_employee_hierarchy",
+        recordId: input.agentUserId,
+        newValues: { ...levelEmployees, notes: input.notes }
+      });
+      const matrix = await listAgentHierarchyMatrix(getPool());
+      const row = matrix.find((m) => m.agentUserId === input.agentUserId) || null;
+      res.json({ ok: true, results, mapping: row });
+    } catch (err) {
+      if (err?.name === "ZodError") {
+        return res.status(400).json({ error: err.errors?.[0]?.message || "Invalid hierarchy matrix" });
+      }
+      if (err?.status) {
+        return res.status(err.status).json({ error: err.message });
+      }
+      next(err);
+    }
+  }
+);
+adminHierarchyRouter.delete(
+  "/matrix/:agentUserId",
+  authenticate,
+  authorize({ resource: "agents", action: "update" }),
+  async (req, res, next) => {
+    try {
+      await ensureStaffMessagingSchema();
+      const deleted = await deleteAgentHierarchyMatrix(getPool(), req.params.agentUserId);
+      if (!deleted) return res.status(404).json({ error: "No hierarchy mapping found for agent" });
+      res.json({ ok: true, deleted });
     } catch (err) {
       next(err);
     }
@@ -300,7 +394,7 @@ const HierarchySchema = z.object({
   agentUserId: z.string().min(1),
   employeeUserId: z.string().min(1),
   communicationEmail: z.string().email(),
-  hierarchyLevel: z.number().int().min(1).max(10).optional(),
+  hierarchyLevel: z.number().int().min(1).max(4).optional(),
   isPrimary: z.boolean().optional(),
   notes: z.string().optional()
 });
@@ -412,7 +506,7 @@ adminHierarchyRouter.delete(
     }
   }
 );
-const HIERARCHY_CSV_HEADER = "agent_code,agent_name,location,level1_name,level1_email,level1_mobile,level2_name,level2_email,level2_mobile,level3_name,level3_email,level3_mobile,office_address";
+const HIERARCHY_CSV_HEADER = "agent_code,agent_name,location,level1_name,level1_email,level1_mobile,level2_name,level2_email,level2_mobile,level3_name,level3_email,level3_mobile,level4_name,level4_email,level4_mobile,office_address";
 adminHierarchyRouter.get(
   "/template.csv",
   authenticate,
@@ -420,7 +514,7 @@ adminHierarchyRouter.get(
   async (_req, res) => {
     const sample = [
       HIERARCHY_CSV_HEADER,
-      "AG001,Sample Agent,Mumbai,L1 Manager,l1@example.com,9876543210,L2 Manager,l2@example.com,9876543211,L3 Manager,l3@example.com,9876543212,Head Office"
+      "AG001,Sample Agent,Mumbai,L1 Manager,l1@example.com,9876543210,L2 Manager,l2@example.com,9876543211,L3 Manager,l3@example.com,9876543212,L4 Manager,l4@example.com,9876543213,Head Office"
     ].join("\n");
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader("Content-Disposition", 'attachment; filename="escalation-matrix-template.csv"');
@@ -558,7 +652,8 @@ adminHierarchyRouter.post(
         const levels = [
           { level: 1, name: get("level1_name"), email: get("level1_email"), mobile: get("level1_mobile") },
           { level: 2, name: get("level2_name"), email: get("level2_email"), mobile: get("level2_mobile") },
-          { level: 3, name: get("level3_name"), email: get("level3_email"), mobile: get("level3_mobile") }
+          { level: 3, name: get("level3_name"), email: get("level3_email"), mobile: get("level3_mobile") },
+          { level: 4, name: get("level4_name"), email: get("level4_email"), mobile: get("level4_mobile") }
         ];
         let primarySet = false;
         for (const lv of levels) {
@@ -576,7 +671,7 @@ adminHierarchyRouter.post(
         }
         if (!primarySet) {
           results.skipped += 1;
-          results.errors.push({ row: i + 1, error: "No valid L1/L2/L3 employees on row" });
+          results.errors.push({ row: i + 1, error: "No valid L1/L2/L3/L4 employees on row" });
         }
       }
       res.json(results);

@@ -68,7 +68,7 @@ async function buildFinancialSummaryRows(pool, { start, end }) {
             COALESCE(b.name, 'Unassigned') AS bank_name
      FROM loan_applications la
      LEFT JOIN banks b ON b.id = la.selected_bank_id
-     WHERE la.created_at BETWEEN :start AND :end`,
+     WHERE la.created_at::date BETWEEN :start::date AND :end::date`,
     { start, end }
   );
   const groups = /* @__PURE__ */ new Map();

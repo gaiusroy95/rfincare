@@ -11,12 +11,62 @@ import {
   listReferralInvites,
   normalizeReferralProgram
 } from "../lib/referralTracking.js";
+import {
+  ensureReferralEngineSchema,
+  getReferrerPerformanceMetrics,
+  getReferralSettings,
+  recordReferralClick
+} from "../lib/referralEngine.js";
 const referralsRouter = Router();
+referralsRouter.get("/settings/public", async (_req, res, next) => {
+  try {
+    const pool = getPool();
+    const settings = await getReferralSettings(pool);
+    res.json({
+      attributionWindowDays: settings.attributionWindowDays
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+referralsRouter.post("/click", async (req, res, next) => {
+  try {
+    const input = z.object({
+      code: z.string().trim().min(3).max(64),
+      program: z.enum(["agent", "customer"]).optional(),
+      landingUrl: z.string().trim().max(2e3).optional().or(z.literal("")),
+      sourceUrl: z.string().trim().max(2e3).optional().or(z.literal("")),
+      utmSource: z.string().trim().max(128).optional().or(z.literal("")),
+      utmMedium: z.string().trim().max(128).optional().or(z.literal("")),
+      utmCampaign: z.string().trim().max(128).optional().or(z.literal("")),
+      deviceRef: z.string().trim().max(255).optional().or(z.literal("")),
+      sessionToken: z.string().trim().max(64).optional().or(z.literal(""))
+    }).parse(req.body || {});
+    const pool = getPool();
+    const ip = req.headers["x-forwarded-for"]?.toString()?.split(",")?.[0]?.trim() || req.socket?.remoteAddress || null;
+    const result = await recordReferralClick(pool, {
+      code: input.code,
+      program: input.program,
+      landingUrl: input.landingUrl || null,
+      sourceUrl: input.sourceUrl || null,
+      utmSource: input.utmSource || null,
+      utmMedium: input.utmMedium || null,
+      utmCampaign: input.utmCampaign || null,
+      deviceRef: input.deviceRef || null,
+      sessionToken: input.sessionToken || null,
+      ip
+    });
+    res.status(201).json(result);
+  } catch (err) {
+    next(err);
+  }
+});
 referralsRouter.get("/", authenticate, async (req, res, next) => {
   try {
     const program = normalizeReferralProgram(req.query.program) || "customer";
     const pool = getPool();
     await ensureReferralSchema(pool);
+    await ensureReferralEngineSchema(pool);
     const code = await ensureReferralCodeForUser(pool, {
       userId: req.auth.userId,
       role: req.auth.role,
@@ -30,12 +80,14 @@ referralsRouter.get("/", authenticate, async (req, res, next) => {
       referrerUserId: req.auth.userId,
       program
     });
+    const metrics = await getReferrerPerformanceMetrics(pool, req.auth.userId, program);
     res.json({
       program,
       referralCode: code?.code || null,
       shareLinks: code?.code ? buildReferralShareLinks(code.code, program) : null,
       attributedCount,
-      invites
+      invites,
+      metrics
     });
   } catch (err) {
     next(err);

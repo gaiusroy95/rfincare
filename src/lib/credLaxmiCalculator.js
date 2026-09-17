@@ -131,7 +131,9 @@ export function normalizeRewardRules(card = {}) {
 function annualizeSpend(amount, period) {
   const n = toNum(amount, 0);
   const p = String(period || 'monthly').toLowerCase();
-  return p === 'annual' || p === 'yearly' ? n : n * 12;
+  if (p === 'annual' || p === 'yearly') return n;
+  if (p === 'quarterly' || p === 'quarter') return n * 4;
+  return n * 12;
 }
 
 function findRate(rules, categoryCode) {

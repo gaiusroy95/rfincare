@@ -202,7 +202,8 @@ export async function listAvailableL1Employees(pool, { excludeIds = [] } = {}) {
   const exclude = (excludeIds || []).filter(Boolean);
 
   const [l1Rows] = await pool.execute(
-    `SELECT DISTINCT up.id, up.full_name, up.email, up.phone, eo.employee_code,
+    `SELECT DISTINCT up.id, up.full_name, up.phone, eo.employee_code,
+            NULLIF(TRIM(COALESCE(eo.email, up.email, '')), '') AS email,
             COALESCE(eo.lead_available, TRUE) AS lead_available,
             COALESCE(eo.lead_level, h.min_level, 1) AS lead_level
      FROM user_profiles up
@@ -224,7 +225,8 @@ export async function listAvailableL1Employees(pool, { excludeIds = [] } = {}) {
      ORDER BY eo.employee_code ASC NULLS LAST, up.created_at ASC`,
   ).catch(async () => {
     const [fallback] = await pool.execute(
-      `SELECT up.id, up.full_name, up.email, up.phone, eo.employee_code,
+      `SELECT up.id, up.full_name, up.phone, eo.employee_code,
+              NULLIF(TRIM(COALESCE(eo.email, up.email, '')), '') AS email,
               TRUE AS lead_available, 1 AS lead_level
        FROM user_profiles up
        LEFT JOIN employee_onboarding eo ON eo.user_id = up.id
@@ -236,7 +238,6 @@ export async function listAvailableL1Employees(pool, { excludeIds = [] } = {}) {
     return [fallback];
   });
 
-  // Fix typo in SQL above - I accidentally wrote "and 1" - need to fix!
   return (l1Rows || []).filter((r) => r?.id && !exclude.includes(r.id));
 }
 
@@ -354,12 +355,41 @@ export async function notifyLeadStakeholders(pool, {
   const settings = await getLeadAssignmentSettings(pool);
   const link = leadDeepLink(lead.id);
   const fullMessage = link ? `${message}\n\nOpen lead: ${link}` : message;
+  const isTatEvent = ['lead_tat_missed', 'lead_reassigned'].includes(String(eventType || ''));
 
   try {
     const { createStaffNotification } = await import('../routes/notifications.js');
+
+    // Official employee mail: prefer employee_onboarding.email over profile email.
+    const [allEmployees] = await pool.execute(
+      `SELECT up.id, up.full_name, up.role, up.phone,
+              NULLIF(TRIM(COALESCE(eo.email, '')), '') AS official_email,
+              NULLIF(TRIM(COALESCE(up.email, '')), '') AS profile_email,
+              COALESCE(eo.lead_level, 0)::int AS lead_level
+       FROM user_profiles up
+       LEFT JOIN employee_onboarding eo ON eo.user_id = up.id
+       WHERE up.role = 'employee'
+         AND COALESCE(up.is_active, TRUE) = TRUE`,
+    ).catch(() => [[]]);
+
+    const withOfficialEmail = (row) => ({
+      ...row,
+      email: row.official_email || row.profile_email || null,
+    });
+
+    const employees = (allEmployees || []).map(withOfficialEmail);
+
     if (assignee?.id) {
+      const assigneeRow = employees.find((e) => e.id === assignee.id) || withOfficialEmail({
+        id: assignee.id,
+        official_email: null,
+        profile_email: assignee.email,
+        phone: assignee.phone,
+        full_name: assignee.full_name || assignee.fullName,
+        role: 'employee',
+      });
       await createStaffNotification(pool, {
-        userId: assignee.id,
+        userId: assigneeRow.id,
         role: 'employee',
         eventType,
         title,
@@ -368,27 +398,12 @@ export async function notifyLeadStakeholders(pool, {
       }).catch(() => {});
     }
 
-    // L2 supervisors: employees with lead_level >= 2 or hierarchy max >= 2
-    const [supervisors] = await pool.execute(
-      `SELECT DISTINCT up.id, up.email, up.phone, up.full_name, up.role
-       FROM user_profiles up
-       LEFT JOIN employee_onboarding eo ON eo.user_id = up.id
-       LEFT JOIN (
-         SELECT employee_user_id, MAX(hierarchy_level)::int AS max_level
-         FROM agent_employee_hierarchy
-         GROUP BY employee_user_id
-       ) h ON h.employee_user_id = up.id
-       WHERE up.role = 'employee'
-         AND COALESCE(up.is_active, TRUE) = TRUE
-         AND (
-           COALESCE(eo.lead_level, 0) >= 2
-           OR COALESCE(h.max_level, 0) >= 2
-         )
-         AND up.id IS DISTINCT FROM :assignee`,
-      { assignee: assignee?.id || null },
-    ).catch(() => [[]]);
+    // In-app: L2+ supervisors (and for TAT events, all employees get email below).
+    const supervisors = employees.filter(
+      (e) => Number(e.lead_level || 0) >= 2 && e.id !== assignee?.id,
+    );
 
-    for (const sup of supervisors || []) {
+    for (const sup of supervisors) {
       await createStaffNotification(pool, {
         userId: sup.id,
         role: 'employee',
@@ -416,12 +431,33 @@ export async function notifyLeadStakeholders(pool, {
       }).catch(() => {});
     }
 
+    // Leads TAT / assignment email: official employee mail only (no WhatsApp).
+    // TAT events are broadcast to all active employees via the existing sendEmail path.
     if (settings.notifyEmailEnabled) {
       const { sendEmail } = await import('./email.js');
       const recipients = new Map();
-      if (assignee?.email) recipients.set(assignee.email, assignee);
-      for (const s of supervisors || []) if (s.email) recipients.set(s.email, s);
-      for (const a of admins || []) if (a.email) recipients.set(a.email, a);
+
+      if (isTatEvent) {
+        for (const emp of employees) {
+          if (emp.email) recipients.set(String(emp.email).toLowerCase(), emp);
+        }
+      } else {
+        if (assignee?.id) {
+          const a = employees.find((e) => e.id === assignee.id);
+          if (a?.email) recipients.set(String(a.email).toLowerCase(), a);
+          else if (assignee.email) {
+            recipients.set(String(assignee.email).toLowerCase(), assignee);
+          }
+        }
+        for (const s of supervisors) {
+          if (s.email) recipients.set(String(s.email).toLowerCase(), s);
+        }
+      }
+
+      for (const a of admins || []) {
+        if (a.email) recipients.set(String(a.email).toLowerCase(), a);
+      }
+
       for (const [email] of recipients) {
         await sendEmail({
           to: email,
@@ -432,17 +468,7 @@ export async function notifyLeadStakeholders(pool, {
       }
     }
 
-    // WhatsApp to assignee phone only (templates are provider-specific; log console fallback).
-    if (settings.notifyWhatsappEnabled && assignee?.phone) {
-      try {
-        const digits = String(assignee.phone).replace(/\D/g, '').slice(-10);
-        if (digits.length === 10) {
-          console.info('[lead-notify:whatsapp]', digits, title, message.slice(0, 120));
-        }
-      } catch {
-        /* ignore */
-      }
-    }
+    // WhatsApp disabled for lead TAT / assignment alerts — official email only.
   } catch (err) {
     console.warn('[lead-notify]', err?.message || err);
   }

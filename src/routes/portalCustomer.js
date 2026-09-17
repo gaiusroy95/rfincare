@@ -80,15 +80,15 @@ portalCustomerRouter.get('/credit-score/report', authenticate, async (req, res, 
       { id: req.auth.userId },
     );
     if (!check?.report_path) {
-      return res.status(404).json({ error: 'CIBIL report not available yet. Pull your score first.' });
+      return res.status(404).json({ error: 'Credit report not available yet. Pull your score first.' });
     }
     const fileName = String(check.report_path).split('/').pop();
     const fullPath = resolve(getUploadDir(), 'cibil-reports', fileName);
     if (!existsSync(fullPath)) {
-      return res.status(404).json({ error: 'CIBIL report file not found' });
+      return res.status(404).json({ error: 'Credit report file not found' });
     }
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="cibil-report-${fileName}"`);
+    res.setHeader('Content-Disposition', `attachment; filename="credit-report-${fileName}"`);
     res.send(readFileSync(fullPath));
   } catch (err) {
     next(err);
@@ -99,7 +99,12 @@ portalCustomerRouter.post('/credit-score/pull', authenticate, async (req, res, n
   try {
     requireCustomer(req);
     const pool = getPool();
-    const pull = await pullCibilForCustomer(req.auth.userId);
+    const demographics = {
+      panNumber: req.body?.panNumber || req.body?.pan_number || null,
+      fatherName: req.body?.fatherName || req.body?.father_name || null,
+      pincode: req.body?.pincode || req.body?.pin_code || null,
+    };
+    const pull = await pullCibilForCustomer(req.auth.userId, { demographics });
     const [[profile]] = await pool.execute(
       `SELECT email FROM user_profiles WHERE id = :id LIMIT 1`,
       { id: req.auth.userId },

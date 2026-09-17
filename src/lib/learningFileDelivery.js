@@ -117,34 +117,24 @@ export function resolveLearningOpenTarget({
   }
 
   if (legacy && id) {
-    const diskPath = resolveLearningDiskPath({ filePath, fileUrl, fileName });
-    const publicUrl = diskPath ? buildPublicUploadUrl(diskPath) : null;
-    if (publicUrl) {
-      return { openUrl: publicUrl, downloadPath: publicUrl };
-    }
     const circularId = String(id).replace(/^circular-/, '');
-    return {
-      openUrl: buildAgentCircularDownloadPath(circularId),
-      downloadPath: buildAgentCircularDownloadPath(circularId),
-    };
+    const downloadPath = buildAgentCircularDownloadPath(circularId);
+    return { openUrl: downloadPath, downloadPath };
+  }
+
+  if (id && (fileUrl || filePath || fileName || contentType === 'video' || contentType === 'marketing' || contentType === 'image')) {
+    const downloadPath =
+      portal === 'employee'
+        ? buildEmployeeContentDownloadPath(id)
+        : buildAgentContentDownloadPath(id);
+    return { openUrl: downloadPath, downloadPath };
   }
 
   if (fileUrl || filePath || fileName) {
     const diskPath = resolveLearningDiskPath({ filePath, fileUrl, fileName });
-    const publicUrl = diskPath ? buildPublicUploadUrl(diskPath) : normalizeLearningPublicUrl(fileUrl || filePath || fileName);
-    if (diskPath && publicUrl?.startsWith('/uploads/')) {
-      return { openUrl: publicUrl, downloadPath: publicUrl };
-    }
-    if (id && contentType !== 'video') {
-      const downloadPath =
-        portal === 'employee'
-          ? buildEmployeeContentDownloadPath(id)
-          : buildAgentContentDownloadPath(id);
-      return {
-        openUrl: downloadPath,
-        downloadPath,
-      };
-    }
+    const publicUrl = diskPath
+      ? buildPublicUploadUrl(diskPath)
+      : normalizeLearningPublicUrl(fileUrl || filePath || fileName);
     if (publicUrl) return { openUrl: publicUrl, downloadPath: publicUrl };
   }
 

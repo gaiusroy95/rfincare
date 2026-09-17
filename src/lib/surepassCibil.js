@@ -21,7 +21,14 @@ function env(name, fallback = '') {
 
 export function getSurepassConfig(vendor = {}) {
   const baseUrl = env('SUREPASS_BASE_URL', DEFAULT_BASE_URL).replace(/\/$/, '');
-  const path = env('SUREPASS_CIBIL_PATH', DEFAULT_CIBIL_PATH);
+  const vendorKey = String(vendor.vendor_key || vendor.vendorKey || '').toLowerCase();
+  const isExperian = vendorKey === 'experian';
+  const defaultPath = isExperian
+    ? '/api/v1/credit-experian-pdf-report'
+    : DEFAULT_CIBIL_PATH;
+  const path = isExperian
+    ? env('SUREPASS_EXPERIAN_PATH', defaultPath)
+    : env('SUREPASS_CIBIL_PATH', defaultPath);
   const token = env('SUREPASS_TOKEN');
   const idNumber = env('SUREPASS_ID_NUMBER');
   const password = env('SUREPASS_PASSWORD') || String(vendor.api_secret || '').trim();
@@ -37,6 +44,8 @@ export function getSurepassConfig(vendor = {}) {
     bearerFromVendor: String(vendor.api_key || '').trim(),
     sandbox,
     timeoutMs,
+    vendorKey,
+    isExperian,
   };
 }
 
@@ -70,6 +79,8 @@ export function extractCreditScore(payload) {
     'credit_score',
     'cibil_score',
     'cibilScore',
+    'experian_score',
+    'experianScore',
     'creditScore',
     'score',
     'Score',
@@ -246,7 +257,14 @@ export async function requestSurepassCibilPdf(demographics, vendor = {}) {
   }
 
   const token = await loginForToken(cfg);
-  const paths = [cfg.path, ...FALLBACK_PATHS.filter((p) => p !== cfg.path)];
+  const experianFallbacks = [
+    '/api/v1/credit-experian-pdf-report',
+    '/api/v1/credit-report-experian',
+    '/api/v1/credit-report-experian/pdf',
+  ];
+  const paths = cfg.isExperian
+    ? [cfg.path, ...experianFallbacks.filter((p) => p !== cfg.path)]
+    : [cfg.path, ...FALLBACK_PATHS.filter((p) => p !== cfg.path)];
   let last = null;
 
   for (const path of paths) {

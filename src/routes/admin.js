@@ -170,6 +170,23 @@ adminRouter.get(
   async (req, res, next) => {
     try {
       const pool = getPool();
+      const year = req.query.year ?? req.query.y;
+      const month = req.query.month ?? req.query.m;
+      const from = req.query.from || req.query.dateFrom || req.query.date_from;
+      const to = req.query.to || req.query.dateTo || req.query.date_to;
+      const view = String(req.query.view || '').toLowerCase();
+      const hasMonth = year != null && year !== '' && month != null && month !== '';
+      const hasRange = Boolean(from && to);
+      const wantsDashboard =
+        view === 'dashboard'
+        || view === 'analytics'
+        || hasMonth
+        || hasRange;
+
+      if (wantsDashboard) {
+        const { buildDashboardAnalytics } = await import('../lib/dashboardAnalytics.js');
+        return res.json(await buildDashboardAnalytics(pool, { year, month, from, to }));
+      }
 
       const [[appStats]] = await pool.execute(
         `SELECT

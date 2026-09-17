@@ -4,6 +4,7 @@ function pad2(n) {
   return String(n).padStart(2, '0');
 }
 
+/** Calendar month (local) → inclusive YYYY-MM-DD bounds. */
 export function resolveDashboardPeriod({ year, month, from, to } = {}) {
   const now = new Date();
   let y = Number(year);
@@ -61,21 +62,24 @@ async function safeRows(pool, sql, params = {}) {
   }
 }
 
+const DATE_BETWEEN = (column) =>
+  `${column}::date BETWEEN :start::date AND :end::date`;
+
 /**
  * Live admin dashboard analytics for a calendar month (synced from system tables).
  */
 export async function buildDashboardAnalytics(pool = getPool(), periodInput = {}) {
   const period = resolveDashboardPeriod(periodInput);
   const params = {
-    start: `${period.startDate} 00:00:00`,
-    end: `${period.endDate} 23:59:59.999`,
+    start: period.startDate,
+    end: period.endDate,
   };
 
   const users = await safeScalar(
     pool,
     `SELECT COUNT(*)::int AS total
      FROM user_profiles
-     WHERE created_at >= :start::timestamptz AND created_at <= :end::timestamptz`,
+     WHERE ${DATE_BETWEEN('created_at')}`,
     params,
   );
 
@@ -102,18 +106,16 @@ export async function buildDashboardAnalytics(pool = getPool(), periodInput = {}
          END
        ), 0)::float AS investments
      FROM loan_applications
-     WHERE created_at >= :start::timestamptz AND created_at <= :end::timestamptz`,
+     WHERE ${DATE_BETWEEN('created_at')}`,
     params,
   );
 
-  // Prefer disbursed_at window when present for disbursed totals
   const disbursedWindow = await safeScalar(
     pool,
     `SELECT COALESCE(SUM(COALESCE(disbursed_amount, loan_amount, 0)), 0)::float AS disbursed
      FROM loan_applications
      WHERE LOWER(COALESCE(status, '')) = 'disbursed'
-       AND COALESCE(disbursed_at, updated_at, created_at) >= :start::timestamptz
-       AND COALESCE(disbursed_at, updated_at, created_at) <= :end::timestamptz`,
+       AND COALESCE(disbursed_at, updated_at, created_at)::date BETWEEN :start::date AND :end::date`,
     params,
   );
 
@@ -121,8 +123,7 @@ export async function buildDashboardAnalytics(pool = getPool(), periodInput = {}
     pool,
     `SELECT COALESCE(SUM(payment_amount), 0)::float AS total
      FROM insurance_purchase_orders
-     WHERE COALESCE(paid_at, created_at) >= :start::timestamptz
-       AND COALESCE(paid_at, created_at) <= :end::timestamptz
+     WHERE COALESCE(paid_at, created_at)::date BETWEEN :start::date AND :end::date
        AND LOWER(COALESCE(payment_status, '')) IN ('paid', 'captured', 'success', 'completed')`,
     params,
   );
@@ -131,7 +132,7 @@ export async function buildDashboardAnalytics(pool = getPool(), periodInput = {}
     pool,
     `SELECT COALESCE(SUM(payment_amount), 0)::float AS total
      FROM insurance_purchase_orders
-     WHERE created_at >= :start::timestamptz AND created_at <= :end::timestamptz`,
+     WHERE ${DATE_BETWEEN('created_at')}`,
     params,
   );
 
@@ -139,7 +140,7 @@ export async function buildDashboardAnalytics(pool = getPool(), periodInput = {}
     pool,
     `SELECT COALESCE(SUM(commission_amount), 0)::float AS total
      FROM agent_commission_ledger
-     WHERE created_at >= :start::timestamptz AND created_at <= :end::timestamptz`,
+     WHERE ${DATE_BETWEEN('created_at')}`,
     params,
   );
 
@@ -147,7 +148,7 @@ export async function buildDashboardAnalytics(pool = getPool(), periodInput = {}
     pool,
     `SELECT COALESCE(NULLIF(TRIM(loan_type), ''), 'Other') AS name, COUNT(*)::int AS value
      FROM loan_applications
-     WHERE created_at >= :start::timestamptz AND created_at <= :end::timestamptz
+     WHERE ${DATE_BETWEEN('created_at')}
      GROUP BY 1
      ORDER BY value DESC
      LIMIT 8`,
@@ -160,35 +161,34 @@ export async function buildDashboardAnalytics(pool = getPool(), periodInput = {}
             c.full_name AS customer_name
      FROM loan_applications la
      LEFT JOIN user_profiles c ON c.id = la.customer_id
-     WHERE la.created_at >= :start::timestamptz AND la.created_at <= :end::timestamptz
+     WHERE la.created_at::date BETWEEN :start::date AND :end::date
      ORDER BY la.created_at DESC
      LIMIT 8`,
     params,
   );
 
-  // Last 6 months ending at selected month (inclusive)
   const revenueSeries = [];
   for (let i = 5; i >= 0; i -= 1) {
     const d = new Date(period.year, period.month - 1 - i, 1);
     const s = new Date(d.getFullYear(), d.getMonth(), 1);
     const e = new Date(d.getFullYear(), d.getMonth() + 1, 0);
     const p = {
-      start: `${s.getFullYear()}-${pad2(s.getMonth() + 1)}-01 00:00:00`,
-      end: `${e.getFullYear()}-${pad2(e.getMonth() + 1)}-${pad2(e.getDate())} 23:59:59.999`,
+      start: `${s.getFullYear()}-${pad2(s.getMonth() + 1)}-01`,
+      end: `${e.getFullYear()}-${pad2(e.getMonth() + 1)}-${pad2(e.getDate())}`,
     };
     const loanRev = await safeScalar(
       pool,
       `SELECT COALESCE(SUM(COALESCE(disbursed_amount, loan_amount, 0)), 0)::float AS total
        FROM loan_applications
        WHERE LOWER(COALESCE(status, '')) IN ('approved', 'disbursed')
-         AND created_at >= :start::timestamptz AND created_at <= :end::timestamptz`,
+         AND created_at::date BETWEEN :start::date AND :end::date`,
       p,
     );
     const premRev = await safeScalar(
       pool,
       `SELECT COALESCE(SUM(payment_amount), 0)::float AS total
        FROM insurance_purchase_orders
-       WHERE created_at >= :start::timestamptz AND created_at <= :end::timestamptz`,
+       WHERE created_at::date BETWEEN :start::date AND :end::date`,
       p,
     );
     const total = Number(loanRev.total || 0) + Number(premRev.total || 0);
@@ -222,7 +222,7 @@ export async function buildDashboardAnalytics(pool = getPool(), periodInput = {}
     pool,
     `SELECT action_type, table_name, created_at, user_id
      FROM audit_logs
-     WHERE created_at >= :start::timestamptz AND created_at <= :end::timestamptz
+     WHERE created_at::date BETWEEN :start::date AND :end::date
      ORDER BY created_at DESC
      LIMIT 8`,
     params,
@@ -234,12 +234,17 @@ export async function buildDashboardAnalytics(pool = getPool(), periodInput = {}
   const commissionRaw = Number(commission.total || 0);
   const revenueRaw = disbursedRaw + premiumRaw + commissionRaw;
 
+  const monthName = new Date(period.year, period.month - 1, 1).toLocaleDateString('en-IN', {
+    month: 'long',
+    year: 'numeric',
+  });
   const labelFmt = new Intl.DateTimeFormat('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
   const periodLabel = `${labelFmt.format(new Date(`${period.startDate}T00:00:00`))} – ${labelFmt.format(new Date(`${period.endDate}T00:00:00`))}`;
 
   return {
     period: {
       ...period,
+      monthLabel: monthName,
       label: periodLabel,
     },
     kpis: {

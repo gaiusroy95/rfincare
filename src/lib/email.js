@@ -58,6 +58,12 @@ function humanizeSmtpError(err) {
   );
 }
 
+/** Customer-facing copy — never expose SMTP / provider credentials hints. */
+export function publicEmailDeliveryMessage(result) {
+  if (result?.sent) return null;
+  return 'Confirmation email could not be delivered right now. Our team still has your booking and will follow up.';
+}
+
 async function sendViaSmtp({ to, subject, text, html, attachments = [], cc }) {
   const nodemailer = await import('nodemailer');
   const pass = smtpPassword();
@@ -95,7 +101,7 @@ async function sendViaSmtp({ to, subject, text, html, attachments = [], cc }) {
   });
 }
 
-export async function sendEmail({ to, subject, text, html, attachments, cc }) {
+export async function sendEmail({ to, subject, text, html, attachments, cc, recipientName }) {
   if (!to) return { sent: false, reason: 'no_recipient' };
 
   const mailAttachments = Array.isArray(attachments)
@@ -120,14 +126,86 @@ export async function sendEmail({ to, subject, text, html, attachments, cc }) {
       };
     } catch (err) {
       console.error('[email:smtp]', err?.message || err);
-      return {
+      // Fall through to MSG91 when SMTP auth/config fails.
+      const smtpFailure = {
         sent: false,
         channel: 'smtp',
         reason: err?.code || 'smtp_error',
-        warning: humanizeSmtpError(err),
+        warningInternal: humanizeSmtpError(err),
         attachmentCount: mailAttachments.length,
       };
+
+      try {
+        const { sendMsg91TransactionalEmail, isMsg91EmailConfigured } = await import('./msg91.js');
+        // MSG91 email only needs domain+from for transactional; OTP template is optional.
+        const authKey = Boolean(String(process.env.MSG91_AUTH_KEY || '').trim());
+        const domain = Boolean(String(process.env.MSG91_EMAIL_DOMAIN || '').trim());
+        const from = Boolean(
+          String(process.env.MSG91_EMAIL_FROM_EMAIL || process.env.MSG91_EMAIL_FROM || '').trim(),
+        );
+        if (authKey && domain && from) {
+          const msg91 = await sendMsg91TransactionalEmail({
+            to,
+            subject,
+            text,
+            html,
+            recipientName,
+          });
+          if (msg91?.sent) {
+            return {
+              ...msg91,
+              channel: 'msg91',
+              attachmentCount: 0,
+              smtpFallback: true,
+            };
+          }
+          console.error('[email:msg91-fallback]', msg91?.warningInternal || msg91?.reason);
+        } else if (isMsg91EmailConfigured()) {
+          const msg91 = await sendMsg91TransactionalEmail({
+            to,
+            subject,
+            text,
+            html,
+            recipientName,
+          });
+          if (msg91?.sent) {
+            return { ...msg91, channel: 'msg91', attachmentCount: 0, smtpFallback: true };
+          }
+        }
+      } catch (fallbackErr) {
+        console.error('[email:fallback]', fallbackErr?.message || fallbackErr);
+      }
+
+      return {
+        ...smtpFailure,
+        // Public APIs must use publicEmailDeliveryMessage — do not put ops hints in `warning`.
+        warning: undefined,
+      };
     }
+  }
+
+  // No SMTP — try MSG91 transactional email before logging-only fallback.
+  try {
+    const { sendMsg91TransactionalEmail } = await import('./msg91.js');
+    const authKey = Boolean(String(process.env.MSG91_AUTH_KEY || '').trim());
+    const domain = Boolean(String(process.env.MSG91_EMAIL_DOMAIN || '').trim());
+    const from = Boolean(
+      String(process.env.MSG91_EMAIL_FROM_EMAIL || process.env.MSG91_EMAIL_FROM || '').trim(),
+    );
+    if (authKey && domain && from) {
+      const msg91 = await sendMsg91TransactionalEmail({
+        to,
+        subject,
+        text,
+        html,
+        recipientName,
+      });
+      if (msg91?.sent) {
+        return { ...msg91, channel: 'msg91', attachmentCount: 0 };
+      }
+    }
+  } catch (err) {
+    console.error('[email:msg91]', err?.message || err);
   }
 
   console.log('[email]', { to, cc, subject }, process.env.LOG_OTP === 'true' ? text : '(body hidden)');
@@ -135,8 +213,8 @@ export async function sendEmail({ to, subject, text, html, attachments, cc }) {
     sent: false,
     channel: 'log',
     reason: 'smtp_not_configured',
-    warning:
-      'Email was not delivered — configure SMTP_HOST and SMTP_FROM on the server. The message is saved in in-app chat only.',
+    warningInternal:
+      'Email was not delivered — configure SMTP_HOST and SMTP_FROM (or MSG91 email domain) on the server.',
     attachmentCount: mailAttachments.length,
   };
 }

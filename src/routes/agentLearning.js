@@ -28,6 +28,8 @@ const CONTENT_TYPES = new Set([
   'course',
   'webinar',
   'certification',
+  'marketing',
+  'image',
 ]);
 
 const TRAINING_TYPE_MAP = {
@@ -38,6 +40,8 @@ const TRAINING_TYPE_MAP = {
   course: 'course',
   webinar: 'webinar',
   certification: 'certification',
+  marketing: 'marketing',
+  image: 'image',
 };
 
 const uploadRoot = process.env.UPLOAD_DIR || './uploads';
@@ -65,18 +69,25 @@ function formatContentRow(row, progress = null) {
     filePath: row.file_path,
     fileName: row.file_name,
   });
+  const thumbnailUrl = row.thumbnail_url
+    || (String(row.mime_type || '').startsWith('image/') ? row.file_url : null);
   return {
     id: row.id,
     contentType: row.content_type,
     type: TRAINING_TYPE_MAP[row.content_type] || 'document',
     title: row.title,
     description: row.description,
+    categoryLabel: row.category_label || null,
+    category: row.category_label || null,
+    audience: row.audience || 'agent',
     duration: row.duration_label || '',
     durationLabel: row.duration_label,
     fileName: row.file_name,
     fileUrl: row.file_url,
     videoUrl: row.video_url,
     mimeType: row.mime_type,
+    fileSizeBytes: row.file_size_bytes != null ? Number(row.file_size_bytes) : null,
+    thumbnailUrl,
     isNew: Boolean(row.is_new),
     isActive: Boolean(row.is_active),
     sortOrder: row.sort_order,
@@ -186,7 +197,10 @@ adminAgentLearningRouter.post(
   '/',
   authenticate,
   authorize({ resource: 'agents', action: 'update' }),
-  learningUpload.single('file'),
+  learningUpload.fields([
+    { name: 'file', maxCount: 1 },
+    { name: 'thumbnail', maxCount: 1 },
+  ]),
   async (req, res, next) => {
     try {
       await ensureAgentLearningSchema();
@@ -198,11 +212,13 @@ adminAgentLearningRouter.post(
       const title = req.body?.title?.trim();
       if (!title) return res.status(400).json({ error: 'Title is required' });
 
+      const mainFile = req.files?.file?.[0] || req.file || null;
+      const thumbFile = req.files?.thumbnail?.[0] || null;
       const videoUrl = req.body?.videoUrl?.trim() || req.body?.video_url?.trim() || null;
-      if (contentType === 'video' && !videoUrl && !req.file) {
+      if (contentType === 'video' && !videoUrl && !mainFile) {
         return res.status(400).json({ error: 'Video URL or file is required for video content' });
       }
-      if (contentType !== 'video' && !req.file && !videoUrl) {
+      if (contentType !== 'video' && !mainFile && !videoUrl) {
         return res.status(400).json({ error: 'File upload is required' });
       }
 
@@ -212,34 +228,50 @@ adminAgentLearningRouter.post(
       let filePath = null;
       let fileName = null;
       let mimeType = null;
+      let fileSizeBytes = null;
+      let thumbnailUrl = null;
 
-      if (req.file) {
-        fileName = req.file.originalname;
-        filePath = req.file.path;
-        mimeType = req.file.mimetype;
-        fileUrl = `/uploads/agent-learning/${req.file.filename}`;
+      if (mainFile) {
+        fileName = mainFile.originalname;
+        filePath = mainFile.path;
+        mimeType = mainFile.mimetype;
+        fileSizeBytes = mainFile.size || null;
+        fileUrl = `/uploads/agent-learning/${mainFile.filename}`;
+        if (String(mimeType || '').startsWith('image/')) {
+          thumbnailUrl = fileUrl;
+        }
+      }
+      if (thumbFile) {
+        thumbnailUrl = `/uploads/agent-learning/${thumbFile.filename}`;
       }
 
       await pool.execute(
         `INSERT INTO agent_learning_content
          (id, content_type, audience, title, description, category_label, duration_label, file_name, file_path, file_url, mime_type,
-          video_url, is_new, sort_order, uploaded_by)
+          video_url, file_size_bytes, thumbnail_url, is_new, sort_order, uploaded_by)
          VALUES
          (:id, :content_type, :audience, :title, :description, :category_label, :duration_label, :file_name, :file_path, :file_url, :mime_type,
-          :video_url, :is_new, :sort_order, :uploaded_by)`,
+          :video_url, :file_size_bytes, :thumbnail_url, :is_new, :sort_order, :uploaded_by)`,
         {
           id,
           content_type: contentType,
-          audience: req.body?.audience === 'all' ? 'all' : 'agent',
+          audience: req.body?.audience === 'all' || contentType === 'marketing' || contentType === 'image'
+            ? 'all'
+            : 'agent',
           title,
           description: req.body?.description?.trim() || null,
-          category_label: req.body?.categoryLabel?.trim() || req.body?.category_label?.trim() || null,
+          category_label:
+            req.body?.categoryLabel?.trim()
+            || req.body?.category_label?.trim()
+            || (contentType === 'marketing' || contentType === 'image' ? 'Investment' : null),
           duration_label: req.body?.durationLabel?.trim() || req.body?.duration_label?.trim() || null,
           file_name: fileName,
           file_path: filePath,
           file_url: fileUrl,
           mime_type: mimeType,
           video_url: videoUrl,
+          file_size_bytes: fileSizeBytes,
+          thumbnail_url: thumbnailUrl,
           is_new: req.body?.isNew === 'false' || req.body?.isNew === false ? 0 : 1,
           sort_order: Number.parseInt(req.body?.sortOrder ?? req.body?.sort_order ?? '0', 10) || 0,
           uploaded_by: req.auth.userId,

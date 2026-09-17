@@ -241,9 +241,9 @@ export function buildReferralShareLinks(code, program) {
       partnerLogin: `${base}/agent-login?aref=${encoded}`,
     };
   }
-  // Customer referral links use cref; keep ref as alias for older share copies.
+  // Customer referral links use ref (cref kept as capture alias on the frontend).
   const looksLikeAgent = /^RFA([-\s]|$)/i.test(String(code || ''));
-  const param = looksLikeAgent ? 'aref' : 'cref';
+  const param = looksLikeAgent ? 'aref' : 'ref';
   return {
     homepage: `${base}/?${param}=${encoded}`,
     insurance: `${base}/insurance-marketplace?${param}=${encoded}`,

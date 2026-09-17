@@ -312,6 +312,208 @@ publicContentRouter.post('/eligibility/calculate', async (req, res) => {
   });
 });
 
+/**
+ * Public website eligibility check:
+ * - Calculates eligibility without login
+ * - Always upserts a marketing lead (website/direct) so Admin sees it even if the user never signs in
+ * - Preserves agent referral attribution when present
+ */
+const PublicEligibilityCheckSchema = z.object({
+  customerName: z.string().trim().min(2).max(120),
+  mobileNumber: z.string().trim().regex(/^[6-9]\d{9}$/, 'Enter a valid 10-digit mobile number'),
+  panNumber: z
+    .string()
+    .trim()
+    .toUpperCase()
+    .regex(/^[A-Z]{5}[0-9]{4}[A-Z]$/, 'Enter a valid PAN (e.g. ABCDE1234F)'),
+  gender: z.enum(['male', 'female', 'other']),
+  loanType: z.string().min(1),
+  loanAmount: z.coerce.number().positive().max(1e12),
+  monthlyIncome: z.coerce.number().positive().max(1e12),
+  extraIncome: z.coerce.number().min(0).max(1e12).optional().default(0),
+  employmentType: z.string().min(1),
+  creditScore: z.string().min(1),
+  existingLoans: z.coerce.number().min(0).max(1e12).optional().default(0),
+  pincode: z.string().optional().nullable(),
+  permanentPincode: z.string().optional().nullable(),
+  propertyPincode: z.string().optional().nullable(),
+  consentAccepted: z.literal(true),
+  sourcedAgentCode: z.string().optional().nullable(),
+  agentCode: z.string().optional().nullable(),
+  referralCode: z.string().optional().nullable(),
+  referralProgram: z.string().optional().nullable(),
+  sessionKey: z.string().optional().nullable(),
+});
+
+publicContentRouter.post('/eligibility/check', async (req, res, next) => {
+  try {
+    const input = PublicEligibilityCheckSchema.parse(req.body || {});
+    const { calculateEligibility } = await import('../lib/eligibilityEngine.js');
+    const {
+      upsertMarketingLead,
+      eligibilityPlaceholderEmail,
+    } = await import('../lib/marketingLeads.js');
+    const { applyReferralToLead, ensureReferralSchema } = await import('../lib/referralTracking.js');
+    const { normalizeAgentCode } = await import('../lib/agentAttribution.js');
+
+    const engineInput = {
+      loanType: input.loanType,
+      loanAmount: input.loanAmount,
+      monthlyIncome: input.monthlyIncome,
+      extraIncome: input.extraIncome || 0,
+      employmentType: input.employmentType,
+      creditScore: input.creditScore,
+      creditScoreRange: input.creditScore,
+      existingLoans: input.existingLoans || 0,
+      pincode: input.pincode || undefined,
+      pinCode: input.pincode || undefined,
+      currentPincode: input.pincode || undefined,
+      permanentPincode: input.permanentPincode || undefined,
+      propertyPincode: input.propertyPincode || undefined,
+    };
+
+    const result = await calculateEligibility(engineInput);
+    const probability = Number(result.overallProbability ?? 0);
+    const status = probability >= 80 ? 'high' : probability >= 60 ? 'medium' : 'low';
+    const checkedAt = new Date().toISOString();
+
+    const agentCode = normalizeAgentCode(
+      input.sourcedAgentCode || input.agentCode || input.referralCode,
+    );
+    const source = agentCode ? 'website_agent_referral' : 'website';
+
+    const eligibilityData = {
+      journeyStage: 'eligibility_checked',
+      checkedAt,
+      initiatedBy: {
+        channel: 'website/direct',
+        source,
+        agentCode: agentCode || null,
+      },
+      customer: {
+        fullName: input.customerName,
+        phone: input.mobileNumber,
+        panNumber: input.panNumber,
+        gender: input.gender,
+      },
+      formData: {
+        loanType: input.loanType,
+        loanAmount: input.loanAmount,
+        monthlyIncome: input.monthlyIncome,
+        extraIncome: input.extraIncome,
+        employmentType: input.employmentType,
+        creditScore: input.creditScore,
+        existingLoans: input.existingLoans,
+        pincode: input.pincode,
+        permanentPincode: input.permanentPincode,
+        propertyPincode: input.propertyPincode,
+      },
+      result: {
+        score: probability,
+        status,
+        eligibleAmount: result.eligibleAmount,
+        message: result.geoMessage || result.message,
+        banks: result.banks,
+      },
+    };
+
+    const pool = getPool();
+    const { row, created } = await upsertMarketingLead(pool, {
+      fullName: input.customerName,
+      email: eligibilityPlaceholderEmail(input.mobileNumber),
+      phone: input.mobileNumber,
+      loanType: input.loanType,
+      source,
+      consentAccepted: true,
+      sessionKey: input.sessionKey || null,
+      status: 'new',
+      skipAutoAssign: false,
+    });
+
+    if (row?.id) {
+      await ensureReferralSchema(pool).catch(() => {});
+      await applyReferralToLead(pool, row.id, {
+        sourcedAgentCode: agentCode,
+        agentCode,
+        referralCode: input.referralCode,
+        referralProgram: input.referralProgram,
+      }).catch(() => {});
+
+      if (agentCode) {
+        await pool.execute(
+          `UPDATE marketing_leads SET sourced_agent_code = COALESCE(:code, sourced_agent_code) WHERE id = :id`,
+          { id: row.id, code: agentCode },
+        ).catch(() => {});
+      }
+
+      await pool.execute(
+        `UPDATE marketing_leads SET
+           eligibility_score = :score,
+           eligibility_data = :data::jsonb,
+           loan_amount = :loan_amount,
+           employment_type = :employment_type,
+           loan_type = COALESCE(:loan_type, loan_type),
+           consent_accepted = TRUE,
+           updated_at = NOW()
+         WHERE id = :id`,
+        {
+          id: row.id,
+          score: probability,
+          data: JSON.stringify(eligibilityData),
+          loan_amount: input.loanAmount,
+          employment_type: input.employmentType,
+          loan_type: input.loanType,
+        },
+      ).catch(async () => {
+        // Older DBs may not cast jsonb the same way
+        await pool.execute(
+          `UPDATE marketing_leads SET
+             eligibility_score = :score,
+             eligibility_data = :data,
+             loan_amount = :loan_amount,
+             employment_type = :employment_type,
+             loan_type = COALESCE(:loan_type, loan_type),
+             updated_at = NOW()
+           WHERE id = :id`,
+          {
+            id: row.id,
+            score: probability,
+            data: JSON.stringify(eligibilityData),
+            loan_amount: input.loanAmount,
+            employment_type: input.employmentType,
+            loan_type: input.loanType,
+          },
+        ).catch(() => {});
+      });
+    }
+
+    res.json({
+      ...result,
+      overallProbability: probability,
+      eligibilityStatus: status,
+      eligibleAmount: result.eligibleAmount,
+      message: result.geoMessage || result.message,
+      lead: row
+        ? {
+            id: row.id,
+            created,
+            source,
+            loanType: input.loanType,
+            eligibilityScore: probability,
+            eligibilityStatus: status,
+            checkedAt,
+            initiatedBy: 'website/direct',
+          }
+        : null,
+    });
+  } catch (err) {
+    if (err?.name === 'ZodError') {
+      return res.status(400).json({ error: err.errors?.[0]?.message || 'Invalid eligibility details' });
+    }
+    next(err);
+  }
+});
+
 const OtpRequestSchema = z.object({
   email: z.string().email(),
   phone: z.string().optional(),

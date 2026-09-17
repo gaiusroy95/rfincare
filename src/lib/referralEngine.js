@@ -463,6 +463,35 @@ export async function recordReferralClick(pool, {
   };
 }
 
+/**
+ * Share-form invites should appear in Referral performance immediately as leads.
+ */
+export async function createInviteLeadAttribution(pool, {
+  referrerUserId,
+  referrerCode,
+  program = 'customer',
+  referredName = null,
+  referredEmail = null,
+  referredPhone = null,
+  channel = 'share',
+} = {}) {
+  if (!referrerUserId || !referrerCode) return null;
+  await ensureReferralEngineSchema(pool);
+  const referralType =
+    program === 'agent' || /^RFA([-\s]|$)/i.test(String(referrerCode || ''))
+      ? 'agent'
+      : 'customer';
+
+  return createAttribution(pool, {
+    referralType,
+    referrerUserId,
+    referrerCode,
+    status: 'lead',
+    landingPage: channel ? `invite:${channel}` : 'invite',
+    sourceUrl: [referredName, referredEmail, referredPhone].filter(Boolean).join(' | ') || null,
+  });
+}
+
 export async function resolveActiveAttribution(pool, {
   attributionId = null,
   referralCode = null,
@@ -1062,27 +1091,64 @@ export async function getReferrerPerformanceMetrics(pool, referrerUserId, progra
   const typeFilter = program === 'agent' ? 'agent' : program === 'customer' ? 'customer' : null;
   const params = { uid: referrerUserId };
   let typeClause = '';
+  let programClause = '';
   if (typeFilter) {
     typeClause = ' AND referral_type = :rtype';
     params.rtype = typeFilter;
   }
+  if (program === 'agent' || program === 'customer') {
+    programClause = ' AND program = :program';
+    params.program = program;
+  }
 
   const [[clicks]] = await pool.execute(
-    `SELECT COUNT(*)::int AS c FROM referral_clicks WHERE referrer_user_id = :uid`,
-    { uid: referrerUserId },
+    `SELECT COUNT(*)::int AS c FROM referral_clicks
+     WHERE referrer_user_id = :uid${programClause}`,
+    params,
+  );
+
+  const inviteParams = { uid: referrerUserId };
+  let inviteProgramClause = '';
+  if (program === 'agent' || program === 'customer') {
+    inviteProgramClause = ' AND program = :program';
+    inviteParams.program = program;
+  }
+  const [[invites]] = await pool.execute(
+    `SELECT COUNT(*)::int AS c FROM referral_invites
+     WHERE referrer_user_id = :uid${inviteProgramClause}`,
+    inviteParams,
   );
 
   const [[funnel]] = await pool.execute(
     `SELECT
        COUNT(*)::int AS attributions,
-       COUNT(*) FILTER (WHERE status IN ('lead', 'application', 'submitted', 'approved', 'disbursed', 'reward_eligible', 'reward_pending', 'reward_paid'))::int AS leads,
+       COUNT(*) FILTER (WHERE status IN ('registered', 'lead', 'application', 'submitted', 'approved', 'disbursed', 'reward_eligible', 'reward_pending', 'reward_paid'))::int AS leads,
        COUNT(*) FILTER (WHERE status IN ('application', 'submitted', 'approved', 'disbursed', 'reward_eligible', 'reward_pending', 'reward_paid'))::int AS applications,
        COUNT(*) FILTER (WHERE status IN ('approved', 'disbursed', 'reward_eligible', 'reward_pending', 'reward_paid'))::int AS approved,
-       COUNT(*) FILTER (WHERE status IN ('disbursed', 'reward_eligible', 'reward_pending', 'reward_paid'))::int AS disbursed
+       COUNT(*) FILTER (WHERE status IN ('disbursed', 'reward_eligible', 'reward_pending', 'reward_paid'))::int AS disbursed,
+       COUNT(*) FILTER (WHERE status = 'clicked')::int AS clicked_only
      FROM referral_attributions
      WHERE referrer_user_id = :uid${typeClause}`,
     params,
   );
+
+  const mktParams = { uid: referrerUserId };
+  let mktProgramClause = '';
+  if (program === 'agent' || program === 'customer') {
+    mktProgramClause = ' AND referral_program = :program';
+    mktParams.program = program;
+  }
+  let marketingLeads = 0;
+  try {
+    const [[mkt]] = await pool.execute(
+      `SELECT COUNT(*)::int AS c FROM marketing_leads
+       WHERE referred_by_user_id = :uid${mktProgramClause}`,
+      mktParams,
+    );
+    marketingLeads = Number(mkt?.c || 0);
+  } catch {
+    marketingLeads = 0;
+  }
 
   const [[money]] = await pool.execute(
     `SELECT
@@ -1097,9 +1163,15 @@ export async function getReferrerPerformanceMetrics(pool, referrerUserId, progra
     params,
   );
 
+  const attributionLeads = Number(funnel?.leads || 0);
+  const inviteLeads = Number(invites?.c || 0);
+  // Invites and marketing leads should surface immediately; avoid under-counting when
+  // attribution rows lag behind share-form invites.
+  const leads = Math.max(attributionLeads, inviteLeads, marketingLeads);
+
   return {
     clicks: Number(clicks?.c || 0),
-    leads: Number(funnel?.leads || 0),
+    leads,
     applications: Number(funnel?.applications || 0),
     approved: Number(funnel?.approved || 0),
     disbursed: Number(funnel?.disbursed || 0),
@@ -1108,6 +1180,8 @@ export async function getReferrerPerformanceMetrics(pool, referrerUserId, progra
     pending: Number(money?.pending || 0),
     paid: Number(money?.paid || 0),
     attributions: Number(funnel?.attributions || 0),
+    invites: inviteLeads,
+    marketingLeads,
   };
 }
 

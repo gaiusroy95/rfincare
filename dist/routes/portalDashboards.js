@@ -26,6 +26,7 @@ import {
 } from "../lib/agentCommissionLedger.js";
 import { buildAgentRecentActivities } from "../lib/agentRecentActivities.js";
 import { getNextCommissionPayoutDateIso } from "../lib/commissionPayoutCycle.js";
+import { buildAgentCircularDownloadPath } from "../lib/learningFileDelivery.js";
 import {
   autoAssignApplicationsForEmployeeVerification,
   fetchEmployeeOwnedApplicationIds
@@ -558,12 +559,18 @@ portalDashboardsRouter.get("/agent/dashboard", authenticate, async (req, res, ne
           disbursed: disbursedApps,
           ratePct: submittedApps > 0 ? Math.round(disbursedApps / submittedApps * 100) : 0
         },
-        policyUpdates: (circulars || []).slice(0, 5).map((c) => ({
-          id: c.id,
-          title: c.title || "Policy update",
-          fileUrl: c.file_url || c.fileUrl,
-          createdAt: c.created_at || c.createdAt
-        }))
+        policyUpdates: (circulars || []).slice(0, 5).map((c) => {
+          const fileUrl = c.file_url || c.fileUrl || null;
+          const openUrl = c.id ? buildAgentCircularDownloadPath(c.id) : null;
+          return {
+            id: c.id,
+            title: c.title || "Policy update",
+            fileUrl,
+            openUrl,
+            downloadPath: openUrl,
+            createdAt: c.created_at || c.createdAt
+          };
+        })
       },
       attribution: {
         agentCode,

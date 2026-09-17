@@ -222,6 +222,79 @@ cmsRouter.put("/homepage/trust-signals", async (req, res, next) => {
     next(err);
   }
 });
+cmsRouter.get("/marketplace-hero", async (req, res, next) => {
+  try {
+    const { getAllMarketplaceHeroContent, getMarketplaceHeroContent } = await import("../lib/marketplaceHeroContent.js");
+    const type = req.query.type || req.query.marketplace;
+    if (type) {
+      return res.json(await getMarketplaceHeroContent(type));
+    }
+    res.json(await getAllMarketplaceHeroContent());
+  } catch (err) {
+    next(err);
+  }
+});
+cmsRouter.put("/marketplace-hero/:type", async (req, res, next) => {
+  try {
+    const { upsertMarketplaceHeroContent } = await import("../lib/marketplaceHeroContent.js");
+    const slides = Array.isArray(req.body?.slides) ? req.body.slides : req.body;
+    res.json(await upsertMarketplaceHeroContent(req.params.type, slides, req.auth.userId));
+  } catch (err) {
+    next(err);
+  }
+});
+cmsRouter.get("/flash-tiles/categories", async (_req, res, next) => {
+  try {
+    const { FLASH_TILE_CATEGORIES } = await import("../lib/flashTiles.js");
+    res.json({ categories: FLASH_TILE_CATEGORIES });
+  } catch (err) {
+    next(err);
+  }
+});
+cmsRouter.get("/flash-tiles", async (req, res, next) => {
+  try {
+    const { listFlashTiles, FLASH_TILE_CATEGORIES } = await import("../lib/flashTiles.js");
+    const category = req.query.category || null;
+    const tiles = await listFlashTiles({ category, activeOnly: false });
+    res.json({ categories: FLASH_TILE_CATEGORIES, tiles });
+  } catch (err) {
+    next(err);
+  }
+});
+cmsRouter.post("/flash-tiles", async (req, res, next) => {
+  try {
+    const { createFlashTile } = await import("../lib/flashTiles.js");
+    const tile = await createFlashTile(req.body || {}, req.auth.userId);
+    res.status(201).json(tile);
+  } catch (err) {
+    next(err);
+  }
+});
+cmsRouter.put("/flash-tiles/:id", async (req, res, next) => {
+  try {
+    const { updateFlashTile } = await import("../lib/flashTiles.js");
+    res.json(await updateFlashTile(req.params.id, req.body || {}, req.auth.userId));
+  } catch (err) {
+    next(err);
+  }
+});
+cmsRouter.post("/flash-tiles/:id/duplicate", async (req, res, next) => {
+  try {
+    const { duplicateFlashTile } = await import("../lib/flashTiles.js");
+    const tile = await duplicateFlashTile(req.params.id, req.auth.userId);
+    res.status(201).json(tile);
+  } catch (err) {
+    next(err);
+  }
+});
+cmsRouter.delete("/flash-tiles/:id", async (req, res, next) => {
+  try {
+    const { deleteFlashTile } = await import("../lib/flashTiles.js");
+    res.json(await deleteFlashTile(req.params.id));
+  } catch (err) {
+    next(err);
+  }
+});
 cmsRouter.get("/about-content", async (_req, res, next) => {
   try {
     res.json(await getAboutPageContent());

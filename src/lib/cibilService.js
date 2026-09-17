@@ -118,6 +118,88 @@ async function getActiveVendor(pool) {
   return row;
 }
 
+async function getVendorByKey(pool, vendorKey) {
+  const [[row]] = await pool.execute(
+    `SELECT * FROM cibil_vendors WHERE vendor_key = :key LIMIT 1`,
+    { key: vendorKey },
+  );
+  return row || null;
+}
+
+/**
+ * Customer dashboard rule:
+ * - First successful bureau pull → TransUnion CIBIL
+ * - Every subsequent refresh → Experian only
+ *
+ * Eligibility check can override with preferredVendorKeys (Experian / Equifax / CRIF).
+ */
+async function resolveCustomerPullVendor(pool, customerId, { preferredVendorKeys = null } = {}) {
+  const preferred = Array.isArray(preferredVendorKeys)
+    ? preferredVendorKeys.map((k) => String(k || '').toLowerCase()).filter(Boolean)
+    : [];
+
+  if (preferred.length) {
+    for (const key of preferred) {
+      let vendor = await getVendorByKey(pool, key);
+      if (!vendor && key === 'experian') {
+        await pool.execute(
+          `INSERT INTO cibil_vendors (vendor_key, display_name, sandbox_mode, is_active, updated_at)
+           VALUES ('experian', 'Experian', TRUE, FALSE, NOW())
+           ON CONFLICT (vendor_key) DO NOTHING`,
+        );
+        vendor = await getVendorByKey(pool, 'experian');
+      }
+      if (vendor) {
+        return {
+          vendor,
+          targetKey: key,
+          successCount: null,
+          lastVendorKey: null,
+          isFirstPull: false,
+          isFirstExperianRefresh: true,
+          preferredOverride: true,
+        };
+      }
+    }
+  }
+
+  const [[stats]] = await pool.execute(
+    `SELECT
+       COUNT(*) FILTER (WHERE status = 'success')::int AS success_count,
+       (
+         SELECT vendor_key FROM cibil_checks
+         WHERE customer_id = :id AND status = 'success'
+         ORDER BY checked_at DESC LIMIT 1
+       ) AS last_vendor_key
+     FROM cibil_checks
+     WHERE customer_id = :id`,
+    { id: customerId },
+  );
+  const successCount = Number(stats?.success_count || 0);
+  const targetKey = successCount === 0 ? 'transunion_cibil' : 'experian';
+  let vendor = await getVendorByKey(pool, targetKey);
+  if (!vendor && targetKey === 'experian') {
+    await pool.execute(
+      `INSERT INTO cibil_vendors (vendor_key, display_name, sandbox_mode, is_active, updated_at)
+       VALUES ('experian', 'Experian', TRUE, FALSE, NOW())
+       ON CONFLICT (vendor_key) DO NOTHING`,
+    );
+    vendor = await getVendorByKey(pool, 'experian');
+  }
+  if (!vendor && targetKey === 'transunion_cibil') {
+    vendor = await getActiveVendor(pool);
+  }
+  return {
+    vendor,
+    targetKey,
+    successCount,
+    lastVendorKey: stats?.last_vendor_key || null,
+    isFirstPull: successCount === 0,
+    isFirstExperianRefresh: successCount > 0 && stats?.last_vendor_key !== 'experian',
+    preferredOverride: false,
+  };
+}
+
 function writeLocalSandboxPdf({ vendor, application, customer, score }) {
   const data = parseJson(application?.data);
   const reportDir = resolve(getUploadDir(), 'cibil-reports');
@@ -135,7 +217,7 @@ function writeLocalSandboxPdf({ vendor, application, customer, score }) {
     `Checked at: ${new Date().toISOString()}`,
     '',
     'Surepass credentials were not set, so this PDF is a local sandbox stub.',
-    'Set SUREPASS_TOKEN or SUREPASS_ID_NUMBER + SUREPASS_PASSWORD to pull a real CIBIL PDF.',
+    'Set SUREPASS_TOKEN or SUREPASS_ID_NUMBER + SUREPASS_PASSWORD to pull a real bureau PDF.',
   ];
   writeFileSync(reportPath, buildSimpleTextPdf(lines));
   return `/uploads/cibil-reports/${fileName}`;
@@ -221,7 +303,7 @@ async function productionPull({ vendor, application, customer, extra }) {
       creditScore: null,
       reportPath: null,
       errorMessage:
-        'Surepass credentials missing. Set SUREPASS_TOKEN or SUREPASS_ID_NUMBER + SUREPASS_PASSWORD (or save API key on the TransUnion CIBIL vendor).',
+        'Surepass credentials missing. Set SUREPASS_TOKEN or SUREPASS_ID_NUMBER + SUREPASS_PASSWORD (or save API key on the bureau vendor).',
       response: { error: 'missing_credentials' },
     };
   }
@@ -360,7 +442,10 @@ export async function getLatestCustomerCibilCheck(customerId) {
   };
 }
 
-export async function pullCibilForCustomer(customerId, { forceSandbox = false, demographics = null } = {}) {
+export async function pullCibilForCustomer(
+  customerId,
+  { forceSandbox = false, demographics = null, preferredVendorKeys = null } = {},
+) {
   await ensureMilestone4Schema();
   const pool = getPool();
   const [[customer]] = await pool.execute(
@@ -378,7 +463,27 @@ export async function pullCibilForCustomer(customerId, { forceSandbox = false, d
     throw e;
   }
 
-  if (!forceSandbox) {
+  const vendorPlan = await resolveCustomerPullVendor(pool, customerId, { preferredVendorKeys });
+  const vendor = vendorPlan.vendor;
+  if (!vendor) {
+    const e = new Error(
+      vendorPlan.targetKey === 'experian'
+        ? 'Experian vendor is not configured'
+        : 'No CIBIL vendor configured for first pull',
+    );
+    e.status = 400;
+    throw e;
+  }
+
+  // Cooldown applies only when refreshing the same bureau again.
+  // First TransUnion → first Experian switch is always allowed.
+  // Eligibility preferred-bureau pulls also skip cooldown so the check can refresh score.
+  if (
+    !forceSandbox
+    && !vendorPlan.preferredOverride
+    && !vendorPlan.isFirstPull
+    && !vendorPlan.isFirstExperianRefresh
+  ) {
     const latest = await getLatestCustomerCibilCheck(customerId);
     if (latest?.checkedAt) {
       const daysSince =
@@ -392,13 +497,6 @@ export async function pullCibilForCustomer(customerId, { forceSandbox = false, d
         throw e;
       }
     }
-  }
-
-  const vendor = await getActiveVendor(pool);
-  if (!vendor) {
-    const e = new Error('No active CIBIL vendor configured in admin panel');
-    e.status = 400;
-    throw e;
   }
 
   const [[latestApp]] = await pool.execute(
@@ -447,7 +545,11 @@ export async function pullCibilForCustomer(customerId, { forceSandbox = false, d
       score: result.creditScore,
       path: result.reportPath,
       err: result.errorMessage || null,
-      resp: JSON.stringify({ ...result.response, source: 'customer_portal' }),
+      resp: JSON.stringify({
+        ...result.response,
+        source: 'customer_portal',
+        pullRule: vendorPlan.isFirstPull ? 'first_transunion' : 'refresh_experian',
+      }),
     },
   );
 
@@ -456,6 +558,7 @@ export async function pullCibilForCustomer(customerId, { forceSandbox = false, d
     vendorKey: vendor.vendor_key,
     vendorName: vendor.display_name,
     sandboxMode: useSandbox,
+    pullRule: vendorPlan.isFirstPull ? 'first_transunion' : 'refresh_experian',
     ...result,
   };
 }
@@ -475,9 +578,9 @@ const BAND_LABELS = {
 };
 
 /**
- * Employee portal CIBIL pull — minimal demographics (no customer account required).
+ * Staff (employee/admin) CIBIL pull — minimal demographics (no customer account required).
  */
-export async function pullCibilForEmployee(demographics, employeeUserId) {
+export async function pullCibilForEmployee(demographics, employeeUserId, options = {}) {
   await ensureMilestone4Schema();
   const pool = getPool();
   const vendor = await getActiveVendor(pool);
@@ -486,6 +589,13 @@ export async function pullCibilForEmployee(demographics, employeeUserId) {
     e.status = 503;
     throw e;
   }
+
+  const source = options.source || 'employee_portal';
+  const reportUrlPrefix =
+    options.reportUrlPrefix
+    || (source === 'admin_panel'
+      ? '/admin/milestone4/cibil/report'
+      : '/portal/employee/milestone4/cibil/report');
 
   const stubId = newId();
   const stubCustomer = {
@@ -502,12 +612,14 @@ export async function pullCibilForEmployee(demographics, employeeUserId) {
       fatherName: demographics.fatherName,
       pincode: demographics.pincode,
       pin_code: demographics.pincode,
+      gender: demographics.gender || null,
     }),
   };
   const extra = {
     fullName: demographics.fullName,
     fatherName: demographics.fatherName,
     pincode: demographics.pincode,
+    gender: demographics.gender || null,
     consent: true,
   };
 
@@ -528,7 +640,7 @@ export async function pullCibilForEmployee(demographics, employeeUserId) {
       score: result.creditScore,
       path: result.reportPath,
       err: result.errorMessage || null,
-      req: JSON.stringify({ ...demographics, initiatedByUserId: employeeUserId, source: 'employee_portal' }),
+      req: JSON.stringify({ ...demographics, initiatedByUserId: employeeUserId, source }),
       resp: JSON.stringify(result.response || {}),
     },
   );
@@ -548,6 +660,7 @@ export async function pullCibilForEmployee(demographics, employeeUserId) {
     vendorName: vendor.display_name,
     sandboxMode: useSandbox,
     reportPath: result.reportPath,
+    reportUrl: result.reportPath ? `${reportUrlPrefix}/${checkId}` : null,
     checkedAt: new Date().toISOString(),
   };
 }
@@ -640,6 +753,32 @@ export async function pullCibilForGuest(demographics, { upsertLead } = {}) {
   };
 }
 
+export async function getCibilCheckById(checkId) {
+  await ensureMilestone4Schema();
+  const pool = getPool();
+  const [[row]] = await pool.execute(
+    `SELECT cc.*, cv.display_name AS vendor_name
+     FROM cibil_checks cc
+     LEFT JOIN cibil_vendors cv ON cv.vendor_key = cc.vendor_key
+     WHERE cc.id = :id
+     LIMIT 1`,
+    { id: checkId },
+  );
+  if (!row) return null;
+  return {
+    id: row.id,
+    applicationId: row.application_id,
+    customerId: row.customer_id,
+    vendorKey: row.vendor_key,
+    vendorName: row.vendor_name,
+    status: row.status,
+    creditScore: row.credit_score != null ? Number(row.credit_score) : null,
+    reportPath: row.report_path,
+    errorMessage: row.error_message,
+    createdAt: row.created_at,
+  };
+}
+
 export async function syncSurepassVendorFromEnv(pool = getPool()) {
   const token = String(process.env.SUREPASS_TOKEN || '').trim();
   const sandbox = String(process.env.SUREPASS_SANDBOX || 'true') !== 'false';
@@ -657,7 +796,21 @@ export async function syncSurepassVendorFromEnv(pool = getPool()) {
       sandbox: sandbox ? 1 : 0,
     },
   );
+  // Keep Experian available for customer refresh pulls (selected by key, not is_active)
   await pool.execute(
-    `UPDATE cibil_vendors SET is_active = FALSE WHERE vendor_key != 'transunion_cibil'`,
+    `INSERT INTO cibil_vendors (vendor_key, display_name, api_key, sandbox_mode, is_active, updated_at)
+     VALUES ('experian', 'Experian', :api_key, :sandbox, FALSE, NOW())
+     ON CONFLICT (vendor_key) DO UPDATE SET
+       display_name = EXCLUDED.display_name,
+       api_key = COALESCE(NULLIF(EXCLUDED.api_key, ''), cibil_vendors.api_key),
+       sandbox_mode = EXCLUDED.sandbox_mode,
+       updated_at = NOW()`,
+    {
+      api_key: token || null,
+      sandbox: sandbox ? 1 : 0,
+    },
+  );
+  await pool.execute(
+    `UPDATE cibil_vendors SET is_active = FALSE WHERE vendor_key NOT IN ('transunion_cibil')`,
   );
 }

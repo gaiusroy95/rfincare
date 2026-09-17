@@ -23,20 +23,40 @@ export async function findMarketingLeadByContact(pool, { email, phone, sessionKe
 
   const normalizedEmail = normalizeLeadEmail(email);
   const normalizedPhone = normalizeLeadPhone(phone);
-  if (!normalizedEmail || normalizedPhone.length !== 10) return null;
 
-  const [rows] = await pool.execute(
-    `SELECT * FROM marketing_leads
-     WHERE ${sqlParamEqualsLower('email', 'email')}
-     ORDER BY updated_at DESC
-     LIMIT 20`,
-    { email: normalizedEmail },
-  );
-
-  for (const row of rows) {
-    if (normalizeLeadPhone(row.phone) === normalizedPhone) return row;
+  if (normalizedEmail && normalizedPhone.length === 10) {
+    const [rows] = await pool.execute(
+      `SELECT * FROM marketing_leads
+       WHERE ${sqlParamEqualsLower('email', 'email')}
+       ORDER BY updated_at DESC
+       LIMIT 20`,
+      { email: normalizedEmail },
+    );
+    for (const row of rows) {
+      if (normalizeLeadPhone(row.phone) === normalizedPhone) return row;
+    }
   }
+
+  // Phone-only match (eligibility leads may use placeholder emails).
+  if (normalizedPhone.length === 10) {
+    const [rows] = await pool.execute(
+      `SELECT * FROM marketing_leads
+       WHERE phone LIKE :phone_tail
+       ORDER BY updated_at DESC
+       LIMIT 30`,
+      { phone_tail: `%${normalizedPhone}` },
+    );
+    for (const row of rows || []) {
+      if (normalizeLeadPhone(row.phone) === normalizedPhone) return row;
+    }
+  }
+
   return null;
+}
+
+export function eligibilityPlaceholderEmail(phone) {
+  const digits = normalizeLeadPhone(phone);
+  return `elig.${digits || 'unknown'}@leads.rfincare.local`;
 }
 
 export async function upsertMarketingLead(
@@ -56,8 +76,11 @@ export async function upsertMarketingLead(
 ) {
   await ensureLeadAssignmentSchema(pool).catch(() => {});
 
-  const normalizedEmail = normalizeLeadEmail(email);
   const normalizedPhone = normalizeLeadPhone(phone);
+  let normalizedEmail = normalizeLeadEmail(email);
+  if (!normalizedEmail && normalizedPhone.length === 10) {
+    normalizedEmail = eligibilityPlaceholderEmail(normalizedPhone);
+  }
   const trimmedName = String(fullName || '').trim();
   const existing = await findMarketingLeadByContact(pool, {
     email: normalizedEmail,

@@ -265,6 +265,126 @@ async function getPolicyVersion(id) {
     riskRules: risk
   };
 }
+function summarizeCondition(c) {
+  const val = c.value_json ?? c.value ?? null;
+  const valTo = c.value_to_json ?? c.value_to ?? null;
+  const valueLabel = valTo != null ? `${JSON.stringify(val)} … ${JSON.stringify(valTo)}` : val != null ? JSON.stringify(val) : "—";
+  return `${c.field_key || c.fieldKey || "field"} ${c.operator || ""} ${valueLabel}`.trim();
+}
+async function getPolicyVisibilitySummary(id) {
+  const detail = await getPolicyVersion(id);
+  if (!detail) return null;
+  const pool = getPool();
+  let currentActive = null;
+  if (detail.bank_product_id) {
+    const [activeRows] = await pool.query(
+      `SELECT id, version_label, status, published_at
+       FROM product_policy_versions
+       WHERE bank_product_id = :pid AND status = 'active' AND id <> :id
+       ORDER BY published_at DESC NULLS LAST
+       LIMIT 1`,
+      { pid: detail.bank_product_id, id }
+    );
+    currentActive = activeRows[0] || null;
+  }
+  const rules = detail.rules || [];
+  const byDomain = {};
+  for (const r of rules) {
+    const domain = r.rule_domain || r.ruleDomain || "general";
+    if (!byDomain[domain]) byDomain[domain] = [];
+    byDomain[domain].push({
+      id: r.id,
+      code: r.rule_code || r.ruleCode,
+      name: r.rule_name || r.ruleName,
+      severity: r.severity,
+      active: Boolean(r.is_active),
+      conditions: (r.conditions || []).map(summarizeCondition)
+    });
+  }
+  const snapshot = detail.snapshot_json || {};
+  const snapshotKeys = Object.keys(snapshot).filter((k) => !String(k).startsWith("policy_"));
+  const approving = {
+    title: "What you are approving",
+    versionLabel: detail.version_label,
+    status: detail.status,
+    lender: detail.bank_name || detail.bank_id,
+    product: detail.product_name || (detail.bank_product_id ? "Linked product" : "Lender-wide (all products)"),
+    changeReason: detail.change_reason || null,
+    effectiveFrom: detail.effective_from || null,
+    effectiveTo: detail.effective_to || null,
+    submittedAt: detail.submitted_at || null,
+    approvedAt: detail.approved_at || null,
+    counts: {
+      eligibilityRules: rules.length,
+      propertyLtvRules: (detail.propertyLtvRules || []).length,
+      dscrRules: (detail.dscrRules || []).length,
+      riskRules: (detail.riskRules || []).length,
+      snapshotFields: snapshotKeys.length
+    },
+    eligibilityByDomain: byDomain,
+    propertyLtvRules: (detail.propertyLtvRules || []).map((r) => ({
+      id: r.id,
+      propertyType: r.property_type || r.propertyType,
+      maxLtv: r.max_ltv_pct ?? r.maxLtvPct,
+      notes: r.notes || null
+    })),
+    dscrRules: (detail.dscrRules || []).map((r) => ({
+      id: r.id,
+      minDscr: r.min_dscr ?? r.minDscr,
+      notes: r.notes || null
+    })),
+    riskRules: (detail.riskRules || []).map((r) => ({
+      id: r.id,
+      code: r.rule_code || r.ruleCode,
+      name: r.rule_name || r.ruleName,
+      severity: r.severity
+    })),
+    snapshotHighlights: snapshotKeys.slice(0, 24).map((key) => ({
+      key,
+      value: typeof snapshot[key] === "object" ? JSON.stringify(snapshot[key]).slice(0, 120) : String(snapshot[key])
+    }))
+  };
+  const publishing = {
+    title: "What publishing will change on the portal",
+    effects: [
+      detail.bank_product_id ? `Bank product catalog entry will be updated with this policy snapshot (${detail.product_name || detail.bank_product_id}).` : "Lender-scoped rules will go live for products under this bank (no single product row update).",
+      `${rules.length} eligibility rule(s) for this version will be activated for customer/agent eligibility & matching.`,
+      `${(detail.propertyLtvRules || []).length} property LTV rule(s), ${(detail.dscrRules || []).length} DSCR rule(s), and ${(detail.riskRules || []).length} risk rule(s) will become active.`,
+      currentActive ? `Current live version "${currentActive.version_label}" will be superseded (no longer active on portal).` : "No other active version for this product — this will become the first live policy.",
+      "Rule debugger, eligibility simulator, and loan product flows will use the newly published rules."
+    ],
+    currentActiveVersion: currentActive ? {
+      id: currentActive.id,
+      versionLabel: currentActive.version_label,
+      publishedAt: currentActive.published_at
+    } : null,
+    portalSurfaces: [
+      "Customer eligibility checks",
+      "Agent / employee application routing & matching",
+      "Policy console rule debugger",
+      "Admin eligibility simulator",
+      detail.bank_product_id ? "Bank product policy data on marketplace / product card" : "Lender-wide policy scope"
+    ]
+  };
+  return {
+    versionId: detail.id,
+    version: {
+      id: detail.id,
+      versionLabel: detail.version_label,
+      status: detail.status,
+      bankName: detail.bank_name,
+      productName: detail.product_name,
+      bankId: detail.bank_id,
+      bankProductId: detail.bank_product_id,
+      changeReason: detail.change_reason,
+      updatedAt: detail.updated_at
+    },
+    approving,
+    publishing,
+    canApprove: String(detail.status).toLowerCase() === "submitted",
+    canPublish: ["approved", "scheduled"].includes(String(detail.status).toLowerCase())
+  };
+}
 async function createDraftVersion({
   bankId,
   bankProductId = null,
@@ -655,6 +775,7 @@ export {
   createEligibilityRule,
   ensurePolicyConsoleSchema,
   getPolicyVersion,
+  getPolicyVisibilitySummary,
   listEligibilityRules,
   listEngineEligibilityRules,
   listPolicyAudit,

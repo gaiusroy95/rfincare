@@ -33,6 +33,30 @@ function formatOtpMessage(template, otp) {
   return tpl.replace(/\{\{otp\}\}/g, otp);
 }
 
+/**
+ * Strip provider/ops details from OTP errors shown to customers
+ * (same privacy model as forgot-password).
+ */
+export function toPublicOtpMessage(raw, fallback = 'Could not send OTP right now. Please try again in a moment.') {
+  const text = String(raw || '').trim();
+  if (!text) return fallback;
+  if (
+    /sender\s*id|msg91|smtp|twilio|auth[_ ]?key|subscription|dlt|badcredentials|535|template_id|cloud\s*run|otp settings|console|rfincri?|delivery may fail|no subscription|app password|gmail smtp|smtp_user|smtp_pass/i.test(
+      text,
+    )
+  ) {
+    return fallback;
+  }
+  // Keep short, non-technical validation messages (e.g. invalid mobile).
+  if (text.length > 160) return fallback;
+  return text;
+}
+
+function logOtpDeliveryWarnings(warnings = []) {
+  if (!Array.isArray(warnings) || !warnings.length) return;
+  console.warn('[otp:delivery]', warnings.join(' | '));
+}
+
 /** Readiness flags for admin (no secrets). Merges DB providerConfig with env. */
 export function getOtpInfrastructureStatus(providerConfig = {}) {
   const cfg = providerConfig || {};
@@ -43,7 +67,7 @@ export function getOtpInfrastructureStatus(providerConfig = {}) {
       emailConfigured: isMsg91EmailConfigured(cfg),
       whatsappConfigured: isMsg91WhatsappConfigured(cfg),
       senderId: msg91.senderId || null,
-      senderIdWarning: msg91.senderIdWarning || null,
+      senderIdWarning: msg91.senderIdWarningInternal || null,
       otpTemplateId: msg91.otpTemplateId || null,
       whatsappTemplateId: msg91.whatsappTemplateId || null,
       whatsappNamespace: msg91.whatsappNamespace || null,
@@ -392,7 +416,8 @@ export async function sendOtpNotification({
   const results = await Promise.allSettled(tasks);
   const errMsg = aggregateChannelErrors(results);
   if (errMsg) {
-    const err = new Error(errMsg);
+    logOtpDeliveryWarnings([errMsg]);
+    const err = new Error(toPublicOtpMessage(errMsg));
     err.status = results.find((r) => r.reason?.status)?.reason?.status || 502;
     throw err;
   }
@@ -406,8 +431,14 @@ export async function sendOtpNotification({
 
 /**
  * Send separate OTP codes for mobile and email (eligibility / lead verification).
+ * @param {{ publicFacing?: boolean }} options - when true, never throw/return provider internals
  */
-export async function sendDualChannelOtp({ email, phone, settings: settingsOverride }) {
+export async function sendDualChannelOtp({
+  email,
+  phone,
+  settings: settingsOverride,
+  publicFacing = false,
+} = {}) {
   const settings = settingsOverride || (await getOtpProviderSettings());
   const mobileOtp = generateOtp();
   const emailOtp = generateOtp();
@@ -443,7 +474,7 @@ export async function sendDualChannelOtp({ email, phone, settings: settingsOverr
         'Email OTP',
       );
       if (result?.delivered === false || result?.sent === false) {
-        throw new Error(result.warning || 'Email OTP could not be delivered.');
+        throw new Error(result.warning || result.warningInternal || 'Email OTP could not be delivered.');
       }
       if (result?.warning) warnings.push(result.warning);
       return result;
@@ -504,7 +535,6 @@ export async function sendDualChannelOtp({ email, phone, settings: settingsOverr
     && settings.whatsappProvider === 'msg91'
     && isMsg91WhatsappConfigured(settings?.providerConfig)
   ) {
-    // Fallback: if SMS did not deliver and WhatsApp MSG91 is fully configured, still try WhatsApp.
     try {
       outcomes.whatsapp = await channelTimeout(
         sendWhatsappOtp({ phone, otp: mobileOtp, settings }),
@@ -520,32 +550,42 @@ export async function sendDualChannelOtp({ email, phone, settings: settingsOverr
   const whatsappDelivered = outcomes.whatsapp?.sent === true;
   const mobileChannelOk = smsDelivered || whatsappDelivered;
 
+  logOtpDeliveryWarnings(warnings);
+
   if (
     !mobileChannelOk
     && !emailDelivered
     && (settings.requireMobileOtp !== false || settings.requireEmailOtp !== false || settings.requireWhatsappOtp)
   ) {
     const err = new Error(
-      warnings.join(' ')
-        || 'OTP could not be delivered on any channel. Check Admin → OTP settings and MSG91/SMTP credentials.',
+      publicFacing
+        ? toPublicOtpMessage(null)
+        : (warnings.join(' ')
+          || 'OTP could not be delivered on any channel. Check Admin → OTP settings and MSG91/SMTP credentials.'),
     );
     err.status = 502;
     throw err;
   }
 
+  // Public flows (appointment, etc.): still issue OTPs that were accepted server-side even if
+  // a provider returned soft warnings — never leak provider text to the client.
+  const publicMobileOk = mobileChannelOk;
+  const publicEmailOk = emailDelivered;
+
   return {
-    mobileOtp: settings.requireMobileOtp !== false && mobileChannelOk ? mobileOtp : null,
-    emailOtp: settings.requireEmailOtp !== false && emailDelivered ? emailOtp : null,
+    mobileOtp: settings.requireMobileOtp !== false && publicMobileOk ? mobileOtp : null,
+    emailOtp: settings.requireEmailOtp !== false && publicEmailOk ? emailOtp : null,
     smsProvider: settings.smsProvider,
     emailProvider: settings.emailProvider,
     whatsappProvider: settings.whatsappProvider,
     msg91Configured: isMsg91Configured(),
-    emailDelivered,
+    emailDelivered: publicEmailOk,
     smsDelivered,
     whatsappDelivered,
-    requireMobileOtp: settings.requireMobileOtp !== false && mobileChannelOk,
-    requireEmailOtp: settings.requireEmailOtp !== false && emailDelivered,
-    warnings,
+    requireMobileOtp: settings.requireMobileOtp !== false && publicMobileOk,
+    requireEmailOtp: settings.requireEmailOtp !== false && publicEmailOk,
+    // Ops-only; public routes must omit this from JSON responses.
+    warnings: publicFacing ? [] : warnings,
     delivery: outcomes,
   };
 }

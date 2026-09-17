@@ -7,6 +7,8 @@ import { sendStaffWelcomeEmail } from "./email.js";
 import { reserveUniqueAgentCode } from "./agentCode.js";
 import { ensureAgentOnboardingQcSchema } from "../db/ensureMilestone4Schema.js";
 import { releaseRejectedAgentCredentials } from "./releaseRejectedStaffCredentials.js";
+import { upsertAgentHierarchyMatrix } from "./hierarchyMatrix.js";
+import { ensureLeadAssignmentSchema } from "./leadAssignmentEngine.js";
 const baseStaffFields = {
   username: z.string().min(3).max(128),
   password: z.string().min(8),
@@ -28,9 +30,12 @@ const CreateEmployeeSchema = z.object({
   panNumber: z.union([
     z.literal(""),
     z.string().regex(/^[A-Z]{5}[0-9]{4}[A-Z]$/i, "Enter a valid PAN number")
-  ]).optional()
+  ]).optional(),
+  joiningLevel: z.coerce.number().int().min(1).max(4)
 }).passthrough();
 function normalizeBody(body = {}) {
+  const rawLevel = body.joiningLevel ?? body.joining_level ?? body.leadLevel ?? body.lead_level ?? body.hierarchyLevel;
+  const joiningLevel = rawLevel === void 0 || rawLevel === null || rawLevel === "" ? void 0 : Number(rawLevel);
   return {
     username: body.username ?? body.user_name,
     password: body.password,
@@ -44,7 +49,13 @@ function normalizeBody(body = {}) {
     employeeName: body.employeeName ?? body.employee_name,
     employeeCode: body.employeeCode ?? body.employee_code,
     panNumber: body.panNumber ?? body.pan_number,
-    photoDataUrl: body.photoDataUrl ?? body.photo_data_url
+    photoDataUrl: body.photoDataUrl ?? body.photo_data_url,
+    level1EmployeeUserId: body.level1EmployeeUserId ?? body.level1_employee_user_id,
+    level2EmployeeUserId: body.level2EmployeeUserId ?? body.level2_employee_user_id,
+    level3EmployeeUserId: body.level3EmployeeUserId ?? body.level3_employee_user_id,
+    level4EmployeeUserId: body.level4EmployeeUserId ?? body.level4_employee_user_id,
+    hierarchyNotes: body.hierarchyNotes ?? body.hierarchy_notes ?? body.notes,
+    joiningLevel: Number.isFinite(joiningLevel) ? joiningLevel : void 0
   };
 }
 async function createAgentAccount(input, createdByUserId, options = {}) {
@@ -104,6 +115,24 @@ async function createAgentAccount(input, createdByUserId, options = {}) {
       }
     );
     await conn.commit();
+    const levelEmployees = {
+      1: data.level1EmployeeUserId || null,
+      2: data.level2EmployeeUserId || null,
+      3: data.level3EmployeeUserId || null,
+      4: data.level4EmployeeUserId || null
+    };
+    if (Object.values(levelEmployees).some(Boolean)) {
+      try {
+        await upsertAgentHierarchyMatrix(pool, {
+          agentUserId: userId,
+          levelEmployees,
+          notes: data.hierarchyNotes || null,
+          createdBy: createdByUserId
+        });
+      } catch (hierErr) {
+        console.warn("[createAgentAccount] hierarchy mapping skipped:", hierErr.message || hierErr);
+      }
+    }
     const [[row]] = await pool.execute(
       `SELECT up.*, ao.agent_code, ao.username, ao.onboarding_status AS ao_status
        FROM user_profiles up
@@ -135,12 +164,14 @@ async function createAgentAccount(input, createdByUserId, options = {}) {
 }
 async function createEmployeeAccount(input, createdByUserId) {
   await ensureOnboardingSchema();
+  await ensureLeadAssignmentSchema();
   const data = CreateEmployeeSchema.parse(normalizeBody(input));
   const pool = getPool();
   const userId = newId();
   const onboardingId = newId();
   const passwordHash = await bcrypt.hash(data.password, 12);
   const panNumber = data.panNumber ? String(data.panNumber).trim().toUpperCase() : null;
+  const joiningLevel = Number(data.joiningLevel);
   let avatarUrl = null;
   const photoDataUrl = input.photoDataUrl ?? input.photo_data_url ?? null;
   if (photoDataUrl && String(photoDataUrl).startsWith("data:image/")) {
@@ -185,10 +216,10 @@ async function createEmployeeAccount(input, createdByUserId) {
     await conn.execute(
       `INSERT INTO employee_onboarding (
          id, user_id, username, employee_name, employee_code, email, mobile_number,
-         account_number, bank_name, ifsc_code, pan_number, onboarding_status, created_by
+         account_number, bank_name, ifsc_code, pan_number, lead_level, onboarding_status, created_by
        ) VALUES (
          :id, :user_id, :username, :employee_name, :employee_code, :email, :mobile_number,
-         :account_number, :bank_name, :ifsc_code, :pan_number, 'active', :created_by
+         :account_number, :bank_name, :ifsc_code, :pan_number, :lead_level, 'active', :created_by
        )`,
       {
         id: onboardingId,
@@ -202,12 +233,14 @@ async function createEmployeeAccount(input, createdByUserId) {
         bank_name: data.bankName,
         ifsc_code: data.ifscCode.toUpperCase(),
         pan_number: panNumber,
+        lead_level: joiningLevel,
         created_by: createdByUserId
       }
     );
     await conn.commit();
     const [[row]] = await pool.execute(
-      `SELECT up.*, eo.employee_code, eo.username, eo.onboarding_status AS eo_status, eo.pan_number
+      `SELECT up.*, eo.employee_code, eo.username, eo.onboarding_status AS eo_status,
+              eo.pan_number, eo.lead_level
        FROM user_profiles up
        LEFT JOIN employee_onboarding eo ON eo.user_id = up.id
        WHERE up.id = :id LIMIT 1`,
@@ -230,6 +263,11 @@ async function createEmployeeAccount(input, createdByUserId) {
     }
     if (String(err?.message || "").includes("pan_number")) {
       const e = new Error("Database missing pan_number column. Run: npm run db:migrate");
+      e.status = 500;
+      throw e;
+    }
+    if (String(err?.message || "").includes("lead_level")) {
+      const e = new Error("Database missing lead_level column. Run: npm run db:migrate");
       e.status = 500;
       throw e;
     }
