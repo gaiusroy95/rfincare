@@ -47,9 +47,9 @@ export async function generateReportSection(pool, reportKey, params) {
             la.bank_approval_status,
             la.created_at
          FROM loan_applications la
-         JOIN user_profiles up ON up.id = la.customer_id
+         LEFT JOIN user_profiles up ON up.id = la.customer_id
          LEFT JOIN agent_onboarding ao ON ao.user_id = la.agent_id
-         WHERE la.created_at BETWEEN :start AND :end
+         WHERE la.created_at::date BETWEEN :start::date AND :end::date
          ORDER BY la.created_at DESC`,
         params,
       );
@@ -101,7 +101,7 @@ export async function generateReportSection(pool, reportKey, params) {
          INNER JOIN user_profiles cust ON cust.id = la.customer_id
          LEFT JOIN user_profiles agent_up ON agent_up.id = la.agent_id AND agent_up.role = 'agent'
          LEFT JOIN agent_onboarding ao ON ao.user_id = la.agent_id
-         WHERE la.created_at BETWEEN :start AND :end
+         WHERE la.created_at::date BETWEEN :start::date AND :end::date
            AND (
              la.agent_id IS NOT NULL
              OR (la.sourced_agent_code IS NOT NULL AND TRIM(la.sourced_agent_code) != '')
@@ -142,7 +142,7 @@ export async function generateReportSection(pool, reportKey, params) {
                 SUM(CASE WHEN la.status = 'approved' THEN 1 ELSE 0 END) AS approved_in_period
          FROM user_profiles up
          LEFT JOIN agent_onboarding ao ON ao.user_id = up.id
-         LEFT JOIN loan_applications la ON la.agent_id = up.id AND la.created_at BETWEEN :start AND :end
+         LEFT JOIN loan_applications la ON la.agent_id = up.id AND la.created_at::date BETWEEN :start::date AND :end::date
          WHERE up.role = 'agent'
          GROUP BY up.id
          ORDER BY agent_name`,
@@ -158,7 +158,7 @@ export async function generateReportSection(pool, reportKey, params) {
       [rows] = await pool.execute(
         `SELECT action_type, table_name, record_id, user_id, created_at
          FROM audit_logs
-         WHERE created_at BETWEEN :start AND :end
+         WHERE created_at::date BETWEEN :start::date AND :end::date
          ORDER BY created_at DESC
          LIMIT 5000`,
         params,
@@ -169,7 +169,7 @@ export async function generateReportSection(pool, reportKey, params) {
       [rows] = await pool.execute(
         `SELECT customer_code, full_name, email, is_active, account_status, created_at
          FROM user_profiles
-         WHERE role = 'customer' AND created_at BETWEEN :start AND :end
+         WHERE role = 'customer' AND created_at::date BETWEEN :start::date AND :end::date
          ORDER BY created_at DESC`,
         params,
       );
@@ -207,7 +207,7 @@ export async function generateReportSection(pool, reportKey, params) {
          LEFT JOIN user_profiles up ON up.id = ml.assigned_to
          LEFT JOIN agent_onboarding ao ON ao.user_id = up.id AND up.role = 'agent'
          LEFT JOIN employee_onboarding eo ON eo.user_id = up.id AND up.role = 'employee'
-         WHERE ml.created_at BETWEEN :start AND :end
+         WHERE ml.created_at::date BETWEEN :start::date AND :end::date
          ORDER BY ml.created_at DESC`,
         params,
       );

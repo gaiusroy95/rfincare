@@ -99,7 +99,7 @@ export async function buildBankPartnershipRows(pool, { start, end }) {
             la.selected_bank_id, la.submitted_at, la.created_at, la.reviewed_at, la.updated_at
      FROM loan_applications la
      WHERE la.selected_bank_id IS NOT NULL
-       AND la.created_at BETWEEN :start AND :end`,
+       AND la.created_at::date BETWEEN :start::date AND :end::date`,
     { start, end },
   );
 

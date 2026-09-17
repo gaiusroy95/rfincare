@@ -18,25 +18,33 @@ async function enforceReportsAccess(req) {
   }
 }
 
-function formatSqlDateTime(date) {
-  return date.toISOString().slice(0, 19).replace('T', ' ');
+function formatSqlDate(date) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+/** Parse YYYY-MM-DD as local calendar date (avoid UTC shift from Date.parse). */
+function parseYmdLocal(ymd) {
+  const [y, m, d] = String(ymd).slice(0, 10).split('-').map(Number);
+  if (!y || !m || !d) return new Date(NaN);
+  return new Date(y, m - 1, d);
 }
 
 function dateRangeFromQuery(query) {
   const now = new Date();
 
   if (query.startDate && query.endDate) {
-    const start = new Date(query.startDate);
-    const end = new Date(query.endDate);
-    start.setHours(0, 0, 0, 0);
-    end.setHours(23, 59, 59, 999);
-    return { start: formatSqlDateTime(start), end: formatSqlDateTime(end) };
+    const start = parseYmdLocal(query.startDate);
+    const end = parseYmdLocal(query.endDate);
+    if (!Number.isNaN(start.getTime()) && !Number.isNaN(end.getTime())) {
+      return { start: formatSqlDate(start), end: formatSqlDate(end) };
+    }
   }
 
-  let end = new Date(now);
-  let start = new Date(now);
-  start.setHours(0, 0, 0, 0);
-  end.setHours(23, 59, 59, 999);
+  let end = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  let start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
 
   const range = query.dateRange || 'last30days';
 
@@ -64,7 +72,7 @@ function dateRangeFromQuery(query) {
       break;
     case 'lastMonth':
       start = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-      end = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59, 999);
+      end = new Date(now.getFullYear(), now.getMonth(), 0);
       break;
     case 'thisQuarter': {
       const quarterStartMonth = Math.floor(now.getMonth() / 3) * 3;
@@ -79,8 +87,12 @@ function dateRangeFromQuery(query) {
       break;
   }
 
-  return { start: formatSqlDateTime(start), end: formatSqlDateTime(end) };
+  return { start: formatSqlDate(start), end: formatSqlDate(end) };
 }
+
+const APPROVED_STATUSES = `('approved', 'disbursed', 'sanctioned', 'completed')`;
+const PENDING_STATUSES = `('submitted', 'pending', 'under_review', 'documents_pending', 'in_review', 'processing')`;
+const DOC_PENDING_STATUSES = `('pending', 'uploaded', 'submitted', 'awaiting_verification', 'under_review')`;
 
 const REPORT_META = [
   { key: 'application_volume', name: 'Application Volume Report', category: 'application' },
@@ -109,52 +121,118 @@ reportsRouter.get(
       await enforceReportsAccess(req);
       const pool = getPool();
       const { start, end } = dateRangeFromQuery(req.query);
-      const prevStart = new Date(start);
-      const prevEnd = new Date(end);
-      const spanMs = new Date(end) - new Date(start);
-      prevStart.setTime(prevStart.getTime() - spanMs);
-      prevEnd.setTime(prevEnd.getTime() - spanMs);
+
+      const startDate = parseYmdLocal(start);
+      const endDate = parseYmdLocal(end);
+      const spanDays = Math.max(
+        1,
+        Math.round((endDate.getTime() - startDate.getTime()) / 86400000) + 1,
+      );
+      const prevEndDate = new Date(startDate);
+      prevEndDate.setDate(prevEndDate.getDate() - 1);
+      const prevStartDate = new Date(prevEndDate);
+      prevStartDate.setDate(prevStartDate.getDate() - (spanDays - 1));
+      const pStart = formatSqlDate(prevStartDate);
+      const pEnd = formatSqlDate(prevEndDate);
+
+      const rangeParams = { start, end };
+      const prevParams = { start: pStart, end: pEnd };
 
       const [[cur]] = await pool.execute(
-        `SELECT COUNT(*) AS total,
-                SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) AS approved,
-                SUM(CASE WHEN status IN ('submitted','pending','under_review') THEN 1 ELSE 0 END) AS pending
+        `SELECT COUNT(*)::int AS total,
+                SUM(CASE WHEN LOWER(COALESCE(status, '')) IN ${APPROVED_STATUSES} THEN 1 ELSE 0 END)::int AS approved,
+                SUM(CASE WHEN LOWER(COALESCE(status, '')) IN ${PENDING_STATUSES} THEN 1 ELSE 0 END)::int AS pending
          FROM loan_applications
-         WHERE created_at BETWEEN :start AND :end`,
-        { start, end },
+         WHERE created_at::date BETWEEN :start::date AND :end::date`,
+        rangeParams,
       );
 
       const [[prev]] = await pool.execute(
-        `SELECT COUNT(*) AS total,
-                SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) AS approved
+        `SELECT COUNT(*)::int AS total,
+                SUM(CASE WHEN LOWER(COALESCE(status, '')) IN ${APPROVED_STATUSES} THEN 1 ELSE 0 END)::int AS approved
          FROM loan_applications
-         WHERE created_at BETWEEN :pStart AND :pEnd`,
-        { pStart: prevStart.toISOString().slice(0, 19).replace('T', ' '), pEnd: prevEnd.toISOString().slice(0, 19).replace('T', ' ') },
+         WHERE created_at::date BETWEEN :start::date AND :end::date`,
+        prevParams,
       );
 
       const [[agents]] = await pool.execute(
-        `SELECT COUNT(*) AS active_agents FROM user_profiles
-         WHERE role = 'agent' AND is_active = TRUE AND account_status = 'active'`,
+        `SELECT COUNT(*)::int AS active_agents FROM user_profiles
+         WHERE role = 'agent'
+           AND COALESCE(is_active, TRUE) = TRUE
+           AND COALESCE(account_status, 'active') NOT IN ('suspended', 'inactive', 'terminated')`,
       );
 
       const [[newAgents]] = await pool.execute(
-        `SELECT COUNT(*) AS cnt FROM user_profiles
-         WHERE role = 'agent' AND created_at BETWEEN :start AND :end`,
-        { start, end },
+        `SELECT COUNT(*)::int AS cnt FROM user_profiles
+         WHERE role = 'agent' AND created_at::date BETWEEN :start::date AND :end::date`,
+        rangeParams,
       );
+
+      const [[customers]] = await pool.execute(
+        `SELECT
+           COUNT(*) FILTER (
+             WHERE COALESCE(is_active, TRUE) = TRUE
+               AND COALESCE(account_status, 'active') NOT IN ('suspended', 'inactive', 'terminated')
+           )::int AS active_customers,
+           COUNT(*) FILTER (
+             WHERE created_at::date BETWEEN :start::date AND :end::date
+           )::int AS new_customers
+         FROM user_profiles
+         WHERE role = 'customer'`,
+        rangeParams,
+      );
+
+      let docsPending = 0;
+      try {
+        const [[docs]] = await pool.execute(
+          `SELECT COUNT(*)::int AS c FROM customer_documents
+           WHERE (
+             LOWER(COALESCE(verification_status, 'pending')) IN ${DOC_PENDING_STATUSES}
+             OR verification_status IS NULL
+           )
+           AND (
+             created_at IS NULL
+             OR created_at::date BETWEEN :start::date AND :end::date
+             OR updated_at::date BETWEEN :start::date AND :end::date
+           )`,
+          rangeParams,
+        );
+        docsPending = Number(docs?.c || 0);
+      } catch {
+        try {
+          const [[docs]] = await pool.execute(
+            `SELECT COUNT(*)::int AS c FROM customer_documents
+             WHERE LOWER(COALESCE(verification_status, 'pending')) IN ${DOC_PENDING_STATUSES}
+                OR verification_status IS NULL`,
+          );
+          docsPending = Number(docs?.c || 0);
+        } catch {
+          docsPending = 0;
+        }
+      }
 
       const total = Number(cur?.total || 0);
       const approved = Number(cur?.approved || 0);
+      const pending = Number(cur?.pending || 0);
       const prevTotal = Number(prev?.total || 0);
+      const prevApproved = Number(prev?.approved || 0);
+      const activeCustomers = Number(customers?.active_customers || 0);
+      const newCustomers = Number(customers?.new_customers || 0);
+      const activeAgents = Number(agents?.active_agents || 0);
+      const agentsJoined = Number(newAgents?.cnt || 0);
+
       const pctChange = (curVal, prevVal) => {
         if (!prevVal) return curVal ? '+100%' : '0%';
         const d = ((curVal - prevVal) / prevVal) * 100;
         return `${d >= 0 ? '+' : ''}${d.toFixed(1)}%`;
       };
 
-      const approvalRate = total > 0 ? ((approved / total) * 100).toFixed(1) : '0';
+      const approvalRate = total > 0 ? ((approved / total) * 100).toFixed(1) : '0.0';
+      const prevApprovalRate = prevTotal > 0 ? (prevApproved / prevTotal) * 100 : 0;
+      const curApprovalRate = total > 0 ? (approved / total) * 100 : 0;
 
       res.json({
+        period: { start, end, previousStart: pStart, previousEnd: pEnd },
         metrics: [
           {
             id: 1,
@@ -163,64 +241,59 @@ reportsRouter.get(
             change: pctChange(total, prevTotal),
             trend: total >= prevTotal ? 'up' : 'down',
             icon: 'FileText',
+            color: '#2563eb',
             subtitle: 'vs. previous period',
           },
           {
             id: 2,
             label: 'Approval Rate',
             value: `${approvalRate}%`,
-            change: pctChange(approved, Number(prev?.approved || 0)),
-            trend: 'up',
+            change: pctChange(curApprovalRate, prevApprovalRate),
+            trend: curApprovalRate >= prevApprovalRate ? 'up' : 'down',
             icon: 'CheckCircle',
-            subtitle: `${approved} approved in period`,
+            color: '#059669',
+            subtitle: `${approved.toLocaleString('en-IN')} approved in period`,
           },
           {
             id: 3,
             label: 'Active Agents',
-            value: String(Number(agents?.active_agents || 0)),
-            change: `+${Number(newAgents?.cnt || 0)}`,
-            trend: 'up',
+            value: String(activeAgents),
+            change: agentsJoined ? `+${agentsJoined}` : '0',
+            trend: agentsJoined > 0 ? 'up' : 'neutral',
             icon: 'Users',
-            subtitle: `New in period: ${Number(newAgents?.cnt || 0)}`,
+            color: '#7c3aed',
+            subtitle: `New in period: ${agentsJoined}`,
           },
           {
             id: 4,
             label: 'Pending Reviews',
-            value: String(Number(cur?.pending || 0)),
+            value: String(pending),
             change: '',
             trend: 'neutral',
             icon: 'Clock',
+            color: '#f59e0b',
             subtitle: 'Awaiting decision',
           },
           {
             id: 5,
             label: 'Active Customers',
-            value: String(
-              (
-                await pool.execute(
-                  `SELECT COUNT(*) AS c FROM user_profiles WHERE role = 'customer' AND is_active = TRUE`,
-                )
-              )[0][0]?.c || 0,
-            ),
-            change: '',
-            trend: 'up',
+            value: String(activeCustomers),
+            change: newCustomers ? `+${newCustomers}` : '0',
+            trend: newCustomers > 0 ? 'up' : 'up',
             icon: 'UserCheck',
-            subtitle: 'Registered customers',
+            color: '#0ea5e9',
+            subtitle: newCustomers
+              ? `${newCustomers} registered in period`
+              : 'Registered customers',
           },
           {
             id: 6,
             label: 'Documents Pending',
-            value: String(
-              (
-                await pool.execute(
-                  `SELECT COUNT(*) AS c FROM customer_documents
-                   WHERE verification_status IN ('pending','uploaded') OR verification_status IS NULL`,
-                )
-              )[0][0]?.c || 0,
-            ),
+            value: String(docsPending),
             change: '',
             trend: 'neutral',
             icon: 'FileText',
+            color: '#ef4444',
             subtitle: 'Awaiting verification',
           },
         ],
@@ -239,18 +312,19 @@ reportsRouter.get(
     try {
       await enforceReportsAccess(req);
       const pool = getPool();
-      const volumeSql = `SELECT TO_CHAR(created_at, 'Mon') AS month,
+      const { start, end } = dateRangeFromQuery(req.query);
+      const volumeSql = `SELECT TO_CHAR(DATE_TRUNC('month', created_at), 'Mon') AS month,
                   EXTRACT(MONTH FROM created_at)::int AS m,
                   EXTRACT(YEAR FROM created_at)::int AS y,
-                  COUNT(*) AS submitted,
-                  SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) AS approved,
-                  SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected,
-                  SUM(CASE WHEN status IN ('draft','submitted','pending','under_review') THEN 1 ELSE 0 END) AS pending
+                  COUNT(*)::int AS submitted,
+                  SUM(CASE WHEN LOWER(COALESCE(status, '')) IN ${APPROVED_STATUSES} THEN 1 ELSE 0 END)::int AS approved,
+                  SUM(CASE WHEN LOWER(COALESCE(status, '')) IN ('rejected', 'declined', 'cancelled') THEN 1 ELSE 0 END)::int AS rejected,
+                  SUM(CASE WHEN LOWER(COALESCE(status, '')) IN ${PENDING_STATUSES} THEN 1 ELSE 0 END)::int AS pending
            FROM loan_applications
-           WHERE created_at >= NOW() - INTERVAL '12 months'
-           GROUP BY EXTRACT(YEAR FROM created_at), EXTRACT(MONTH FROM created_at), TO_CHAR(created_at, 'Mon')
+           WHERE created_at::date BETWEEN :start::date AND :end::date
+           GROUP BY DATE_TRUNC('month', created_at), EXTRACT(YEAR FROM created_at), EXTRACT(MONTH FROM created_at), TO_CHAR(DATE_TRUNC('month', created_at), 'Mon')
            ORDER BY y, m`;
-      const [rows] = await pool.execute(volumeSql);
+      const [rows] = await pool.execute(volumeSql, { start, end });
       res.json(rows);
     } catch (err) {
       next(err);
@@ -266,16 +340,21 @@ reportsRouter.get(
     try {
       await enforceReportsAccess(req);
       const pool = getPool();
+      const { start, end } = dateRangeFromQuery(req.query);
       const [rows] = await pool.execute(
         `SELECT up.full_name AS name,
-                COUNT(la.id) AS clients,
-                SUM(CASE WHEN la.status = 'approved' THEN 1 ELSE 0 END) AS conversions
+                COUNT(la.id)::int AS clients,
+                SUM(CASE WHEN LOWER(COALESCE(la.status, '')) IN ${APPROVED_STATUSES} THEN 1 ELSE 0 END)::int AS conversions
          FROM user_profiles up
-         LEFT JOIN loan_applications la ON la.agent_id = up.id
-         WHERE up.role = 'agent' AND up.is_active = TRUE
+         LEFT JOIN loan_applications la
+           ON la.agent_id = up.id
+          AND la.created_at::date BETWEEN :start::date AND :end::date
+         WHERE up.role = 'agent' AND COALESCE(up.is_active, TRUE) = TRUE
          GROUP BY up.id, up.full_name
-         ORDER BY conversions DESC
+         HAVING COUNT(la.id) > 0
+         ORDER BY conversions DESC, clients DESC
          LIMIT 12`,
+        { start, end },
       );
       res.json(
         rows.map((r) => ({
@@ -303,12 +382,31 @@ reportsRouter.get(
     try {
       await enforceReportsAccess(req);
       const pool = getPool();
-      const [rows] = await pool.execute(
-        `SELECT COALESCE(data->>'loan_type', 'personal') AS loan_type,
-                COUNT(*) AS count
-         FROM loan_applications
-         GROUP BY loan_type`,
-      );
+      const { start, end } = dateRangeFromQuery(req.query);
+      let rows = [];
+      try {
+        const [r] = await pool.execute(
+          `SELECT COALESCE(NULLIF(TRIM(loan_type), ''), NULLIF(TRIM(data->>'loan_type'), ''), 'other') AS loan_type,
+                  COUNT(*)::int AS count
+           FROM loan_applications
+           WHERE created_at::date BETWEEN :start::date AND :end::date
+           GROUP BY 1
+           ORDER BY count DESC`,
+          { start, end },
+        );
+        rows = r;
+      } catch {
+        const [r] = await pool.execute(
+          `SELECT COALESCE(NULLIF(TRIM(loan_type), ''), 'other') AS loan_type,
+                  COUNT(*)::int AS count
+           FROM loan_applications
+           WHERE created_at::date BETWEEN :start::date AND :end::date
+           GROUP BY 1
+           ORDER BY count DESC`,
+          { start, end },
+        );
+        rows = r;
+      }
       const colors = ['#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#ef4444'];
       res.json(
         rows.map((r, i) => ({

@@ -9,6 +9,7 @@ import {
   ensurePolicyConsoleSchema,
   listPolicyVersions,
   getPolicyVersion,
+  getPolicyVisibilitySummary,
   createDraftVersion,
   submitVersion,
   approveVersion,
@@ -51,6 +52,20 @@ adminPolicyConsoleRouter.get(
       const row = await getPolicyVersion(req.params.id);
       if (!row) return res.status(404).json({ error: 'Version not found' });
       res.json({ data: row });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+adminPolicyConsoleRouter.get(
+  '/versions/:id/visibility-summary',
+  authorize({ resource: 'bank_products', action: 'read' }),
+  async (req, res, next) => {
+    try {
+      const summary = await getPolicyVisibilitySummary(req.params.id);
+      if (!summary) return res.status(404).json({ error: 'Version not found' });
+      res.json({ data: summary });
     } catch (err) {
       next(err);
     }

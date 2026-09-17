@@ -9,6 +9,7 @@ import { reserveUniqueAgentCode } from './agentCode.js';
 import { ensureAgentOnboardingQcSchema } from '../db/ensureMilestone4Schema.js';
 import { releaseRejectedAgentCredentials } from './releaseRejectedStaffCredentials.js';
 import { upsertAgentHierarchyMatrix } from './hierarchyMatrix.js';
+import { ensureLeadAssignmentSchema } from './leadAssignmentEngine.js';
 
 const baseStaffFields = {
   username: z.string().min(3).max(128),
@@ -37,10 +38,17 @@ export const CreateEmployeeSchema = z
       z.literal(''),
       z.string().regex(/^[A-Z]{5}[0-9]{4}[A-Z]$/i, 'Enter a valid PAN number'),
     ]).optional(),
+    joiningLevel: z.coerce.number().int().min(1).max(4),
   })
   .passthrough();
 
 function normalizeBody(body = {}) {
+  const rawLevel =
+    body.joiningLevel ?? body.joining_level ?? body.leadLevel ?? body.lead_level ?? body.hierarchyLevel;
+  const joiningLevel =
+    rawLevel === undefined || rawLevel === null || rawLevel === ''
+      ? undefined
+      : Number(rawLevel);
   return {
     username: body.username ?? body.user_name,
     password: body.password,
@@ -60,6 +68,7 @@ function normalizeBody(body = {}) {
     level3EmployeeUserId: body.level3EmployeeUserId ?? body.level3_employee_user_id,
     level4EmployeeUserId: body.level4EmployeeUserId ?? body.level4_employee_user_id,
     hierarchyNotes: body.hierarchyNotes ?? body.hierarchy_notes ?? body.notes,
+    joiningLevel: Number.isFinite(joiningLevel) ? joiningLevel : undefined,
   };
 }
 
@@ -181,12 +190,14 @@ export async function createAgentAccount(input, createdByUserId, options = {}) {
 
 export async function createEmployeeAccount(input, createdByUserId) {
   await ensureOnboardingSchema();
+  await ensureLeadAssignmentSchema();
   const data = CreateEmployeeSchema.parse(normalizeBody(input));
   const pool = getPool();
   const userId = newId();
   const onboardingId = newId();
   const passwordHash = await bcrypt.hash(data.password, 12);
   const panNumber = data.panNumber ? String(data.panNumber).trim().toUpperCase() : null;
+  const joiningLevel = Number(data.joiningLevel);
 
   let avatarUrl = null;
   const photoDataUrl = input.photoDataUrl ?? input.photo_data_url ?? null;
@@ -236,10 +247,10 @@ export async function createEmployeeAccount(input, createdByUserId) {
     await conn.execute(
       `INSERT INTO employee_onboarding (
          id, user_id, username, employee_name, employee_code, email, mobile_number,
-         account_number, bank_name, ifsc_code, pan_number, onboarding_status, created_by
+         account_number, bank_name, ifsc_code, pan_number, lead_level, onboarding_status, created_by
        ) VALUES (
          :id, :user_id, :username, :employee_name, :employee_code, :email, :mobile_number,
-         :account_number, :bank_name, :ifsc_code, :pan_number, 'active', :created_by
+         :account_number, :bank_name, :ifsc_code, :pan_number, :lead_level, 'active', :created_by
        )`,
       {
         id: onboardingId,
@@ -253,6 +264,7 @@ export async function createEmployeeAccount(input, createdByUserId) {
         bank_name: data.bankName,
         ifsc_code: data.ifscCode.toUpperCase(),
         pan_number: panNumber,
+        lead_level: joiningLevel,
         created_by: createdByUserId,
       },
     );
@@ -260,7 +272,8 @@ export async function createEmployeeAccount(input, createdByUserId) {
     await conn.commit();
 
     const [[row]] = await pool.execute(
-      `SELECT up.*, eo.employee_code, eo.username, eo.onboarding_status AS eo_status, eo.pan_number
+      `SELECT up.*, eo.employee_code, eo.username, eo.onboarding_status AS eo_status,
+              eo.pan_number, eo.lead_level
        FROM user_profiles up
        LEFT JOIN employee_onboarding eo ON eo.user_id = up.id
        WHERE up.id = :id LIMIT 1`,
@@ -283,9 +296,13 @@ export async function createEmployeeAccount(input, createdByUserId) {
       e.status = 409;
       throw e;
     }
-    // Fallback if pan_number column not migrated yet
     if (String(err?.message || '').includes('pan_number')) {
       const e = new Error('Database missing pan_number column. Run: npm run db:migrate');
+      e.status = 500;
+      throw e;
+    }
+    if (String(err?.message || '').includes('lead_level')) {
+      const e = new Error('Database missing lead_level column. Run: npm run db:migrate');
       e.status = 500;
       throw e;
     }

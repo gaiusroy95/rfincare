@@ -149,6 +149,8 @@ function mapEmployeeProfile(row, accessRows = []) {
     username: row.username || null,
     onboarding_status: row.eo_status || row.onboarding_status || row.account_status || 'pending',
     created_at: row.created_at,
+    joining_level: row.lead_level != null ? Number(row.lead_level) : null,
+    lead_level: row.lead_level != null ? Number(row.lead_level) : null,
     user_profile: {
       role: row.role,
       is_active: Boolean(row.is_active),
@@ -209,6 +211,25 @@ adminRouter.get(
         loan_products: Number(productStats?.total || 0),
         approval_rules: Number(ruleStats?.total || 0),
       });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+adminRouter.get(
+  '/dashboard-analytics',
+  authenticate,
+  authorize({ resource: 'reports', action: 'read' }),
+  async (req, res, next) => {
+    try {
+      const { buildDashboardAnalytics } = await import('../lib/dashboardAnalytics.js');
+      const year = req.query.year ?? req.query.y;
+      const month = req.query.month ?? req.query.m;
+      const from = req.query.from || req.query.dateFrom || req.query.date_from;
+      const to = req.query.to || req.query.dateTo || req.query.date_to;
+      const data = await buildDashboardAnalytics(getPool(), { year, month, from, to });
+      res.json(data);
     } catch (err) {
       next(err);
     }
@@ -321,10 +342,16 @@ adminRouter.get(
       await ensureOnboardingSchema();
       const pool = getPool();
       await backfillMissingAgentCodes(pool);
+      try {
+        const { ensureLeadAssignmentSchema } = await import('../lib/leadAssignmentEngine.js');
+        await ensureLeadAssignmentSchema(pool);
+      } catch {
+        /* lead_level optional until migrated */
+      }
 
       const [employees] = await pool.execute(
         `SELECT up.id, up.full_name, up.email, up.account_status, up.onboarding_status,
-                eo.employee_code, eo.username
+                eo.employee_code, eo.username, eo.lead_level
          FROM user_profiles up
          LEFT JOIN employee_onboarding eo ON eo.user_id = up.id
          WHERE up.role = 'employee'
@@ -346,6 +373,8 @@ adminRouter.get(
             ? row.agent_code || '—'
             : row.employee_code || `EMP-${String(row.id).slice(0, 8).toUpperCase()}`;
         const name = row.full_name || row.email || 'Staff';
+        const joiningLevel =
+          role === 'employee' && row.lead_level != null ? Number(row.lead_level) : null;
         return {
           id: row.id,
           role,
@@ -354,7 +383,11 @@ adminRouter.get(
           email: row.email,
           username: row.username || null,
           status: row.onboarding_status || row.account_status || 'pending',
-          label: `${code} — ${name}`,
+          label: joiningLevel
+            ? `${code} — ${name} (L${joiningLevel})`
+            : `${code} — ${name}`,
+          joiningLevel,
+          leadLevel: joiningLevel,
         };
       };
 
@@ -421,7 +454,8 @@ adminRouter.get(
         `SELECT up.*,
                 eo.employee_code,
                 eo.username,
-                eo.onboarding_status AS eo_status
+                eo.onboarding_status AS eo_status,
+                eo.lead_level
          FROM user_profiles up
          LEFT JOIN employee_onboarding eo ON eo.user_id = up.id
          WHERE up.role = 'employee'

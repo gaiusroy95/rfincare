@@ -108,12 +108,24 @@ export async function upsertAgentHierarchyMatrix(
     }
 
     const [[employee]] = await pool.execute(
-      `SELECT id, email, full_name FROM user_profiles
-       WHERE id = :id AND role = 'employee' LIMIT 1`,
+      `SELECT up.id, up.email, up.full_name, eo.lead_level AS joining_level
+       FROM user_profiles up
+       LEFT JOIN employee_onboarding eo ON eo.user_id = up.id
+       WHERE up.id = :id AND up.role = 'employee' LIMIT 1`,
       { id: employeeUserId },
     );
     if (!employee) {
       const err = new Error(`Level ${level}: employee not found`);
+      err.status = 400;
+      throw err;
+    }
+
+    const empJoiningLevel =
+      employee.joining_level != null ? Number(employee.joining_level) : null;
+    if (empJoiningLevel != null && empJoiningLevel !== level) {
+      const err = new Error(
+        `Level ${level}: ${employee.full_name || 'Employee'} is onboarded as L${empJoiningLevel}, not L${level}`,
+      );
       err.status = 400;
       throw err;
     }

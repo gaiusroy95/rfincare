@@ -123,6 +123,46 @@ publicContentRouter.get('/homepage/trust-signals', async (_req, res, next) => {
   }
 });
 
+publicContentRouter.get('/marketplace-hero', async (req, res, next) => {
+  try {
+    const type = req.query.type || req.query.marketplace || 'insurance';
+    const { listPublicFlashSlides } = await import('../lib/flashTiles.js');
+    const flash = await listPublicFlashSlides(type);
+    if (Array.isArray(flash?.slides) && flash.slides.length) {
+      return res.json({
+        type,
+        marketplace: type,
+        category: flash.category,
+        slides: flash.slides,
+        source: 'flash_tiles',
+      });
+    }
+    const { getMarketplaceHeroContent } = await import('../lib/marketplaceHeroContent.js');
+    res.json(await getMarketplaceHeroContent(type));
+  } catch (err) {
+    next(err);
+  }
+});
+
+publicContentRouter.get('/flash-tiles', async (req, res, next) => {
+  try {
+    const { listPublicFlashSlides, FLASH_TILE_CATEGORIES } = await import('../lib/flashTiles.js');
+    const category = req.query.category || req.query.type || null;
+    if (category) {
+      const data = await listPublicFlashSlides(category);
+      return res.json(data);
+    }
+    const byCategory = {};
+    for (const cat of FLASH_TILE_CATEGORIES) {
+      const data = await listPublicFlashSlides(cat.id);
+      byCategory[cat.id] = data.slides;
+    }
+    res.json({ categories: FLASH_TILE_CATEGORIES, tiles: byCategory });
+  } catch (err) {
+    next(err);
+  }
+});
+
 publicContentRouter.get('/oauth-config', async (_req, res, next) => {
   try {
     res.json(await getPublicOAuthConfig());
