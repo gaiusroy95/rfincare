@@ -131,6 +131,8 @@ function createApp({ serveStatic = true } = {}) {
   app.use("/api/loan-products", loanProductCatalogRouter);
   app.use("/interest-matrix", interestMatrixRouter);
   app.use("/reports", reportsRouter);
+  app.use("/portal", portalEligibilityRouter);
+  app.use("/api/portal", portalEligibilityRouter);
   app.use("/portal", portalDashboardsRouter);
   app.use("/portal/communication", staffCommunicationRouter);
   app.use("/portal/agent", portalAgentApplicationsRouter);
@@ -141,8 +143,6 @@ function createApp({ serveStatic = true } = {}) {
   app.use("/portal/admin/profile", portalAdminProfileRouter);
   app.use("/portal/employee/milestone4", portalEmployeeMilestone4Router);
   app.use("/portal/agent/reports", portalAgentMilestone4Router);
-  app.use("/portal", portalEligibilityRouter);
-  app.use("/api/portal", portalEligibilityRouter);
   app.use("/document-requirements", documentRequirementsRouter);
   app.use("/partners", partnersRouter);
   app.use("/api/partners", partnersRouter);

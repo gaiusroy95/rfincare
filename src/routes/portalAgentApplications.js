@@ -125,6 +125,49 @@ function parseJson(value) {
 
 portalAgentApplicationsRouter.use(authenticate);
 
+/** Agent eligibility — also mounted here so it cannot be shadowed by this router's catch-all auth. */
+portalAgentApplicationsRouter.post('/eligibility/calculate', async (req, res, next) => {
+  try {
+    requireAgent(req);
+    const { calculateEligibility } = await import('../lib/eligibilityEngine.js');
+    const { z } = await import('zod');
+    const schema = z.object({
+      loanType: z.string().min(1),
+      loanAmount: z.coerce.number().positive().max(1e12),
+      monthlyIncome: z.coerce.number().positive().max(1e12),
+      extraIncome: z.coerce.number().min(0).max(1e12).optional().default(0),
+      employmentType: z.string().min(1),
+      creditScore: z.string().optional(),
+      creditScoreRange: z.string().optional(),
+      existingLoans: z.coerce.number().min(0).max(1e12).optional().default(0),
+      collateralValue: z.coerce.number().min(0).max(1e12).optional(),
+      propertyValue: z.coerce.number().min(0).max(1e12).optional(),
+      loanPurpose: z.string().optional(),
+      dateOfBirth: z.string().optional(),
+      age: z.coerce.number().optional(),
+      yearsEmployed: z.coerce.number().min(0).max(60).optional(),
+      pincode: z.string().optional(),
+      pinCode: z.string().optional(),
+      pin_code: z.string().optional(),
+      currentPincode: z.string().optional(),
+      permanentPincode: z.string().optional(),
+      propertyPincode: z.string().optional(),
+      district: z.string().optional(),
+      fetchLiveCibil: z.boolean().optional(),
+      refreshLiveCibil: z.boolean().optional(),
+      consentAccepted: z.boolean().optional(),
+      panNumber: z.string().optional(),
+    }).refine((data) => data.creditScore || data.creditScoreRange || data.fetchLiveCibil, {
+      message: 'Credit score range is required unless fetching live CIBIL',
+      path: ['creditScore'],
+    });
+    const input = schema.parse(req.body || {});
+    res.json(await calculateEligibility(input));
+  } catch (err) {
+    next(err);
+  }
+});
+
 portalAgentApplicationsRouter.get('/profile', async (req, res, next) => {
   try {
     requireAgent(req);

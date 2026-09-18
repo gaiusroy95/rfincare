@@ -24,6 +24,8 @@ const CreateSchema = z.object({
   loan_amount: z.coerce.number().optional(),
   monthlyIncome: z.coerce.number().optional(),
   monthly_income: z.coerce.number().optional(),
+  extraIncome: z.coerce.number().optional(),
+  extra_income: z.coerce.number().optional(),
   employmentType: z.string().optional(),
   employment_type: z.string().optional(),
   creditScoreRange: z.string().optional(),
@@ -42,7 +44,11 @@ const CreateSchema = z.object({
   bank_results: z.array(z.unknown()).optional(),
   pincode: z.string().optional(),
   pinCode: z.string().optional(),
-  pin_code: z.string().optional()
+  pin_code: z.string().optional(),
+  permanentPincode: z.string().optional(),
+  permanent_pincode: z.string().optional(),
+  propertyPincode: z.string().optional(),
+  property_pincode: z.string().optional()
 });
 eligibilityAssessmentsRouter.post("/", async (req, res, next) => {
   try {
@@ -54,17 +60,22 @@ eligibilityAssessmentsRouter.post("/", async (req, res, next) => {
       loanType: body.loanType || body.loan_type,
       loanAmount: body.loanAmount ?? body.loan_amount,
       monthlyIncome: body.monthlyIncome ?? body.monthly_income,
+      extraIncome: body.extraIncome ?? body.extra_income ?? 0,
       employmentType: body.employmentType || body.employment_type,
       creditScore: body.creditScoreRange || body.credit_score_range,
       creditScoreRange: body.creditScoreRange || body.credit_score_range,
       existingLoans: body.existingLoans ?? body.existing_loans ?? 0,
-      pincode: body.pincode || body.pinCode || body.pin_code
+      pincode: body.pincode || body.pinCode || body.pin_code,
+      permanentPincode: body.permanentPincode || body.permanent_pincode,
+      propertyPincode: body.propertyPincode || body.property_pincode
     };
     let bankResults = body.bankResults || body.bank_results;
     let score = body.eligibilityScore ?? body.eligibility_score;
     let eligibleAmount = body.eligibleAmount ?? body.eligible_amount;
+    let calculatedMeta = null;
     if (!bankResults?.length) {
       const calculated = await calculateEligibility(calcInput);
+      calculatedMeta = calculated;
       bankResults = calculated.banks;
       score = score ?? calculated.overallProbability;
       eligibleAmount = eligibleAmount ?? calculated.eligibleAmount;
@@ -115,8 +126,14 @@ eligibilityAssessmentsRouter.post("/", async (req, res, next) => {
     res.status(201).json({
       id,
       eligibilityScore: score,
+      overallProbability: score,
+      eligibilityStatus: body.eligibilityStatus || body.eligibility_status || calculatedMeta?.eligibilityStatus || (score >= 80 ? "high" : score >= 60 ? "medium" : "low"),
       eligibleAmount,
-      bankResults
+      bankResults,
+      banks: bankResults,
+      banksInReview: calculatedMeta?.banksInReview || [],
+      message: calculatedMeta?.message || null,
+      geoMessage: calculatedMeta?.geoMessage || null
     });
   } catch (err) {
     if (isNoSuchTableError(err)) {

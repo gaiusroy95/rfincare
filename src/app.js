@@ -138,6 +138,10 @@ export function createApp({ serveStatic = true } = {}) {
   app.use('/api/loan-products', loanProductCatalogRouter);
   app.use('/interest-matrix', interestMatrixRouter);
   app.use('/reports', reportsRouter);
+  // Eligibility must mount before /portal/agent* routers that use authenticate on all paths,
+  // otherwise /portal/agent/eligibility/calculate is swallowed and returns 404.
+  app.use('/portal', portalEligibilityRouter);
+  app.use('/api/portal', portalEligibilityRouter);
   app.use('/portal', portalDashboardsRouter);
   app.use('/portal/communication', staffCommunicationRouter);
   app.use('/portal/agent', portalAgentApplicationsRouter);
@@ -148,8 +152,6 @@ export function createApp({ serveStatic = true } = {}) {
   app.use('/portal/admin/profile', portalAdminProfileRouter);
   app.use('/portal/employee/milestone4', portalEmployeeMilestone4Router);
   app.use('/portal/agent/reports', portalAgentMilestone4Router);
-  app.use('/portal', portalEligibilityRouter);
-  app.use('/api/portal', portalEligibilityRouter);
   app.use('/document-requirements', documentRequirementsRouter);
   app.use('/partners', partnersRouter);
   app.use('/api/partners', partnersRouter);

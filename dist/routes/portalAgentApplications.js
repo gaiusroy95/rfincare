@@ -109,6 +109,47 @@ function parseJson(value) {
   }
 }
 portalAgentApplicationsRouter.use(authenticate);
+portalAgentApplicationsRouter.post("/eligibility/calculate", async (req, res, next) => {
+  try {
+    requireAgent(req);
+    const { calculateEligibility } = await import("../lib/eligibilityEngine.js");
+    const { z: z2 } = await import("zod");
+    const schema = z2.object({
+      loanType: z2.string().min(1),
+      loanAmount: z2.coerce.number().positive().max(1e12),
+      monthlyIncome: z2.coerce.number().positive().max(1e12),
+      extraIncome: z2.coerce.number().min(0).max(1e12).optional().default(0),
+      employmentType: z2.string().min(1),
+      creditScore: z2.string().optional(),
+      creditScoreRange: z2.string().optional(),
+      existingLoans: z2.coerce.number().min(0).max(1e12).optional().default(0),
+      collateralValue: z2.coerce.number().min(0).max(1e12).optional(),
+      propertyValue: z2.coerce.number().min(0).max(1e12).optional(),
+      loanPurpose: z2.string().optional(),
+      dateOfBirth: z2.string().optional(),
+      age: z2.coerce.number().optional(),
+      yearsEmployed: z2.coerce.number().min(0).max(60).optional(),
+      pincode: z2.string().optional(),
+      pinCode: z2.string().optional(),
+      pin_code: z2.string().optional(),
+      currentPincode: z2.string().optional(),
+      permanentPincode: z2.string().optional(),
+      propertyPincode: z2.string().optional(),
+      district: z2.string().optional(),
+      fetchLiveCibil: z2.boolean().optional(),
+      refreshLiveCibil: z2.boolean().optional(),
+      consentAccepted: z2.boolean().optional(),
+      panNumber: z2.string().optional()
+    }).refine((data) => data.creditScore || data.creditScoreRange || data.fetchLiveCibil, {
+      message: "Credit score range is required unless fetching live CIBIL",
+      path: ["creditScore"]
+    });
+    const input = schema.parse(req.body || {});
+    res.json(await calculateEligibility(input));
+  } catch (err) {
+    next(err);
+  }
+});
 portalAgentApplicationsRouter.get("/profile", async (req, res, next) => {
   try {
     requireAgent(req);
