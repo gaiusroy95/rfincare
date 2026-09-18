@@ -87,6 +87,7 @@ export async function finalizeApplicationSubmission({
     ...data,
     application_package_pdf: publicPath,
     application_package_generated_at: new Date().toISOString(),
+    application_package_format: 'bank_loan_application_form_v2_official_template',
   };
 
   await pool.execute(

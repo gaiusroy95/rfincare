@@ -11,7 +11,6 @@ import { createCustomerNotification } from './notifications.js';
 import { writeAuditLog } from '../lib/audit.js';
 import { requireSuccessfulCibilForSubmit } from '../lib/cibilService.js';
 import { dispatchFileUpdateNotification } from '../lib/fileNotificationService.js';
-import { buildSimpleTextPdf } from '../lib/simplePdf.js';
 import { buildBankLoanApplicationFormPdf } from '../lib/bankLoanApplicationFormPdf.js';
 import { finalizeApplicationSubmission } from '../lib/applicationSubmissionService.js';
 import {
@@ -1092,20 +1091,11 @@ loanApplicationsRouter.get('/:id/summary-pdf', authenticate, async (req, res, ne
         consents: consents || [],
       });
     } catch (pdfErr) {
-      console.warn('[summary-pdf] bank form generation failed, falling back:', pdfErr.message);
-      const lines = [
-        'Rfincare — Loan Application Summary (Read-only)',
-        `Application: ${row.application_number || row.id}`,
-        `Status: ${row.status}`,
-        `Submitted: ${row.submitted_at || '—'}`,
-        '',
-        `Name: ${data.firstName || ''} ${data.lastName || ''}`.trim(),
-        `Email: ${data.email || row.customer_email || '—'}`,
-        `Phone: ${data.phone || data.mobile || '—'}`,
-        `Loan type: ${data.loan_type || data.loan_purpose || '—'}`,
-        `Amount: ${data.loan_amount || data.requested_loan_amount || '—'}`,
-      ];
-      pdf = buildSimpleTextPdf(lines);
+      console.error('[summary-pdf] official bank form generation failed:', pdfErr);
+      return res.status(500).json({
+        error:
+          'Could not generate the official Rfincare Bank Loan Application Form. Please contact support.',
+      });
     }
 
     // Persist regenerated official form so subsequent downloads stay consistent.
@@ -1123,7 +1113,7 @@ loanApplicationsRouter.get('/:id/summary-pdf', authenticate, async (req, res, ne
         ...data,
         application_package_pdf: publicPath,
         application_package_generated_at: new Date().toISOString(),
-        application_package_format: 'bank_loan_application_form_v1',
+        application_package_format: 'bank_loan_application_form_v2_official_template',
       };
       await pool.execute(
         `UPDATE loan_applications SET data = :data WHERE id = :id`,
