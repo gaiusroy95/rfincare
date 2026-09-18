@@ -283,6 +283,27 @@ cmsRouter.put('/marketplace-hero/:type', async (req, res, next) => {
   }
 });
 
+cmsRouter.get('/credlaxmi-banner', async (_req, res, next) => {
+  try {
+    const { getCredLaxmiBannerContent } = await import('../lib/credLaxmiBannerContent.js');
+    res.json(await getCredLaxmiBannerContent());
+  } catch (err) {
+    next(err);
+  }
+});
+
+cmsRouter.put('/credlaxmi-banner', async (req, res, next) => {
+  try {
+    if (!['admin', 'super_admin'].includes(req.auth.role)) {
+      return res.status(403).json({ error: 'Only admin can update CredLaxmi banner' });
+    }
+    const { upsertCredLaxmiBannerContent } = await import('../lib/credLaxmiBannerContent.js');
+    res.json(await upsertCredLaxmiBannerContent(req.body || {}, req.auth.userId));
+  } catch (err) {
+    next(err);
+  }
+});
+
 cmsRouter.get('/flash-tiles/categories', async (_req, res, next) => {
   try {
     const { FLASH_TILE_CATEGORIES } = await import('../lib/flashTiles.js');

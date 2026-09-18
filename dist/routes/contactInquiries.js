@@ -3,8 +3,9 @@ import { z } from "zod";
 import { getPool } from "../db/pool.js";
 import { newId } from "../lib/ids.js";
 import { sendEmail } from "../lib/email.js";
+import { sendMsg91TransactionalSms, isMsg91Configured } from "../lib/msg91.js";
 import { getSiteContactSettings } from "../lib/siteContactSettings.js";
-import { hashOtp, sendDualChannelOtp } from "../lib/otp.js";
+import { hashOtp, sendDualChannelOtp, toPublicOtpMessage } from "../lib/otp.js";
 import { getOtpProviderSettings } from "../lib/otpProviderSettings.js";
 const contactInquiriesRouter = Router();
 let schemaReady = false;
@@ -74,8 +75,42 @@ const OtpVerifySchema = z.object({
   mobileOtp: z.string().trim().length(6).optional(),
   emailOtp: z.string().trim().length(6).optional()
 });
-function supportInbox(contact) {
-  return process.env.CONTACT_INQUIRY_EMAIL || process.env.SALES_TEAM_EMAIL || contact?.emails?.[0] || contact?.email || "support@rfincare.com";
+function supportInboxes(contact) {
+  const extras = [
+    process.env.CONTACT_INQUIRY_EMAIL,
+    process.env.SALES_TEAM_EMAIL,
+    ...Array.isArray(contact?.emails) ? contact.emails : [],
+    contact?.email
+  ].map((v) => String(v || "").trim().toLowerCase()).filter((v) => v.includes("@"));
+  return [.../* @__PURE__ */ new Set(["support@rfincare.com", ...extras])];
+}
+function supportSmsPhone(contact) {
+  const fromEnv = String(process.env.CONTACT_INQUIRY_SMS || "").replace(/\D/g, "").slice(-10);
+  if (fromEnv.length === 10) return fromEnv;
+  const fromContact = String(contact?.phone || contact?.phones?.[0] || "").replace(/\D/g, "").slice(-10);
+  if (fromContact.length === 10) return fromContact;
+  return "7300069952";
+}
+async function notifySupportSms({ phone, fullName, customerPhone, subject, inquiryId }) {
+  if (!isMsg91Configured()) {
+    console.warn("[contact:support-sms] MSG91 not configured — skipped");
+    return { sent: false };
+  }
+  const body = [
+    "Rfincare new contact enquiry",
+    `From: ${fullName} (${customerPhone})`,
+    `Subject: ${String(subject || "").slice(0, 80)}`,
+    `ID: ${inquiryId}`
+  ].join("\n");
+  try {
+    return await sendMsg91TransactionalSms({
+      phone,
+      message: body.slice(0, 500)
+    });
+  } catch (err) {
+    console.error("[contact:support-sms]", err?.message || err);
+    return { sent: false };
+  }
 }
 async function verifyOtpAndCreateVerification(pool, { email, phone, mobileOtp, emailOtp }) {
   const settings = await getOtpProviderSettings();
@@ -132,11 +167,20 @@ contactInquiriesRouter.post("/otp/request", async (req, res, next) => {
     await ensureContactInquirySchema();
     const input = OtpRequestSchema.parse(req.body);
     const settings = await getOtpProviderSettings();
-    const otpResult = await sendDualChannelOtp({
-      phone: input.phone,
-      email: input.email,
-      settings
-    });
+    let otpResult;
+    try {
+      otpResult = await sendDualChannelOtp({
+        phone: input.phone,
+        email: input.email,
+        settings,
+        publicFacing: true
+      });
+    } catch (otpErr) {
+      console.error("[contact:otp]", otpErr?.message || otpErr);
+      return res.status(502).json({
+        error: toPublicOtpMessage(otpErr?.message)
+      });
+    }
     const pool = getPool();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1e3);
     if (otpResult.requireMobileOtp && otpResult.mobileOtp) {
@@ -167,11 +211,10 @@ contactInquiriesRouter.post("/otp/request", async (req, res, next) => {
     }
     res.json({
       success: true,
-      message: "OTP sent successfully.",
+      message: "OTP sent. Please verify to send your message.",
       expiresInSeconds: 600,
       requireMobileOtp: otpResult.requireMobileOtp,
       requireEmailOtp: otpResult.requireEmailOtp,
-      warnings: Array.isArray(otpResult.warnings) && otpResult.warnings.length ? otpResult.warnings : void 0,
       ...process.env.LOG_OTP === "true" ? {
         devMobileOtp: otpResult.mobileOtp || void 0,
         devEmailOtp: otpResult.emailOtp || void 0
@@ -238,13 +281,49 @@ contactInquiriesRouter.post("/", async (req, res, next) => {
       { id: verification.id }
     );
     const contact = await getSiteContactSettings();
-    const inbox = supportInbox(contact);
-    const notificationWarnings = [];
+    const inboxes = supportInboxes(contact);
+    const smsPhone = supportSmsPhone(contact);
+    const supportSubject = `[Contact] ${input.subject} — ${input.fullName}`;
+    const supportText = [
+      "New contact form inquiry (OTP verified)",
+      "",
+      `Name: ${input.fullName}`,
+      `Email: ${input.email}`,
+      `Phone: ${input.phone}`,
+      `Subject: ${input.subject}`,
+      "",
+      "Message:",
+      input.message,
+      "",
+      `Inquiry ID: ${inquiryId}`,
+      "",
+      "Reply directly to the customer email above."
+    ].join("\n");
     let customerEmailSent = false;
     let supportEmailSent = false;
+    let supportSmsSent = false;
     try {
+      const supportMail = await sendEmail({
+        to: inboxes,
+        subject: supportSubject,
+        text: supportText,
+        replyTo: input.email,
+        recipientName: "Rfincare Support"
+      });
+      supportEmailSent = Boolean(supportMail?.sent);
+      if (!supportEmailSent && supportMail?.warningInternal) {
+        console.warn("[contact:support-mail]", supportMail.warningInternal, { inquiryId, inboxes });
+      } else if (supportEmailSent) {
+        console.info("[contact:support-mail] delivered", { inquiryId, to: inboxes, channel: supportMail?.channel });
+      }
+    } catch (err) {
+      console.error("[contact:support-mail]", err?.message || err, { inquiryId });
+    }
+    try {
+      const bccSupport = !supportEmailSent;
       const customerMail = await sendEmail({
         to: input.email,
+        bcc: bccSupport ? inboxes : void 0,
         subject: `We received your message — ${input.subject}`,
         text: [
           `Hi ${input.fullName},`,
@@ -258,49 +337,57 @@ contactInquiriesRouter.post("/", async (req, res, next) => {
           input.message,
           "",
           "— Rfincare Support"
-        ].join("\n")
+        ].join("\n"),
+        recipientName: input.fullName,
+        replyTo: inboxes[0]
       });
       customerEmailSent = Boolean(customerMail?.sent);
-      if (!customerEmailSent && customerMail?.warning) {
-        notificationWarnings.push(customerMail.warning);
+      if (!customerEmailSent && customerMail?.warningInternal) {
+        console.warn("[contact:customer-mail]", customerMail.warningInternal);
+      }
+      if (bccSupport && customerEmailSent) {
+        supportEmailSent = true;
+        console.info("[contact:support-mail] notified via customer BCC", { inquiryId, inboxes });
       }
     } catch (err) {
-      notificationWarnings.push(err?.message || "Customer confirmation email failed.");
+      console.error("[contact:customer-mail]", err?.message || err);
     }
-    try {
-      const supportMail = await sendEmail({
-        to: inbox,
-        subject: `[Contact] ${input.subject} — ${input.fullName}`,
-        text: [
-          "New contact form inquiry (OTP verified)",
-          "",
-          `Name: ${input.fullName}`,
-          `Email: ${input.email}`,
-          `Phone: ${input.phone}`,
-          `Subject: ${input.subject}`,
-          "",
-          "Message:",
-          input.message,
-          "",
-          `Inquiry ID: ${inquiryId}`
-        ].join("\n")
-      });
-      supportEmailSent = Boolean(supportMail?.sent);
-      if (!supportEmailSent && supportMail?.warning) {
-        notificationWarnings.push(supportMail.warning);
+    if (!supportEmailSent) {
+      try {
+        const retry = await sendEmail({
+          to: "support@rfincare.com",
+          subject: supportSubject,
+          text: supportText,
+          replyTo: input.email,
+          recipientName: "Rfincare Support"
+        });
+        supportEmailSent = Boolean(retry?.sent);
+        if (!supportEmailSent) {
+          console.error("[contact:support-mail:retry-failed]", retry?.warningInternal || retry?.reason, {
+            inquiryId
+          });
+        }
+      } catch (err) {
+        console.error("[contact:support-mail:retry]", err?.message || err);
       }
-    } catch (err) {
-      notificationWarnings.push(err?.message || "Support notification email failed.");
     }
+    const smsResult = await notifySupportSms({
+      phone: smsPhone,
+      fullName: input.fullName,
+      customerPhone: input.phone,
+      subject: input.subject,
+      inquiryId
+    });
+    supportSmsSent = Boolean(smsResult?.sent);
     res.status(201).json({
       success: true,
       inquiryId,
       message: "Your message has been sent successfully.",
       emails: {
         customer: { sent: customerEmailSent },
-        support: { sent: supportEmailSent, to: inbox }
+        support: { sent: supportEmailSent, to: inboxes }
       },
-      notificationWarnings: notificationWarnings.length ? notificationWarnings : void 0
+      sms: { sent: supportSmsSent }
     });
   } catch (err) {
     next(err);

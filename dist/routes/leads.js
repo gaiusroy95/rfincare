@@ -3,7 +3,7 @@ import { z } from "zod";
 import { getPool } from "../db/pool.js";
 import { ensureOnboardingSchema } from "../db/ensureOnboardingSchema.js";
 import { newId } from "../lib/ids.js";
-import { hashOtp, sendDualChannelOtp, sendOtpNotification } from "../lib/otp.js";
+import { hashOtp, sendDualChannelOtp, sendOtpNotification, toPublicOtpMessage } from "../lib/otp.js";
 import { getOtpProviderSettings } from "../lib/otpProviderSettings.js";
 import {
   createResumeToken,
@@ -113,13 +113,17 @@ function formatLead(row, settings = null) {
 const CreateLeadSchema = z.object({
   fullName: z.string().min(1).optional(),
   full_name: z.string().min(1).optional(),
-  email: z.string().email(),
+  email: z.union([z.string().email(), z.literal("")]).optional(),
   phone: z.string().min(10),
   loanType: z.string().optional(),
   loan_type: z.string().optional(),
   source: z.string().optional(),
   consentAccepted: z.boolean().optional(),
   consent_accepted: z.boolean().optional(),
+  consentToken: z.string().optional().nullable(),
+  consent_token: z.string().optional().nullable(),
+  otpId: z.string().optional().nullable(),
+  otp_id: z.string().optional().nullable(),
   sessionKey: z.string().optional(),
   session_key: z.string().optional(),
   sourcedAgentCode: z.string().optional().nullable(),
@@ -134,7 +138,18 @@ const CreateLeadSchema = z.object({
   assignedTo: z.string().optional().nullable(),
   assigned_to: z.string().optional().nullable(),
   agentUserId: z.string().optional().nullable(),
-  agent_user_id: z.string().optional().nullable()
+  agent_user_id: z.string().optional().nullable(),
+  eligibilityScore: z.coerce.number().optional().nullable(),
+  eligibility_score: z.coerce.number().optional().nullable(),
+  eligibilityData: z.record(z.unknown()).optional().nullable(),
+  eligibility_data: z.record(z.unknown()).optional().nullable(),
+  loanAmount: z.coerce.number().optional().nullable(),
+  loan_amount: z.coerce.number().optional().nullable(),
+  employmentType: z.string().optional().nullable(),
+  employment_type: z.string().optional().nullable(),
+  gender: z.string().optional().nullable(),
+  panNumber: z.string().optional().nullable(),
+  pan_number: z.string().optional().nullable()
 });
 async function applyAgentCodeToLead(pool, leadId, body) {
   await ensureReferralSchema(pool);
@@ -209,18 +224,37 @@ leadsRouter.post("/", async (req, res, next) => {
     const sessionKey = body.sessionKey || body.session_key || null;
     const leadKind = String(body.leadKind || body.lead_kind || "").toLowerCase();
     const source = body.source || (agentUserId ? "agent_portal" : null) || (employeeUserId && leadKind === "agent" ? "employee_agent_lead" : null) || (employeeUserId ? "employee_portal" : null) || "eligibility";
+    let callConsentVerified = false;
+    if (employeeUserId || agentUserId) {
+      const { assertCallConsentToken } = await import("../lib/callConsentOtp.js");
+      await assertCallConsentToken({
+        phone: body.phone,
+        consentToken: body.consentToken || body.consent_token,
+        otpId: body.otpId || body.otp_id
+      });
+      callConsentVerified = true;
+    }
     const { row, created } = await upsertMarketingLead(pool, {
       fullName,
-      email: body.email,
+      email: String(body.email || "").trim() || (await import("../lib/marketingLeads.js")).eligibilityPlaceholderEmail(body.phone),
       phone: body.phone,
       loanType: body.loanType || body.loan_type || null,
       source,
-      consentAccepted: Boolean(body.consentAccepted || body.consent_accepted),
+      consentAccepted: Boolean(body.consentAccepted || body.consent_accepted || callConsentVerified),
       sessionKey,
       status: "new",
       // Staff-captured leads are assigned below; skip queue so they don't bounce to another L1.
       skipAutoAssign: Boolean(agentUserId || employeeUserId || body.assignedTo || body.assigned_to)
     });
+    if (callConsentVerified && row?.id) {
+      await pool.execute(
+        `UPDATE marketing_leads
+         SET consent_accepted = TRUE, consent_verified_at = NOW(), updated_at = NOW()
+         WHERE id = :id`,
+        { id: row.id }
+      ).catch(() => {
+      });
+    }
     await applyAgentCodeToLead(pool, row?.id, body);
     let assigneeId = body.assignedTo || body.assigned_to || null;
     let stampAgentCode = normalizeAgentCode(
@@ -275,6 +309,33 @@ leadsRouter.post("/", async (req, res, next) => {
           await ensureLeadTatClock(pool, row.id).catch(() => {
           });
         }
+      } catch {
+      }
+    }
+    const eligibilityData = body.eligibilityData || body.eligibility_data || null;
+    const eligibilityScore = body.eligibilityScore ?? body.eligibility_score ?? null;
+    const loanAmount = body.loanAmount ?? body.loan_amount ?? null;
+    const employmentType = body.employmentType || body.employment_type || null;
+    if (row?.id && (eligibilityData || eligibilityScore != null || loanAmount != null || employmentType)) {
+      try {
+        await pool.execute(
+          `UPDATE marketing_leads SET
+             eligibility_score = COALESCE(:score, eligibility_score),
+             eligibility_data = COALESCE(:data, eligibility_data),
+             loan_amount = COALESCE(:loan_amount, loan_amount),
+             employment_type = COALESCE(:employment_type, employment_type),
+             loan_type = COALESCE(:loan_type, loan_type),
+             updated_at = NOW()
+           WHERE id = :id`,
+          {
+            id: row.id,
+            score: eligibilityScore,
+            data: eligibilityData ? JSON.stringify(eligibilityData) : null,
+            loan_amount: loanAmount != null ? Number(loanAmount) : null,
+            employment_type: employmentType || null,
+            loan_type: body.loanType || body.loan_type || null
+          }
+        );
       } catch {
       }
     }
@@ -501,7 +562,15 @@ async function persistLeadOtps(pool, { leadId, email, phone, settings, mobileOtp
   }
   return otpIds;
 }
-function formatOtpSendResponse({ settings, mobileOtp, emailOtp, otpIds, warnings = [], otpResult }) {
+function formatOtpSendResponse({
+  settings,
+  mobileOtp,
+  emailOtp,
+  otpIds,
+  warnings = [],
+  otpResult,
+  publicFacing = true
+}) {
   const requireMobileOtp = otpResult?.requireMobileOtp ?? settings.requireMobileOtp;
   const requireEmailOtp = otpResult?.requireEmailOtp ?? settings.requireEmailOtp;
   return {
@@ -512,9 +581,12 @@ function formatOtpSendResponse({ settings, mobileOtp, emailOtp, otpIds, warnings
     requireEmailOtp,
     emailDelivered: otpResult?.emailDelivered,
     smsDelivered: otpResult?.smsDelivered,
-    smsProvider: settings.smsProvider,
-    emailProvider: settings.emailProvider,
-    warnings: warnings.length ? warnings : void 0,
+    // Provider names / warnings are ops-only — never leak MSG91/SMTP internals to customers.
+    ...publicFacing ? {} : {
+      smsProvider: settings.smsProvider,
+      emailProvider: settings.emailProvider,
+      warnings: warnings.length ? warnings : void 0
+    },
     ...process.env.LOG_OTP === "true" ? { devMobileOtp: mobileOtp, devEmailOtp: emailOtp } : {}
   };
 }
@@ -547,7 +619,13 @@ leadsRouter.post("/start-verification", async (req, res, next) => {
     });
     await applyAgentCodeToLead(pool, row?.id, body);
     const settings = await getOtpProviderSettings();
-    const otpResult = await sendDualChannelOtp({ phone, email, settings });
+    let otpResult;
+    try {
+      otpResult = await sendDualChannelOtp({ phone, email, settings, publicFacing: true });
+    } catch (otpErr) {
+      console.error("[leads:start-verification:otp]", otpErr?.message || otpErr);
+      return res.status(502).json({ error: toPublicOtpMessage(otpErr?.message) });
+    }
     const deliverySettings = effectiveOtpSettings(settings, otpResult);
     const otpIds = await persistLeadOtps(pool, {
       leadId: row.id,
@@ -566,11 +644,36 @@ leadsRouter.post("/start-verification", async (req, res, next) => {
         mobileOtp: otpResult.mobileOtp,
         emailOtp: otpResult.emailOtp,
         otpIds,
-        warnings: otpResult.warnings,
-        otpResult
+        otpResult,
+        publicFacing: true
       }),
       lead: formatLead(fresh || row)
     });
+  } catch (err) {
+    next(err);
+  }
+});
+leadsRouter.post("/call-consent/request-otp", authenticate, async (req, res, next) => {
+  try {
+    if (!["employee", "agent", "admin", "super_admin"].includes(req.auth.role)) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+    const phone = String(req.body?.mobile || req.body?.phone || "").replace(/\D/g, "").slice(-10);
+    const { requestCallConsentOtp } = await import("../lib/callConsentOtp.js");
+    res.json(await requestCallConsentOtp({ phone, initiatedByUserId: req.auth.userId }));
+  } catch (err) {
+    next(err);
+  }
+});
+leadsRouter.post("/call-consent/verify-otp", authenticate, async (req, res, next) => {
+  try {
+    if (!["employee", "agent", "admin", "super_admin"].includes(req.auth.role)) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+    const phone = String(req.body?.mobile || req.body?.phone || "").replace(/\D/g, "").slice(-10);
+    const otp = String(req.body?.otp || "").trim();
+    const { verifyCallConsentOtp } = await import("../lib/callConsentOtp.js");
+    res.json(await verifyCallConsentOtp({ phone, otp }));
   } catch (err) {
     next(err);
   }
@@ -589,11 +692,18 @@ leadsRouter.post("/request-otp", async (req, res, next) => {
       const existing = await findMarketingLeadByContact(pool, { email, phone });
       resolvedLeadId = existing?.id || null;
     }
-    const otpResult = await sendDualChannelOtp({
-      phone,
-      email,
-      settings
-    });
+    let otpResult;
+    try {
+      otpResult = await sendDualChannelOtp({
+        phone,
+        email,
+        settings,
+        publicFacing: true
+      });
+    } catch (otpErr) {
+      console.error("[leads:request-otp]", otpErr?.message || otpErr);
+      return res.status(502).json({ error: toPublicOtpMessage(otpErr?.message) });
+    }
     const deliverySettings = effectiveOtpSettings(settings, otpResult);
     const otpIds = await persistLeadOtps(pool, {
       leadId: resolvedLeadId,
@@ -609,8 +719,8 @@ leadsRouter.post("/request-otp", async (req, res, next) => {
         mobileOtp: otpResult.mobileOtp,
         emailOtp: otpResult.emailOtp,
         otpIds,
-        warnings: otpResult.warnings,
-        otpResult
+        otpResult,
+        publicFacing: true
       })
     );
   } catch (err) {
@@ -712,19 +822,39 @@ leadsRouter.patch("/:id", async (req, res, next) => {
     const pool = getPool();
     const updates = req.body || {};
     const eligibilityData = updates.eligibilityData || updates.eligibility_data;
+    let mergedEligibility = eligibilityData || null;
+    if (eligibilityData) {
+      try {
+        const [[existing]] = await pool.execute(
+          `SELECT eligibility_data FROM marketing_leads WHERE id = :id LIMIT 1`,
+          { id: req.params.id }
+        );
+        const prev = typeof existing?.eligibility_data === "object" ? existing.eligibility_data : existing?.eligibility_data ? JSON.parse(existing.eligibility_data) : {};
+        mergedEligibility = { ...prev || {}, ...eligibilityData };
+      } catch {
+        mergedEligibility = eligibilityData;
+      }
+    }
     await pool.execute(
       `UPDATE marketing_leads SET
          status = COALESCE(:status, status),
          eligibility_score = COALESCE(:score, eligibility_score),
          eligibility_data = COALESCE(:data, eligibility_data),
-         application_id = COALESCE(:application_id, application_id)
+         application_id = COALESCE(:application_id, application_id),
+         loan_type = COALESCE(:loan_type, loan_type),
+         loan_amount = COALESCE(:loan_amount, loan_amount),
+         employment_type = COALESCE(:employment_type, employment_type),
+         updated_at = NOW()
        WHERE id = :id`,
       {
         id: req.params.id,
         status: updates.status ?? null,
         score: updates.eligibilityScore ?? updates.eligibility_score ?? null,
-        data: eligibilityData ? JSON.stringify(eligibilityData) : null,
-        application_id: updates.applicationId ?? updates.application_id ?? null
+        data: mergedEligibility ? JSON.stringify(mergedEligibility) : null,
+        application_id: updates.applicationId ?? updates.application_id ?? null,
+        loan_type: updates.loanType ?? updates.loan_type ?? null,
+        loan_amount: updates.loanAmount != null || updates.loan_amount != null ? Number(updates.loanAmount ?? updates.loan_amount) : null,
+        employment_type: updates.employmentType ?? updates.employment_type ?? null
       }
     );
     const [[row]] = await pool.execute(`SELECT * FROM marketing_leads WHERE id = :id`, {

@@ -26,6 +26,21 @@ function formatOtpMessage(template, otp) {
   const tpl = template || "Your Rfincare verification code is {{otp}}. Valid for 10 minutes.";
   return tpl.replace(/\{\{otp\}\}/g, otp);
 }
+function toPublicOtpMessage(raw, fallback = "Could not send OTP right now. Please try again in a moment.") {
+  const text = String(raw || "").trim();
+  if (!text) return fallback;
+  if (/sender\s*id|msg91|smtp|twilio|auth[_ ]?key|subscription|dlt|badcredentials|535|template_id|cloud\s*run|otp settings|console|rfincri?|delivery may fail|no subscription|app password|gmail smtp|smtp_user|smtp_pass/i.test(
+    text
+  )) {
+    return fallback;
+  }
+  if (text.length > 160) return fallback;
+  return text;
+}
+function logOtpDeliveryWarnings(warnings = []) {
+  if (!Array.isArray(warnings) || !warnings.length) return;
+  console.warn("[otp:delivery]", warnings.join(" | "));
+}
 function getOtpInfrastructureStatus(providerConfig = {}) {
   const cfg = providerConfig || {};
   const msg91 = getMsg91Config(cfg);
@@ -35,7 +50,7 @@ function getOtpInfrastructureStatus(providerConfig = {}) {
       emailConfigured: isMsg91EmailConfigured(cfg),
       whatsappConfigured: isMsg91WhatsappConfigured(cfg),
       senderId: msg91.senderId || null,
-      senderIdWarning: msg91.senderIdWarning || null,
+      senderIdWarning: msg91.senderIdWarningInternal || null,
       otpTemplateId: msg91.otpTemplateId || null,
       whatsappTemplateId: msg91.whatsappTemplateId || null,
       whatsappNamespace: msg91.whatsappNamespace || null,
@@ -326,7 +341,8 @@ async function sendOtpNotification({
   const results = await Promise.allSettled(tasks);
   const errMsg = aggregateChannelErrors(results);
   if (errMsg) {
-    const err = new Error(errMsg);
+    logOtpDeliveryWarnings([errMsg]);
+    const err = new Error(toPublicOtpMessage(errMsg));
     err.status = results.find((r) => r.reason?.status)?.reason?.status || 502;
     throw err;
   }
@@ -336,7 +352,12 @@ async function sendOtpNotification({
   });
   return out;
 }
-async function sendDualChannelOtp({ email, phone, settings: settingsOverride }) {
+async function sendDualChannelOtp({
+  email,
+  phone,
+  settings: settingsOverride,
+  publicFacing = false
+} = {}) {
   const settings = settingsOverride || await getOtpProviderSettings();
   const mobileOtp = generateOtp();
   const emailOtp = generateOtp();
@@ -367,7 +388,7 @@ async function sendDualChannelOtp({ email, phone, settings: settingsOverride }) 
         "Email OTP"
       );
       if (result?.delivered === false || result?.sent === false) {
-        throw new Error(result.warning || "Email OTP could not be delivered.");
+        throw new Error(result.warning || result.warningInternal || "Email OTP could not be delivered.");
       }
       if (result?.warning) warnings.push(result.warning);
       return result;
@@ -431,26 +452,30 @@ async function sendDualChannelOtp({ email, phone, settings: settingsOverride }) 
   }
   const whatsappDelivered = outcomes.whatsapp?.sent === true;
   const mobileChannelOk = smsDelivered || whatsappDelivered;
+  logOtpDeliveryWarnings(warnings);
   if (!mobileChannelOk && !emailDelivered && (settings.requireMobileOtp !== false || settings.requireEmailOtp !== false || settings.requireWhatsappOtp)) {
     const err = new Error(
-      warnings.join(" ") || "OTP could not be delivered on any channel. Check Admin → OTP settings and MSG91/SMTP credentials."
+      publicFacing ? toPublicOtpMessage(null) : warnings.join(" ") || "OTP could not be delivered on any channel. Check Admin → OTP settings and MSG91/SMTP credentials."
     );
     err.status = 502;
     throw err;
   }
+  const publicMobileOk = mobileChannelOk;
+  const publicEmailOk = emailDelivered;
   return {
-    mobileOtp: settings.requireMobileOtp !== false && mobileChannelOk ? mobileOtp : null,
-    emailOtp: settings.requireEmailOtp !== false && emailDelivered ? emailOtp : null,
+    mobileOtp: settings.requireMobileOtp !== false && publicMobileOk ? mobileOtp : null,
+    emailOtp: settings.requireEmailOtp !== false && publicEmailOk ? emailOtp : null,
     smsProvider: settings.smsProvider,
     emailProvider: settings.emailProvider,
     whatsappProvider: settings.whatsappProvider,
     msg91Configured: isMsg91Configured(),
-    emailDelivered,
+    emailDelivered: publicEmailOk,
     smsDelivered,
     whatsappDelivered,
-    requireMobileOtp: settings.requireMobileOtp !== false && mobileChannelOk,
-    requireEmailOtp: settings.requireEmailOtp !== false && emailDelivered,
-    warnings,
+    requireMobileOtp: settings.requireMobileOtp !== false && publicMobileOk,
+    requireEmailOtp: settings.requireEmailOtp !== false && publicEmailOk,
+    // Ops-only; public routes must omit this from JSON responses.
+    warnings: publicFacing ? [] : warnings,
     delivery: outcomes
   };
 }
@@ -459,5 +484,6 @@ export {
   getOtpInfrastructureStatus,
   hashOtp,
   sendDualChannelOtp,
-  sendOtpNotification
+  sendOtpNotification,
+  toPublicOtpMessage
 };

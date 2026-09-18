@@ -28,13 +28,18 @@ function getMsg91Config(overrides = {}) {
     if (panelSender && panelSender.length !== 6) {
       senderIdWarning = `Admin sender ID "${overrides.msg91SenderId}" is not 6 characters; using server MSG91_SENDER_ID (${envSender}).`;
     }
-  } else if (panelSender) {
+  } else if (panelSender || process.env.MSG91_SENDER_ID) {
     senderIdWarning = `Sender ID "${overrides.msg91SenderId || process.env.MSG91_SENDER_ID}" is invalid (need exactly 6 A–Z/0–9). Using RFINCR fallback — update DLT sender ID or delivery may fail.`;
+  }
+  if (senderIdWarning) {
+    console.warn("[msg91:sender]", senderIdWarning);
   }
   return {
     authKey: (process.env.MSG91_AUTH_KEY || "").trim(),
     senderId,
-    senderIdWarning,
+    // Kept for admin diagnostics only; public OTP/SMS flows must not surface this.
+    senderIdWarning: null,
+    senderIdWarningInternal: senderIdWarning,
     otpTemplateId: String(templateId || "").trim(),
     flowTemplateId: String(
       overrides.msg91FlowTemplateId || process.env.MSG91_FLOW_TEMPLATE_ID || ""
@@ -200,8 +205,7 @@ async function sendMsg91Otp({ phone, otp, config: overrides = {}, messageTemplat
     provider: "msg91",
     mode: "otp_api",
     mobile: mobileE164,
-    senderId: config.senderId,
-    warning: config.senderIdWarning || void 0
+    senderId: config.senderId
   };
 }
 async function sendMsg91Flow({ phone, variables = {}, config: overrides = {} }) {
@@ -415,6 +419,91 @@ async function sendMsg91EmailOtp({
     templateId: config.emailOtpTemplateId
   };
 }
+async function sendMsg91TransactionalEmail({
+  to,
+  subject,
+  text,
+  html,
+  recipientName,
+  config: overrides = {}
+}) {
+  const config = getMsg91EmailConfig(overrides);
+  if (!config.authKey || !config.domain || !config.fromEmail) {
+    return {
+      sent: false,
+      provider: "msg91",
+      reason: "msg91_email_not_configured"
+    };
+  }
+  const toEmail = String(to || "").trim().toLowerCase();
+  if (!toEmail) {
+    return { sent: false, provider: "msg91", reason: "no_recipient" };
+  }
+  const body = {
+    recipients: [
+      {
+        to: [
+          {
+            email: toEmail,
+            name: recipientName || toEmail
+          }
+        ]
+      }
+    ],
+    from: {
+      name: config.fromName,
+      email: config.fromEmail
+    },
+    domain: config.domain,
+    subject: String(subject || "Rfincare notification"),
+    body: {
+      html: html || `<pre style="font-family:sans-serif;white-space:pre-wrap">${String(text || "")}</pre>`,
+      text: text || ""
+    }
+  };
+  if (config.emailOtpTemplateId && process.env.MSG91_EMAIL_FORCE_TEMPLATE === "true") {
+    body.template_id = config.emailOtpTemplateId;
+    body.recipients[0].variables = {
+      SUBJECT: String(subject || ""),
+      BODY: String(text || ""),
+      MESSAGE: String(text || "")
+    };
+    delete body.subject;
+    delete body.body;
+  }
+  try {
+    const res = await fetchWithTimeout(
+      MSG91_EMAIL_URL,
+      {
+        method: "POST",
+        headers: {
+          authkey: config.authKey,
+          "Content-Type": "application/json",
+          Accept: "application/json"
+        },
+        body: JSON.stringify(body),
+        timeoutMessage: "MSG91 transactional email timed out."
+      },
+      MSG91_FETCH_TIMEOUT_MS
+    );
+    await parseMsg91Response(res);
+    return {
+      sent: true,
+      provider: "msg91",
+      mode: "transactional_email",
+      domain: config.domain,
+      from: config.fromEmail
+    };
+  } catch (err) {
+    console.error("[msg91:email]", err?.message || err);
+    return {
+      sent: false,
+      provider: "msg91",
+      reason: "msg91_email_failed",
+      warningInternal: err?.message || "MSG91 email failed"
+    };
+  }
+}
 async function testMsg91Connection(overrides = {}) {
   const config = getMsg91Config(overrides);
   const emailConfig = getMsg91EmailConfig(overrides);
@@ -424,7 +513,7 @@ async function testMsg91Connection(overrides = {}) {
   return {
     ok: true,
     senderId: config.senderId,
-    senderIdWarning: config.senderIdWarning || null,
+    senderIdWarning: config.senderIdWarningInternal || null,
     otpTemplateId: config.otpTemplateId || "(using plain SMS — set MSG91_OTP_TEMPLATE_ID)",
     flowTemplateId: config.flowTemplateId || null,
     whatsappTemplateId: config.whatsappTemplateId || null,
@@ -451,6 +540,7 @@ export {
   sendMsg91EmailOtp,
   sendMsg91Flow,
   sendMsg91Otp,
+  sendMsg91TransactionalEmail,
   sendMsg91TransactionalSms,
   sendMsg91Whatsapp,
   testMsg91Connection

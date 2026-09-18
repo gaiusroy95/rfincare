@@ -123,6 +123,15 @@ publicContentRouter.get('/homepage/trust-signals', async (_req, res, next) => {
   }
 });
 
+publicContentRouter.get('/credlaxmi-banner', async (_req, res, next) => {
+  try {
+    const { getCredLaxmiBannerContent } = await import('../lib/credLaxmiBannerContent.js');
+    res.json(await getCredLaxmiBannerContent());
+  } catch (err) {
+    next(err);
+  }
+});
+
 publicContentRouter.get('/marketplace-hero', async (req, res, next) => {
   try {
     const type = req.query.type || req.query.marketplace || 'insurance';

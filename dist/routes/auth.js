@@ -749,6 +749,10 @@ authRouter.post("/forgot-password/request-otp", async (req, res, next) => {
     if (err?.name === "ZodError") {
       err.status = 400;
       err.message = err.issues?.[0]?.message || "Invalid request";
+    } else if (err?.message && /msg91|smtp|sender|subscription|auth[_ ]?key|twilio/i.test(String(err.message))) {
+      console.error("[forgot-password:otp]", err.message);
+      err.status = err.status || 502;
+      err.message = "Could not send OTP right now. Please try again in a moment.";
     }
     next(err);
   }

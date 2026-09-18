@@ -77,7 +77,8 @@ async function finalizeApplicationSubmission({
   const mergedData = {
     ...data,
     application_package_pdf: publicPath,
-    application_package_generated_at: (/* @__PURE__ */ new Date()).toISOString()
+    application_package_generated_at: (/* @__PURE__ */ new Date()).toISOString(),
+    application_package_format: "bank_loan_application_form_v2_official_template"
   };
   await pool.execute(
     `UPDATE loan_applications SET data = :data WHERE id = :id`,

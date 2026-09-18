@@ -64,7 +64,7 @@ export function publicEmailDeliveryMessage(result) {
   return 'Confirmation email could not be delivered right now. Our team still has your booking and will follow up.';
 }
 
-async function sendViaSmtp({ to, subject, text, html, attachments = [], cc }) {
+async function sendViaSmtp({ to, subject, text, html, attachments = [], cc, replyTo, bcc }) {
   const nodemailer = await import('nodemailer');
   const pass = smtpPassword();
   const user = String(process.env.SMTP_USER || '').trim();
@@ -94,6 +94,8 @@ async function sendViaSmtp({ to, subject, text, html, attachments = [], cc }) {
     from: smtpFromAddress() || user,
     to,
     cc: cc || undefined,
+    bcc: bcc || undefined,
+    replyTo: replyTo || undefined,
     subject,
     text,
     html: html || text,
@@ -101,8 +103,28 @@ async function sendViaSmtp({ to, subject, text, html, attachments = [], cc }) {
   });
 }
 
-export async function sendEmail({ to, subject, text, html, attachments, cc, recipientName }) {
-  if (!to) return { sent: false, reason: 'no_recipient' };
+function normalizeRecipients(value) {
+  if (!value) return [];
+  const list = Array.isArray(value) ? value : String(value).split(/[,;]+/);
+  return [...new Set(list.map((v) => String(v || '').trim()).filter(Boolean))];
+}
+
+export async function sendEmail({
+  to,
+  subject,
+  text,
+  html,
+  attachments,
+  cc,
+  bcc,
+  replyTo,
+  recipientName,
+}) {
+  const recipients = normalizeRecipients(to);
+  if (!recipients.length) return { sent: false, reason: 'no_recipient' };
+  const toAddress = recipients.join(', ');
+  const ccAddress = normalizeRecipients(cc).join(', ') || undefined;
+  const bccAddress = normalizeRecipients(bcc).join(', ') || undefined;
 
   const mailAttachments = Array.isArray(attachments)
     ? attachments.filter((a) => a?.path || a?.content)
@@ -111,18 +133,21 @@ export async function sendEmail({ to, subject, text, html, attachments, cc, reci
   if (smtpConfigured()) {
     try {
       await sendViaSmtp({
-        to,
+        to: toAddress,
         subject,
         text,
         html,
         attachments: mailAttachments,
-        cc,
+        cc: ccAddress,
+        bcc: bccAddress,
+        replyTo,
       });
       return {
         sent: true,
         channel: 'smtp',
         attachmentCount: mailAttachments.length,
         ccSupported: true,
+        to: recipients,
       };
     } catch (err) {
       console.error('[email:smtp]', err?.message || err);
@@ -144,32 +169,42 @@ export async function sendEmail({ to, subject, text, html, attachments, cc, reci
           String(process.env.MSG91_EMAIL_FROM_EMAIL || process.env.MSG91_EMAIL_FROM || '').trim(),
         );
         if (authKey && domain && from) {
-          const msg91 = await sendMsg91TransactionalEmail({
-            to,
-            subject,
-            text,
-            html,
-            recipientName,
-          });
-          if (msg91?.sent) {
+          // MSG91 typically accepts one primary recipient; send to each.
+          let anySent = false;
+          for (const recipient of recipients) {
+            const msg91 = await sendMsg91TransactionalEmail({
+              to: recipient,
+              subject,
+              text,
+              html,
+              recipientName,
+            });
+            if (msg91?.sent) anySent = true;
+          }
+          if (anySent) {
             return {
-              ...msg91,
+              sent: true,
               channel: 'msg91',
               attachmentCount: 0,
               smtpFallback: true,
+              to: recipients,
             };
           }
-          console.error('[email:msg91-fallback]', msg91?.warningInternal || msg91?.reason);
+          console.error('[email:msg91-fallback] no recipients accepted');
         } else if (isMsg91EmailConfigured()) {
-          const msg91 = await sendMsg91TransactionalEmail({
-            to,
-            subject,
-            text,
-            html,
-            recipientName,
-          });
-          if (msg91?.sent) {
-            return { ...msg91, channel: 'msg91', attachmentCount: 0, smtpFallback: true };
+          let anySent = false;
+          for (const recipient of recipients) {
+            const msg91 = await sendMsg91TransactionalEmail({
+              to: recipient,
+              subject,
+              text,
+              html,
+              recipientName,
+            });
+            if (msg91?.sent) anySent = true;
+          }
+          if (anySent) {
+            return { sent: true, channel: 'msg91', attachmentCount: 0, smtpFallback: true, to: recipients };
           }
         }
       } catch (fallbackErr) {
@@ -193,22 +228,26 @@ export async function sendEmail({ to, subject, text, html, attachments, cc, reci
       String(process.env.MSG91_EMAIL_FROM_EMAIL || process.env.MSG91_EMAIL_FROM || '').trim(),
     );
     if (authKey && domain && from) {
-      const msg91 = await sendMsg91TransactionalEmail({
-        to,
-        subject,
-        text,
-        html,
-        recipientName,
-      });
-      if (msg91?.sent) {
-        return { ...msg91, channel: 'msg91', attachmentCount: 0 };
+      let anySent = false;
+      for (const recipient of recipients) {
+        const msg91 = await sendMsg91TransactionalEmail({
+          to: recipient,
+          subject,
+          text,
+          html,
+          recipientName,
+        });
+        if (msg91?.sent) anySent = true;
+      }
+      if (anySent) {
+        return { sent: true, channel: 'msg91', attachmentCount: 0, to: recipients };
       }
     }
   } catch (err) {
     console.error('[email:msg91]', err?.message || err);
   }
 
-  console.log('[email]', { to, cc, subject }, process.env.LOG_OTP === 'true' ? text : '(body hidden)');
+  console.log('[email]', { to: toAddress, cc: ccAddress, bcc: bccAddress, subject }, process.env.LOG_OTP === 'true' ? text : '(body hidden)');
   return {
     sent: false,
     channel: 'log',

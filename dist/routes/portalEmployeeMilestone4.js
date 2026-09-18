@@ -235,7 +235,37 @@ const EmployeeCibilPullSchema = z.object({
   panNumber: z.string().regex(/^[A-Z]{5}[0-9]{4}[A-Z]$/i, "Enter a valid PAN number"),
   mobile: z.string().min(10, "Mobile number is required"),
   pincode: z.string().regex(/^\d{6}$/, "Enter a valid 6-digit pincode"),
-  consentAccepted: z.literal(true, { errorMap: () => ({ message: "Consent is required" }) })
+  gender: z.enum(["male", "female", "other"], { errorMap: () => ({ message: "Gender is required" }) }),
+  consentAccepted: z.literal(true, { errorMap: () => ({ message: "Consent is required" }) }),
+  consentToken: z.string().min(16, "OTP consent is required"),
+  otpId: z.string().min(8, "OTP consent is required")
+});
+portalEmployeeMilestone4Router.post("/cibil/consent/request-otp", async (req, res, next) => {
+  try {
+    requireEmployee(req);
+    if (req.auth.role === "employee") {
+      await assertEmployeeAccess(req, "applications", "read");
+    }
+    const phone = String(req.body?.mobile || req.body?.phone || "").replace(/\D/g, "").slice(-10);
+    const { requestCibilConsentOtp } = await import("../lib/cibilConsentOtp.js");
+    res.json(await requestCibilConsentOtp({ phone, initiatedByUserId: req.auth.userId }));
+  } catch (err) {
+    next(err);
+  }
+});
+portalEmployeeMilestone4Router.post("/cibil/consent/verify-otp", async (req, res, next) => {
+  try {
+    requireEmployee(req);
+    if (req.auth.role === "employee") {
+      await assertEmployeeAccess(req, "applications", "read");
+    }
+    const phone = String(req.body?.mobile || req.body?.phone || "").replace(/\D/g, "").slice(-10);
+    const otp = String(req.body?.otp || "").trim();
+    const { verifyCibilConsentOtp } = await import("../lib/cibilConsentOtp.js");
+    res.json(await verifyCibilConsentOtp({ phone, otp }));
+  } catch (err) {
+    next(err);
+  }
 });
 portalEmployeeMilestone4Router.post("/cibil/pull", async (req, res, next) => {
   try {
@@ -245,6 +275,12 @@ portalEmployeeMilestone4Router.post("/cibil/pull", async (req, res, next) => {
     }
     const input = EmployeeCibilPullSchema.parse(req.body);
     const phone = String(input.mobile).replace(/\D/g, "").slice(-10);
+    const { assertCibilConsentToken } = await import("../lib/cibilConsentOtp.js");
+    await assertCibilConsentToken({
+      phone,
+      consentToken: input.consentToken,
+      otpId: input.otpId
+    });
     const result = await pullCibilForEmployee(
       {
         fullName: input.fullName.trim(),
@@ -252,11 +288,38 @@ portalEmployeeMilestone4Router.post("/cibil/pull", async (req, res, next) => {
         panNumber: input.panNumber.toUpperCase(),
         mobile: phone,
         pincode: input.pincode,
+        gender: input.gender,
         consentAccepted: true
       },
       req.auth.userId
     );
     res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+portalEmployeeMilestone4Router.get("/cibil/report/:checkId", async (req, res, next) => {
+  try {
+    requireEmployee(req);
+    if (req.auth.role === "employee") {
+      await assertEmployeeAccess(req, "applications", "read");
+    }
+    const { getCibilCheckById } = await import("../lib/cibilService.js");
+    const { getUploadDir } = await import("../lib/uploadPaths.js");
+    const { resolve } = await import("node:path");
+    const { readFileSync, existsSync } = await import("node:fs");
+    const check = await getCibilCheckById(req.params.checkId);
+    if (!check?.reportPath) {
+      return res.status(404).json({ error: "CIBIL report not found" });
+    }
+    const fileName = check.reportPath.split("/").pop();
+    const fullPath = resolve(getUploadDir(), "cibil-reports", fileName);
+    if (!existsSync(fullPath)) {
+      return res.status(404).json({ error: "CIBIL report file missing on server" });
+    }
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="cibil-report-${fileName}"`);
+    res.send(readFileSync(fullPath));
   } catch (err) {
     next(err);
   }

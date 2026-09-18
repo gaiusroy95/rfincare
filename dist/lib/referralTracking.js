@@ -219,7 +219,7 @@ function buildReferralShareLinks(code, program) {
     };
   }
   const looksLikeAgent = /^RFA([-\s]|$)/i.test(String(code || ""));
-  const param = looksLikeAgent ? "aref" : "cref";
+  const param = looksLikeAgent ? "aref" : "ref";
   return {
     homepage: `${base}/?${param}=${encoded}`,
     insurance: `${base}/insurance-marketplace?${param}=${encoded}`,

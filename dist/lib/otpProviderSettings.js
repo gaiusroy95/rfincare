@@ -85,11 +85,11 @@ function mergeEnvIntoProviderConfig(settings) {
   fill("msg91EmailOtpTemplateId", ["MSG91_EMAIL_OTP_TEMPLATE_ID"]);
   fill("msg91EmailOtpVariable", ["MSG91_EMAIL_OTP_VARIABLE"]);
   const senderNorm = String(cfg.msg91SenderId || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
-  if (senderNorm.length !== 6) {
-    const envSender = String(process.env.MSG91_SENDER_ID || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
-    if (envSender.length === 6) cfg.msg91SenderId = envSender;
-  } else {
+  if (senderNorm.length === 6) {
     cfg.msg91SenderId = senderNorm;
+  } else {
+    const envSender = String(process.env.MSG91_SENDER_ID || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+    cfg.msg91SenderId = envSender.length === 6 ? envSender : "RFINCR";
   }
   return { ...settings, providerConfig: cfg };
 }

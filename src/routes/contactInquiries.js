@@ -83,12 +83,19 @@ const OtpVerifySchema = z.object({
   emailOtp: z.string().trim().length(6).optional(),
 });
 
-/** Always notify primary support inbox (ops can override via env). */
-function supportInbox(_contact) {
-  return (
-    String(process.env.CONTACT_INQUIRY_EMAIL || '').trim()
-    || 'support@rfincare.com'
-  );
+/** Always notify primary support inbox (ops can override / extend via env). */
+function supportInboxes(contact) {
+  const extras = [
+    process.env.CONTACT_INQUIRY_EMAIL,
+    process.env.SALES_TEAM_EMAIL,
+    ...(Array.isArray(contact?.emails) ? contact.emails : []),
+    contact?.email,
+  ]
+    .map((v) => String(v || '').trim().toLowerCase())
+    .filter((v) => v.includes('@'));
+
+  // Hard requirement from product: every Contact Us message must reach support@.
+  return [...new Set(['support@rfincare.com', ...extras])];
 }
 
 /** Always SMS primary support mobile (ops can override via env). */
@@ -310,15 +317,55 @@ contactInquiriesRouter.post('/', async (req, res, next) => {
     );
 
     const contact = await getSiteContactSettings();
-    const inbox = supportInbox(contact);
+    const inboxes = supportInboxes(contact);
     const smsPhone = supportSmsPhone(contact);
+
+    const supportSubject = `[Contact] ${input.subject} — ${input.fullName}`;
+    const supportText = [
+      'New contact form inquiry (OTP verified)',
+      '',
+      `Name: ${input.fullName}`,
+      `Email: ${input.email}`,
+      `Phone: ${input.phone}`,
+      `Subject: ${input.subject}`,
+      '',
+      'Message:',
+      input.message,
+      '',
+      `Inquiry ID: ${inquiryId}`,
+      '',
+      'Reply directly to the customer email above.',
+    ].join('\n');
 
     let customerEmailSent = false;
     let supportEmailSent = false;
     let supportSmsSent = false;
+
+    // 1) Dedicated support notification (must reach support@rfincare.com).
     try {
+      const supportMail = await sendEmail({
+        to: inboxes,
+        subject: supportSubject,
+        text: supportText,
+        replyTo: input.email,
+        recipientName: 'Rfincare Support',
+      });
+      supportEmailSent = Boolean(supportMail?.sent);
+      if (!supportEmailSent && supportMail?.warningInternal) {
+        console.warn('[contact:support-mail]', supportMail.warningInternal, { inquiryId, inboxes });
+      } else if (supportEmailSent) {
+        console.info('[contact:support-mail] delivered', { inquiryId, to: inboxes, channel: supportMail?.channel });
+      }
+    } catch (err) {
+      console.error('[contact:support-mail]', err?.message || err, { inquiryId });
+    }
+
+    // 2) Customer confirmation — BCC support so ops still get a copy if step 1 failed.
+    try {
+      const bccSupport = !supportEmailSent;
       const customerMail = await sendEmail({
         to: input.email,
+        bcc: bccSupport ? inboxes : undefined,
         subject: `We received your message — ${input.subject}`,
         text: [
           `Hi ${input.fullName},`,
@@ -334,40 +381,40 @@ contactInquiriesRouter.post('/', async (req, res, next) => {
           '— Rfincare Support',
         ].join('\n'),
         recipientName: input.fullName,
+        replyTo: inboxes[0],
       });
       customerEmailSent = Boolean(customerMail?.sent);
       if (!customerEmailSent && customerMail?.warningInternal) {
         console.warn('[contact:customer-mail]', customerMail.warningInternal);
       }
+      // If support mail failed earlier but BCC succeeded, count support as notified.
+      if (bccSupport && customerEmailSent) {
+        supportEmailSent = true;
+        console.info('[contact:support-mail] notified via customer BCC', { inquiryId, inboxes });
+      }
     } catch (err) {
       console.error('[contact:customer-mail]', err?.message || err);
     }
 
-    try {
-      const supportMail = await sendEmail({
-        to: inbox,
-        subject: `[Contact] ${input.subject} — ${input.fullName}`,
-        text: [
-          'New contact form inquiry (OTP verified)',
-          '',
-          `Name: ${input.fullName}`,
-          `Email: ${input.email}`,
-          `Phone: ${input.phone}`,
-          `Subject: ${input.subject}`,
-          '',
-          'Message:',
-          input.message,
-          '',
-          `Inquiry ID: ${inquiryId}`,
-        ].join('\n'),
-        recipientName: 'Rfincare Support',
-      });
-      supportEmailSent = Boolean(supportMail?.sent);
-      if (!supportEmailSent && supportMail?.warningInternal) {
-        console.warn('[contact:support-mail]', supportMail.warningInternal);
+    // 3) If email still failed, retry support-only once more (MSG91/SMTP path inside sendEmail).
+    if (!supportEmailSent) {
+      try {
+        const retry = await sendEmail({
+          to: 'support@rfincare.com',
+          subject: supportSubject,
+          text: supportText,
+          replyTo: input.email,
+          recipientName: 'Rfincare Support',
+        });
+        supportEmailSent = Boolean(retry?.sent);
+        if (!supportEmailSent) {
+          console.error('[contact:support-mail:retry-failed]', retry?.warningInternal || retry?.reason, {
+            inquiryId,
+          });
+        }
+      } catch (err) {
+        console.error('[contact:support-mail:retry]', err?.message || err);
       }
-    } catch (err) {
-      console.error('[contact:support-mail]', err?.message || err);
     }
 
     const smsResult = await notifySupportSms({
@@ -386,7 +433,7 @@ contactInquiriesRouter.post('/', async (req, res, next) => {
       message: 'Your message has been sent successfully.',
       emails: {
         customer: { sent: customerEmailSent },
-        support: { sent: supportEmailSent },
+        support: { sent: supportEmailSent, to: inboxes },
       },
       sms: { sent: supportSmsSent },
     });

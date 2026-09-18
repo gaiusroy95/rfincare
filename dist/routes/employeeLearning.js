@@ -22,7 +22,9 @@ const CONTENT_TYPES = /* @__PURE__ */ new Set([
   "circular",
   "course",
   "webinar",
-  "certification"
+  "certification",
+  "marketing",
+  "image"
 ]);
 const CATEGORY_BY_TYPE = {
   video: "System Training",
@@ -31,7 +33,9 @@ const CATEGORY_BY_TYPE = {
   circular: "Compliance",
   course: "Document Verification",
   webinar: "System Training",
-  certification: "Compliance"
+  certification: "Compliance",
+  marketing: "Marketing",
+  image: "Marketing"
 };
 const uploadRoot = process.env.UPLOAD_DIR || "./uploads";
 const staffLearningDir = resolve(uploadRoot, "staff-learning");
@@ -72,6 +76,8 @@ function formatEmployeeContentRow(row, progress = null, completionCount = 0) {
     fileUrl: row.file_url,
     videoUrl: row.video_url,
     mimeType: row.mime_type,
+    fileSizeBytes: row.file_size_bytes != null ? Number(row.file_size_bytes) : null,
+    thumbnailUrl: row.thumbnail_url || (String(row.mime_type || "").startsWith("image/") ? row.file_url : null),
     isNew: Boolean(row.is_new),
     isActive: Boolean(row.is_active),
     sortOrder: row.sort_order,
@@ -144,7 +150,7 @@ adminEmployeeLearningRouter.post(
       if (contentType === "video" && !videoUrl && !req.file) {
         return res.status(400).json({ error: "Video URL or file is required for video content" });
       }
-      if (contentType !== "video" && !req.file && !videoUrl) {
+      if (!["video"].includes(contentType) && !req.file && !videoUrl) {
         return res.status(400).json({ error: "File upload is required" });
       }
       const id = newId();
@@ -160,16 +166,18 @@ adminEmployeeLearningRouter.post(
         fileUrl = `/uploads/staff-learning/${req.file.filename}`;
       }
       const categoryLabel = req.body?.categoryLabel?.trim() || req.body?.category_label?.trim() || CATEGORY_BY_TYPE[contentType] || null;
+      const audience = req.body?.audience === "all" || contentType === "marketing" ? "all" : "employee";
       await pool.execute(
         `INSERT INTO agent_learning_content
          (id, content_type, audience, title, description, category_label, duration_label, file_name, file_path, file_url, mime_type,
           video_url, is_new, sort_order, uploaded_by)
          VALUES
-         (:id, :content_type, 'employee', :title, :description, :category_label, :duration_label, :file_name, :file_path, :file_url, :mime_type,
+         (:id, :content_type, :audience, :title, :description, :category_label, :duration_label, :file_name, :file_path, :file_url, :mime_type,
           :video_url, :is_new, :sort_order, :uploaded_by)`,
         {
           id,
           content_type: contentType,
+          audience,
           title,
           description: req.body?.description?.trim() || null,
           category_label: categoryLabel,
