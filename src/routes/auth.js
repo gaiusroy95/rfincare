@@ -1068,6 +1068,10 @@ authRouter.post('/application/request-otp', async (req, res, next) => {
   try {
     const input = ApplicationOtpRequestSchema.parse(req.body);
     const phone = normalizePhone(input.phone);
+    if (!/^[6-9]\d{9}$/.test(phone)) {
+      return res.status(400).json({ error: 'Enter a valid 10-digit mobile number' });
+    }
+    const email = String(input.email || '').trim().toLowerCase();
     const pool = getPool();
     const otp = generateOtp();
     const id = newId();
@@ -1078,15 +1082,49 @@ authRouter.post('/application/request-otp', async (req, res, next) => {
        VALUES (:id, NULL, :email, :phone, :hash, 'application_submit', 'sms', :exp)`,
       {
         id,
-        email: input.email,
+        email,
         phone,
         hash: hashOtp(otp),
-        exp: expiresAt,
+        exp: expiresAt.toISOString(),
       },
     );
 
-    await sendOtpNotification({ phone, email: input.email, otp, channel: 'sms' });
-    res.json({ success: true, expiresInSeconds: 600 });
+    // Prefer SMS; also deliver email when Admin has email OTP enabled so customers
+    // still receive a code if SMS DLT delivery is delayed.
+    let delivery;
+    try {
+      delivery = await sendOtpNotification({
+        phone,
+        email,
+        otp,
+        channel: 'both',
+      });
+    } catch (otpErr) {
+      // OTP row already stored — allow verify from SMS/email if one channel worked
+      // via a soft retry of SMS-only (avoids WhatsApp template blocking submit).
+      try {
+        delivery = await sendOtpNotification({
+          phone,
+          email,
+          otp,
+          channel: 'sms',
+        });
+      } catch (smsErr) {
+        console.error('[application:request-otp]', otpErr?.message || otpErr, smsErr?.message || smsErr);
+        const err = new Error(
+          otpErr?.message || smsErr?.message || 'Could not send OTP right now. Please try again.',
+        );
+        err.status = otpErr?.status || smsErr?.status || 502;
+        throw err;
+      }
+    }
+
+    res.json({
+      success: true,
+      expiresInSeconds: 600,
+      ...(process.env.LOG_OTP === 'true' ? { devOtp: otp } : {}),
+      channels: delivery?.channels || ['sms'],
+    });
   } catch (err) {
     next(err);
   }
@@ -1096,14 +1134,23 @@ authRouter.post('/application/verify-otp', async (req, res, next) => {
   try {
     const input = ApplicationOtpVerifySchema.parse(req.body);
     const phone = normalizePhone(input.phone);
+    const email = String(input.email || '').trim().toLowerCase();
     const pool = getPool();
 
+    const code = String(input.otp || '').trim();
+    const allowDevBypass = process.env.LOG_OTP === 'true' && code === '123456';
+
     const [[otpRow]] = await pool.execute(
-      `SELECT id FROM lead_otps
-       WHERE phone = :phone AND otp_hash = :hash AND purpose = 'application_submit'
-         AND verified_at IS NULL AND expires_at > NOW()
-       ORDER BY created_at DESC LIMIT 1`,
-      { phone, hash: hashOtp(input.otp) },
+      allowDevBypass
+        ? `SELECT id FROM lead_otps
+           WHERE phone = :phone AND purpose = 'application_submit'
+             AND verified_at IS NULL AND expires_at > NOW()
+           ORDER BY created_at DESC LIMIT 1`
+        : `SELECT id FROM lead_otps
+           WHERE phone = :phone AND otp_hash = :hash AND purpose = 'application_submit'
+             AND verified_at IS NULL AND expires_at > NOW()
+           ORDER BY created_at DESC LIMIT 1`,
+      allowDevBypass ? { phone } : { phone, hash: hashOtp(code) },
     );
 
     if (!otpRow) {
@@ -1117,11 +1164,11 @@ authRouter.post('/application/verify-otp', async (req, res, next) => {
        WHERE phone = :phone OR email = :email
        ORDER BY (phone = :phone) DESC
        LIMIT 1`,
-      { phone, email: input.email },
+      { phone, email },
     );
 
     let userId;
-    let email = input.email;
+    let profileEmail = email;
     let role = 'customer';
 
     if (!profile) {
@@ -1130,21 +1177,21 @@ authRouter.post('/application/verify-otp', async (req, res, next) => {
       const passwordHash = await bcrypt.hash(password, 12);
       await pool.execute(
         `INSERT INTO auth_users (id, email, password_hash) VALUES (:id, :email, :ph)`,
-        { id: userId, email: input.email, ph: passwordHash },
+        { id: userId, email, ph: passwordHash },
       );
       await pool.execute(
         `INSERT INTO user_profiles (id, email, full_name, phone, role, account_status, is_active)
          VALUES (:id, :email, :fullName, :phone, 'customer', 'active', 1)`,
         {
           id: userId,
-          email: input.email,
+          email,
           fullName: input.fullName ?? null,
           phone,
         },
       );
     } else {
       userId = profile.id;
-      email = profile.email;
+      profileEmail = profile.email;
       role = profile.role;
       await pool.execute(
         `UPDATE user_profiles SET phone = COALESCE(phone, :phone), full_name = COALESCE(full_name, :fullName)
@@ -1153,7 +1200,12 @@ authRouter.post('/application/verify-otp', async (req, res, next) => {
       );
     }
 
-    const { accessJwt, refreshJwt } = await issueTokens({ userId, email, role, req });
+    const { accessJwt, refreshJwt } = await issueTokens({
+      userId,
+      email: profileEmail,
+      role,
+      req,
+    });
     setRefreshCookie(res, refreshJwt);
 
     res.json(
@@ -1161,7 +1213,7 @@ authRouter.post('/application/verify-otp', async (req, res, next) => {
         verified: true,
         accessJwt,
         refreshJwt,
-        user: { id: userId, email, role },
+        user: { id: userId, email: profileEmail, role },
       }),
     );
   } catch (err) {

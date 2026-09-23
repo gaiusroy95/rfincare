@@ -414,12 +414,43 @@ export async function sendOtpNotification({
   }
 
   const results = await Promise.allSettled(tasks);
-  const errMsg = aggregateChannelErrors(results);
-  if (errMsg) {
-    logOtpDeliveryWarnings([errMsg]);
-    const err = new Error(toPublicOtpMessage(errMsg));
-    err.status = results.find((r) => r.reason?.status)?.reason?.status || 502;
-    throw err;
+
+  // Soft-fail optional WhatsApp (and any secondary channel) when SMS and/or email already succeeded.
+  // Otherwise a WhatsApp template misconfiguration blocks every OTP send.
+  const primaryIndexes = labels
+    .map((label, index) => ({ label, index }))
+    .filter(({ label }) => label === 'sms' || label === 'email')
+    .map(({ index }) => index);
+
+  const primarySucceeded = primaryIndexes.some((index) => {
+    const result = results[index];
+    if (result.status !== 'fulfilled') return false;
+    const value = result.value;
+    if (value?.delivered === false && value?.sent === false) return false;
+    // Console SMS returns sent:false — treat as soft success only when LOG_OTP is on
+    // so local/dev flows can still verify from logs / Admin test OTP.
+    if (value?.sent === false && value?.provider === 'console') {
+      return process.env.LOG_OTP === 'true' || process.env.NODE_ENV !== 'production';
+    }
+    return value?.sent !== false;
+  });
+
+  if (primarySucceeded) {
+    results.forEach((result, index) => {
+      if (result.status === 'rejected') {
+        logOtpDeliveryWarnings([
+          `${labels[index]} OTP failed (non-blocking): ${result.reason?.message || 'send failed'}`,
+        ]);
+      }
+    });
+  } else {
+    const errMsg = aggregateChannelErrors(results);
+    if (errMsg) {
+      logOtpDeliveryWarnings([errMsg]);
+      const err = new Error(toPublicOtpMessage(errMsg));
+      err.status = results.find((r) => r.reason?.status)?.reason?.status || 502;
+      throw err;
+    }
   }
 
   const out = { sent: true, channels: labels };

@@ -845,77 +845,74 @@ leadsRouter.post('/verify-otp', async (req, res, next) => {
       })
       .parse(req.body);
 
-    const settings = await getOtpProviderSettings();
-    const mobileCode = body.mobileOtp || (settings.requireEmailOtp === false ? body.otp : undefined);
-    const emailCode = body.emailOtp || (settings.requireMobileOtp === false ? body.otp : undefined);
-
-    if (settings.requireMobileOtp && !mobileCode) {
-      return res.status(400).json({ error: 'Mobile OTP is required.' });
-    }
-    if (settings.requireEmailOtp && !emailCode) {
-      return res.status(400).json({ error: 'Email OTP is required.' });
-    }
-
     const pool = getPool();
-    let smsRow = null;
-    let emailRow = null;
-
     const phone = normalizeLeadPhone(body.phone);
     const email = body.email.trim().toLowerCase();
 
-    const devTestOtp =
-      process.env.LOG_OTP === 'true' &&
-      (!settings.requireMobileOtp || mobileCode === '123456') &&
-      (!settings.requireEmailOtp || emailCode === '123456');
+    // Verify against OTP rows that were actually issued (not Admin "required" flags alone).
+    // If SMS delivery failed and only email OTP was stored, require email only — and vice versa.
+    const [[pendingSms]] = await pool.execute(
+      `SELECT id, lead_id, otp_hash FROM lead_otps
+       WHERE ${sqlParamEquals('phone', 'phone')}
+         AND ${sqlLiteralEquals('purpose', 'lead_verify')}
+         AND ${sqlLiteralEquals('channel', 'sms')}
+         AND verified_at IS NULL AND expires_at > NOW()
+       ORDER BY created_at DESC LIMIT 1`,
+      { phone },
+    );
+    const [[pendingEmail]] = await pool.execute(
+      `SELECT id, lead_id, otp_hash FROM lead_otps
+       WHERE ${sqlParamEquals('email', 'email')}
+         AND ${sqlLiteralEquals('purpose', 'lead_verify')}
+         AND ${sqlLiteralEquals('channel', 'email')}
+         AND verified_at IS NULL AND expires_at > NOW()
+       ORDER BY created_at DESC LIMIT 1`,
+      { email },
+    );
 
-    if (settings.requireMobileOtp && mobileCode) {
-      const [[row]] = await pool.execute(
-        devTestOtp
-          ? `SELECT id, lead_id FROM lead_otps
-             WHERE ${sqlParamEquals('phone', 'phone')}
-               AND ${sqlLiteralEquals('purpose', 'lead_verify')}
-               AND ${sqlLiteralEquals('channel', 'sms')}
-               AND verified_at IS NULL AND expires_at > NOW()
-             ORDER BY created_at DESC LIMIT 1`
-          : `SELECT id, lead_id FROM lead_otps
-             WHERE ${sqlParamEquals('phone', 'phone')}
-               AND ${sqlParamEquals('otp_hash', 'hash')}
-               AND ${sqlLiteralEquals('purpose', 'lead_verify')}
-               AND ${sqlLiteralEquals('channel', 'sms')}
-               AND verified_at IS NULL AND expires_at > NOW()
-             ORDER BY created_at DESC LIMIT 1`,
-        devTestOtp
-          ? { phone }
-          : { phone, hash: hashOtp(mobileCode) },
-      );
-      smsRow = row;
-      if (!smsRow) {
+    const needMobile = Boolean(pendingSms);
+    const needEmail = Boolean(pendingEmail);
+
+    if (!needMobile && !needEmail) {
+      return res.status(401).json({
+        error: 'Invalid or expired OTP. Please request a new code.',
+      });
+    }
+
+    const mobileCode =
+      body.mobileOtp
+      || (needMobile && !needEmail ? body.otp : undefined);
+    const emailCode =
+      body.emailOtp
+      || (needEmail && !needMobile ? body.otp : undefined);
+
+    if (needMobile && !mobileCode) {
+      return res.status(400).json({ error: 'Mobile OTP is required.' });
+    }
+    if (needEmail && !emailCode) {
+      return res.status(400).json({ error: 'Email OTP is required.' });
+    }
+
+    const devTestOtp =
+      process.env.LOG_OTP === 'true'
+      && (!needMobile || mobileCode === '123456')
+      && (!needEmail || emailCode === '123456');
+
+    let smsRow = null;
+    let emailRow = null;
+
+    if (needMobile) {
+      if (devTestOtp || pendingSms.otp_hash === hashOtp(mobileCode)) {
+        smsRow = pendingSms;
+      } else {
         return res.status(401).json({ error: 'Invalid or expired mobile OTP.' });
       }
     }
 
-    if (settings.requireEmailOtp && emailCode) {
-      const [[row]] = await pool.execute(
-        devTestOtp
-          ? `SELECT id, lead_id FROM lead_otps
-             WHERE ${sqlParamEquals('email', 'email')}
-               AND ${sqlLiteralEquals('purpose', 'lead_verify')}
-               AND ${sqlLiteralEquals('channel', 'email')}
-               AND verified_at IS NULL AND expires_at > NOW()
-             ORDER BY created_at DESC LIMIT 1`
-          : `SELECT id, lead_id FROM lead_otps
-             WHERE ${sqlParamEquals('email', 'email')}
-               AND ${sqlParamEquals('otp_hash', 'hash')}
-               AND ${sqlLiteralEquals('purpose', 'lead_verify')}
-               AND ${sqlLiteralEquals('channel', 'email')}
-               AND verified_at IS NULL AND expires_at > NOW()
-             ORDER BY created_at DESC LIMIT 1`,
-        devTestOtp
-          ? { email }
-          : { email, hash: hashOtp(emailCode) },
-      );
-      emailRow = row;
-      if (!emailRow) {
+    if (needEmail) {
+      if (devTestOtp || pendingEmail.otp_hash === hashOtp(emailCode)) {
+        emailRow = pendingEmail;
+      } else {
         return res.status(401).json({ error: 'Invalid or expired email OTP.' });
       }
     }
