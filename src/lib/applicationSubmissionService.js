@@ -68,36 +68,48 @@ export async function finalizeApplicationSubmission({
     { id: applicationId },
   );
 
-  const pdfBuffer = await buildBankLoanApplicationFormPdf({
-    row,
-    data,
-    documents,
-    consents,
-  });
+  let publicPath = null;
+  let pdfGenerated = false;
+  let pdfError = null;
 
-  const packageDir = resolve(getUploadDir(), 'application-packages');
-  mkdirSync(packageDir, { recursive: true });
-  const safeNumber = String(row.application_number || applicationId).replace(/[^\w-]/g, '_');
-  const fileName = `${safeNumber}.pdf`;
-  const absolutePath = resolve(packageDir, fileName);
-  writeFileSync(absolutePath, pdfBuffer);
+  try {
+    const pdfBuffer = await buildBankLoanApplicationFormPdf({
+      row,
+      data,
+      documents,
+      consents,
+    });
 
-  const publicPath = `/uploads/application-packages/${fileName}`;
-  const mergedData = {
-    ...data,
-    application_package_pdf: publicPath,
-    application_package_generated_at: new Date().toISOString(),
-    application_package_format: 'bank_loan_application_form_v2_official_template',
-  };
+    const packageDir = resolve(getUploadDir(), 'application-packages');
+    mkdirSync(packageDir, { recursive: true });
+    const safeNumber = String(row.application_number || applicationId).replace(/[^\w-]/g, '_');
+    const fileName = `${safeNumber}.pdf`;
+    const absolutePath = resolve(packageDir, fileName);
+    writeFileSync(absolutePath, pdfBuffer);
 
-  await pool.execute(
-    `UPDATE loan_applications SET data = :data WHERE id = :id`,
-    { id: applicationId, data: JSON.stringify(mergedData) },
-  );
+    publicPath = `/uploads/application-packages/${fileName}`;
+    pdfGenerated = true;
+    const mergedData = {
+      ...data,
+      application_package_pdf: publicPath,
+      application_package_generated_at: new Date().toISOString(),
+      application_package_format: 'bank_loan_application_form_v2_official_template',
+    };
+
+    await pool.execute(
+      `UPDATE loan_applications SET data = :data WHERE id = :id`,
+      { id: applicationId, data: JSON.stringify(mergedData) },
+    );
+  } catch (err) {
+    pdfError = err?.message || 'PDF generation failed';
+    console.error('[submission] official bank form PDF failed:', err);
+  }
 
   const applicant = applicantName(data, row);
   const submittedAt = row.submitted_at || new Date();
   const appNumber = row.application_number || applicationId;
+  const pdfDownloadPath = `/loan-applications/${applicationId}/summary-pdf`;
+
 
   const notificationResults = { email: false, sms: false };
   const email = field(data, 'email', 'email') || row.customer_email;
@@ -192,6 +204,9 @@ export async function finalizeApplicationSubmission({
     status: 'submitted',
     statusLabel: 'Submitted Successfully',
     pdfUrl: publicPath,
+    pdfDownloadPath,
+    pdfGenerated,
+    pdfError,
     documentCount: documents.length,
     notifications: notificationResults,
   };

@@ -83,6 +83,10 @@ function existingLoans(data) {
   return Array.isArray(list) ? list : [];
 }
 
+/**
+ * Resolve the official blank Rfincare Bank Loan Application Form template.
+ * Production (Render): backend/assets/forms/Rfincare_Bank_Loan_Application_Form.pdf
+ */
 export function resolveBlankTemplatePath() {
   const candidates = [
     resolve(__dirname, '../../assets/forms/Rfincare_Bank_Loan_Application_Form.pdf'),
@@ -92,6 +96,10 @@ export function resolveBlankTemplatePath() {
     resolve(__dirname, '../../../docs/Need This Rfincare_Bank_Loan_Application_Form.pdf'),
   ];
   return candidates.find((p) => existsSync(p)) || null;
+}
+
+export function getBlankBankLoanApplicationFormPath() {
+  return resolveBlankTemplatePath();
 }
 
 /**
@@ -118,6 +126,14 @@ export function buildBankLoanApplicationValues({ row, data: rawData, documents =
     (documents || []).map((d) => String(d.document_type || d.documentType || '').toLowerCase()),
   );
   const hasDoc = (...keys) => keys.some((k) => [...docTypes].some((t) => t.includes(k)));
+
+  const consentMap = {};
+  for (const c of consents || []) {
+    const type = String(c.consent_type || c.consentType || '').toLowerCase();
+    const granted = c.is_granted ?? c.isGranted ?? c.granted;
+    if (type) consentMap[type] = Boolean(granted);
+  }
+  const anyConsent = (consents || []).some((c) => c.is_granted ?? c.isGranted ?? c.granted);
 
   return {
     applicationNumber: row?.application_number || row?.id || '',
@@ -153,7 +169,7 @@ export function buildBankLoanApplicationValues({ row, data: rawData, documents =
     city: dash(field(data, 'city')),
     district: dash(field(data, 'district')),
     state: dash(field(data, 'state')),
-    pinCode: dash(field(data, 'pinCode', 'pin_code')),
+    pinCode: dash(field(data, 'pinCode', 'pin_code', 'pincode')),
     yearsAtAddress: dash(field(data, 'yearsAtAddress', 'years_at_address')),
     permanentAddress: dash(field(data, 'permanentAddress', 'permanent_address') || addressLine(data)),
     residenceType: dash(field(data, 'residenceType', 'residence_type')),
@@ -189,26 +205,37 @@ export function buildBankLoanApplicationValues({ row, data: rawData, documents =
     coApplicantName: co
       ? dash([field(co, 'firstName', 'first_name'), field(co, 'lastName', 'last_name')].filter(Boolean).join(' '))
       : '',
+    coFatherName: dash(co && field(co, 'fatherName', 'father_name', 'spouseName', 'spouse_name')),
     coRelationship: dash(co && field(co, 'relationship')),
     coDob: formatDate(co && field(co, 'dateOfBirth', 'date_of_birth')),
     coGender: dash(co && field(co, 'gender')),
     coMarital: dash(co && field(co, 'maritalStatus', 'marital_status')),
+    coDependents: dash(co && field(co, 'numberOfDependents', 'dependents')),
+    coNationality: dash((co && field(co, 'nationality')) || (co ? 'Indian' : '')),
+    coResidential: dash((co && field(co, 'residentialStatus', 'residential_status')) || (co ? 'Resident' : '')),
     coPan: dash(co && (field(co, 'pan', 'pan_number') || field(co, 'panNumber'))),
     coAadhaarLast4: last4(co && (field(co, 'aadhaar', 'aadhaar_number') || field(co, 'aadhaarNumber'))),
     coMobile: dash(co && field(co, 'phone')),
+    coAltMobile: dash(co && field(co, 'alternatePhone', 'alternate_phone')),
     coEmail: dash(co && field(co, 'email')),
     coAddress: co ? addressLine(co) : '',
     coCity: dash(co && field(co, 'city')),
     coDistrict: dash(co && field(co, 'district')),
     coState: dash(co && field(co, 'state')),
-    coPin: dash(co && field(co, 'pinCode', 'pin_code')),
+    coPin: dash(co && field(co, 'pinCode', 'pin_code', 'pincode')),
+    coYearsAtAddress: dash(co && field(co, 'yearsAtAddress', 'years_at_address')),
+    coPermanentAddress: dash(co && (field(co, 'permanentAddress', 'permanent_address') || addressLine(co))),
+    coResidenceType: dash(co && field(co, 'residenceType', 'residence_type')),
     coOccupation: dash(co && field(co, 'employmentType', 'employment_type')),
     coEmployer: dash(co && field(co, 'employerName', 'employer_name')),
     coDesignation: dash(co && field(co, 'jobTitle', 'job_title')),
     coIndustry: dash(co && field(co, 'industry')),
+    coOfficeAddress: dash(co && field(co, 'officeAddress', 'office_address')),
     coYearsEmployed: dash(co && field(co, 'yearsEmployed', 'years_employed')),
     coGrossMonthly: formatInr(co && field(co, 'monthlyIncome', 'monthly_income')),
     coNetMonthly: formatInr(co && field(co, 'monthlyIncome', 'monthly_income')),
+    coOtherIncome: formatInr(co && field(co, 'otherIncome', 'other_income')),
+    coExistingEmi: formatInr(co && field(co, 'monthlyDebtPayments', 'existingEmi')),
 
     endUse: dash(field(data, 'loanPurpose', 'loan_purpose')),
     downPayment: formatInr(field(data, 'downPayment', 'down_payment')),
@@ -221,12 +248,12 @@ export function buildBankLoanApplicationValues({ row, data: rawData, documents =
 
     loans: loans.slice(0, 4).map((loan) => ({
       lender: dash(loan.lender || loan.bank_name || loan.bankName),
-      type: dash(loan.loan_type || loan.loanType),
+      type: dash(loan.loan_type || loan.loanType || loan.type),
       last4: last4(loan.account_number || loan.accountNumber),
       original: formatInr(loan.original_amount || loan.originalAmount),
       outstanding: formatInr(loan.outstanding_amount || loan.outstandingAmount),
       emi: formatInr(loan.emi_amount || loan.emiAmount || loan.emi),
-      tenureLeft: dash(loan.tenure_left || loan.tenureLeft),
+      tenureLeft: dash(loan.tenure_left || loan.tenureLeft || loan.remainingTenure),
       security: dash(loan.security || loan.collateral),
     })),
 
@@ -236,55 +263,79 @@ export function buildBankLoanApplicationValues({ row, data: rawData, documents =
     propertyAddress: dash(field(data, 'propertyAddress', 'property_address')),
     propertyCity: dash(field(data, 'propertyCity', 'property_city') || field(data, 'city')),
     propertyState: dash(field(data, 'propertyState', 'property_state') || field(data, 'state')),
-    propertyPin: dash(field(data, 'propertyPin', 'property_pin') || field(data, 'pinCode', 'pin_code')),
+    propertyPin: dash(
+      field(data, 'propertyPin', 'property_pin', 'propertyPincode', 'property_pincode')
+      || field(data, 'pinCode', 'pin_code'),
+    ),
     marketValue: formatInr(field(data, 'propertyValue', 'property_value')),
     purchaseCost: formatInr(field(data, 'purchaseCost', 'purchase_cost')),
     existingCharge: yesNo(field(data, 'existingMortgage', 'existing_mortgage')),
 
     docs: {
       pan: hasDoc('pan'),
-      idProof: hasDoc('aadhaar', 'identity', 'address'),
+      idProof: hasDoc('aadhaar', 'identity', 'address', 'voter', 'passport', 'driving'),
       photo: hasDoc('photo', 'customer_photo'),
       bank: hasDoc('bank'),
-      salary: hasDoc('salary', 'income'),
-      itr: hasDoc('itr', 'form_16', 'financial'),
-      employment: hasDoc('employment', 'business'),
-      property: hasDoc('property', 'collateral'),
-      loanStmt: hasDoc('loan_statement', 'closure'),
+      salary: hasDoc('salary', 'income', 'payslip'),
+      itr: hasDoc('itr', 'form_16', 'form16', 'financial'),
+      employment: hasDoc('employment', 'business', 'offer'),
+      property: hasDoc('property', 'collateral', 'sale_deed', 'title'),
+      loanStmt: hasDoc('loan_statement', 'closure', 'noc'),
       other: (documents || []).length > 0,
     },
 
-    consentProcessing: (consents?.length || field(data, 'agreeTerms', 'agree_terms')) ? 'Yes' : '',
-    consentPhone: yesNo(field(data, 'consentWhatsapp', 'consent_whatsapp') || true),
-    consentSmsEmail: yesNo(field(data, 'consentEmail', 'consent_email') || true),
-    consentFuture: yesNo(field(data, 'consentMarketing', 'consent_marketing')),
+    consentProcessing:
+      yesNo(
+        consentMap.processing
+        ?? consentMap.application_processing
+        ?? consentMap.lender_sharing
+        ?? field(data, 'agreeTerms', 'agree_terms')
+        ?? (anyConsent ? true : ''),
+      ) || (anyConsent || field(data, 'agreeTerms', 'agree_terms') ? 'Yes' : ''),
+    consentPhone: yesNo(
+      consentMap.phone
+      ?? consentMap.whatsapp
+      ?? field(data, 'consentWhatsapp', 'consent_whatsapp')
+      ?? true,
+    ),
+    consentSmsEmail: yesNo(
+      consentMap.sms
+      ?? consentMap.email
+      ?? field(data, 'consentEmail', 'consent_email')
+      ?? true,
+    ),
+    consentFuture: yesNo(
+      consentMap.marketing
+      ?? consentMap.future
+      ?? field(data, 'consentMarketing', 'consent_marketing'),
+    ),
 
-    certifyAccuracy: yesNo(field(data, 'certifyAccuracy', 'certify_accuracy') || true),
-    authorizeCredit: yesNo(field(data, 'authorizeCredit', 'authorize_credit') || true),
-    agreeTerms: yesNo(field(data, 'agreeTerms', 'agree_terms') || true),
     signatureName: dash(field(data, 'signatureName', 'signature_name') || fullName(data, row)),
     signatureDate: formatDate(field(data, 'signatureSignedAt', 'signature_signed_at') || submittedAt),
-    signaturePlace: dash(field(data, 'city')),
+    signaturePlace: dash(field(data, 'city') || field(data, 'state')),
     status: dash(row?.status),
     recommendedLender: dash(field(data, 'preferredBankName', 'preferred_bank_name')),
     eligibilityAmount: formatInr(field(data, 'eligibleAmount', 'eligible_amount')),
+    submittedToLender: yesNo(row?.status === 'submitted' || row?.bank_approval_status),
+    lenderRef: dash(row?.application_number || row?.id),
+    qcStatus: dash(row?.document_stage_status || 'documents_pending'),
+    bankStage: dash(row?.bank_approval_status || row?.status),
   };
 }
 
-function clip(text, maxLen = 48) {
+function clip(text, maxLen = 72) {
   const s = String(text || '').trim();
   if (!s) return '';
   return s.length > maxLen ? `${s.slice(0, maxLen - 1)}…` : s;
 }
 
 function drawValue(page, font, text, x, y, size = 8, maxWidth = 220) {
-  const value = clip(text, 80);
+  const value = clip(text, 90);
   if (!value) return;
   let draw = value;
   while (font.widthOfTextAtSize(draw, size) > maxWidth && draw.length > 3) {
     draw = `${draw.slice(0, -2)}…`;
   }
-  // White strip behind value so underscore lines do not clash with text.
   const w = Math.min(maxWidth, font.widthOfTextAtSize(draw, size) + 4);
   page.drawRectangle({
     x: x - 1,
@@ -303,7 +354,8 @@ function drawValue(page, font, text, x, y, size = 8, maxWidth = 220) {
 }
 
 function markCheck(page, font, checked, x, y) {
-  page.drawText(checked ? 'X' : '', {
+  if (!checked) return;
+  page.drawText('X', {
     x,
     y,
     size: 9,
@@ -313,16 +365,19 @@ function markCheck(page, font, checked, x, y) {
 }
 
 /**
- * Fill the official blank Rfincare Bank Loan Application Form (attached template).
- * Values are stamped onto the blank 9-page PDF so the download matches the client format.
+ * Fill the official blank Rfincare Bank Loan Application Form (9 pages).
+ * Values are stamped onto the blank PDF so the download matches the client format.
  */
 export async function buildBankLoanApplicationFormPdf(payload) {
   const values = buildBankLoanApplicationValues(payload);
   const templatePath = resolveBlankTemplatePath();
   if (!templatePath) {
-    throw new Error(
-      'Official bank loan application form template is missing (assets/forms/Rfincare_Bank_Loan_Application_Form.pdf).',
+    const err = new Error(
+      'Official bank loan application form template is missing. Expected assets/forms/Rfincare_Bank_Loan_Application_Form.pdf',
     );
+    err.status = 500;
+    err.code = 'BANK_FORM_TEMPLATE_MISSING';
+    throw err;
   }
 
   const blankBytes = readFileSync(templatePath);
@@ -331,17 +386,22 @@ export async function buildBankLoanApplicationFormPdf(payload) {
   const copied = await doc.copyPages(src, src.getPageIndices());
   copied.forEach((p) => doc.addPage(p));
   const pages = doc.getPages();
+  if (pages.length < 9) {
+    const err = new Error(`Official form template must have 9 pages (found ${pages.length}).`);
+    err.status = 500;
+    throw err;
+  }
+
   const font = await doc.embedFont(StandardFonts.Helvetica);
   const fontBold = await doc.embedFont(StandardFonts.HelveticaBold);
 
-  const L = 48; // left value column (after label)
-  const R = 330; // right value column
+  const L = 48;
+  const R = 330;
   const W = 230;
 
-  // ——— Page 1: Identification + Applicant personal ———
+  // ——— Page 1: §1 Identification + §2 Applicant personal ———
   {
     const p = pages[0];
-    // Section 1
     drawValue(p, font, values.applicationNumber, L + 130, 628, 8, 140);
     drawValue(p, font, values.applicationDate, R + 90, 628, 8, 140);
     drawValue(p, font, values.agentCode, L + 100, 606, 8, 150);
@@ -353,7 +413,6 @@ export async function buildBankLoanApplicationFormPdf(payload) {
     drawValue(p, font, values.preferredLender, L + 140, 528, 8, W);
     drawValue(p, font, values.existingCustomer, L + 140, 494, 8, 160);
 
-    // Section 2
     drawValue(p, font, values.applicantName, L + 140, 430, 8, 150);
     drawValue(p, font, values.fatherSpouseName, R + 140, 430, 8, 130);
     drawValue(p, font, values.dateOfBirth, L + 90, 408, 8, 140);
@@ -366,7 +425,7 @@ export async function buildBankLoanApplicationFormPdf(payload) {
     drawValue(p, font, values.aadhaarLast4, L + 180, 308, 8, 160);
   }
 
-  // ——— Page 2: Contact + Employment ———
+  // ——— Page 2: §3 Contact + §4 Employment ———
   {
     const p = pages[1];
     drawValue(p, font, values.mobile, L + 90, 700, 8, 150);
@@ -392,10 +451,9 @@ export async function buildBankLoanApplicationFormPdf(payload) {
     drawValue(p, font, values.registrationNo, R + 180, 362, 8, 130);
   }
 
-  // ——— Page 3: Income + Co-applicant personal ———
+  // ——— Page 3: §5 Income + §6 Co-applicant personal + §7 start ———
   {
     const p = pages[2];
-    // Income table columns roughly: item | monthly | annual
     drawValue(p, font, values.grossMonthly, 220, 678, 8, 70);
     drawValue(p, font, values.grossAnnual, 310, 678, 8, 80);
     drawValue(p, font, values.netMonthly, 220, 656, 8, 70);
@@ -414,33 +472,44 @@ export async function buildBankLoanApplicationFormPdf(payload) {
     drawValue(p, font, values.ifsc, L + 40, 468, 8, 160);
     drawValue(p, font, values.avgMonthlyCredit, R + 160, 468, 8, 120);
 
-    // Co-applicant section 6
     drawValue(p, font, values.coApplicantName, L + 140, 390, 8, 150);
     drawValue(p, font, values.coRelationship, R + 140, 390, 8, 120);
+    drawValue(p, font, values.coFatherName, L + 140, 368, 8, 150);
     drawValue(p, font, values.coDob, R + 90, 368, 8, 130);
     drawValue(p, font, values.coGender, L + 50, 346, 8, 140);
     drawValue(p, font, values.coMarital, R + 90, 346, 8, 130);
+    drawValue(p, font, values.coDependents, L + 130, 324, 8, 120);
+    drawValue(p, font, values.coNationality, R + 90, 324, 8, 120);
+    drawValue(p, font, values.coResidential, L + 110, 302, 8, 130);
     drawValue(p, font, values.coPan, R + 40, 302, 8, 140);
     drawValue(p, font, values.coAadhaarLast4, L + 180, 268, 8, 140);
+
+    drawValue(p, font, values.coMobile, L + 90, 220, 8, 140);
+    drawValue(p, font, values.coAltMobile, R + 130, 220, 8, 120);
+    drawValue(p, font, values.coEmail, L + 60, 198, 8, 180);
+    drawValue(p, font, values.coAddress, R + 100, 198, 8, 150);
   }
 
-  // ——— Page 4: Co-applicant contact/employment + Loan requirement ———
+  // ——— Page 4: §7–§9 Co-applicant address/employment + Loan requirement ———
   {
     const p = pages[3];
-    drawValue(p, font, values.coCity, L + 90, 700, 8, 150);
+    drawValue(p, font, `${values.coCity}${values.coDistrict ? ` / ${values.coDistrict}` : ''}`, L + 90, 700, 8, 150);
     drawValue(p, font, values.coState, R + 50, 700, 8, 150);
     drawValue(p, font, values.coPin, L + 70, 678, 8, 140);
-    drawValue(p, font, values.coAddress, L + 110, 656, 8, 180);
-    drawValue(p, font, values.coMobile, L + 90, 748, 8, 140);
-    drawValue(p, font, values.coEmail, L + 60, 726, 8, 180);
+    drawValue(p, font, values.coYearsAtAddress, R + 140, 678, 8, 120);
+    drawValue(p, font, values.coPermanentAddress, L + 110, 656, 8, 180);
+    drawValue(p, font, values.coResidenceType, R + 130, 656, 8, 130);
 
     drawValue(p, font, values.coOccupation, L + 100, 600, 8, 160);
     drawValue(p, font, values.coEmployer, R + 140, 600, 8, 140);
     drawValue(p, font, values.coDesignation, L + 160, 556, 8, W);
     drawValue(p, font, values.coIndustry, L + 100, 534, 8, W);
+    drawValue(p, font, values.coOfficeAddress, L + 140, 512, 8, 180);
     drawValue(p, font, values.coYearsEmployed, R + 180, 512, 8, 120);
     drawValue(p, font, values.coGrossMonthly, L + 130, 468, 8, 140);
     drawValue(p, font, values.coNetMonthly, R + 160, 468, 8, 120);
+    drawValue(p, font, values.coOtherIncome, L + 100, 446, 8, 140);
+    drawValue(p, font, values.coExistingEmi, R + 160, 446, 8, 120);
 
     drawValue(p, font, values.endUse, L + 130, 390, 8, 150);
     drawValue(p, font, values.requestedAmount, R + 140, 390, 8, 120);
@@ -454,7 +523,7 @@ export async function buildBankLoanApplicationFormPdf(payload) {
     drawValue(p, font, values.assetValue, R + 150, 268, 8, 120);
   }
 
-  // ——— Page 5: Existing loans + Banking + Property ———
+  // ——— Page 5: §10 Existing loans + §11 Banking + §12 Property start ———
   {
     const p = pages[4];
     const loanRowsY = [660, 638, 616, 594];
@@ -487,11 +556,20 @@ export async function buildBankLoanApplicationFormPdf(payload) {
     drawValue(p, font, values.marketValue, R + 150, 324, 8, 120);
     drawValue(p, font, values.purchaseCost, L + 180, 290, 8, 140);
     drawValue(p, font, values.existingCharge, R + 140, 290, 8, 120);
+
+    const hasPropertyDocs = values.docs.property;
+    markCheck(p, fontBold, hasPropertyDocs, 292, 246);
+    markCheck(p, fontBold, hasPropertyDocs, 292, 224);
   }
 
-  // ——— Page 6: Document checklist ———
+  // ——— Page 6: §12 continued + §13 Document checklist ———
   {
     const p = pages[5];
+    const hasPropertyDocs = values.docs.property;
+    markCheck(p, fontBold, hasPropertyDocs, 292, 700);
+    markCheck(p, fontBold, hasPropertyDocs, 292, 678);
+    markCheck(p, fontBold, hasPropertyDocs, 292, 656);
+
     const rows = [
       { y: 620, ok: values.docs.pan },
       { y: 598, ok: values.docs.idProof },
@@ -505,29 +583,35 @@ export async function buildBankLoanApplicationFormPdf(payload) {
       { y: 396, ok: values.docs.other },
     ];
     rows.forEach((row) => {
+      // Applicant column
       markCheck(p, fontBold, row.ok, 292, row.y);
       if (row.ok) drawValue(p, font, 'Uploaded', 360, row.y, 7, 120);
+      // Co-applicant column (same uploads when co-applicant present)
+      if (values.coApplicantName) markCheck(p, fontBold, row.ok, 318, row.y);
     });
   }
 
-  // ——— Page 7: Declarations + consent ———
+  // ——— Page 7: §14–§16 Declarations + consents ———
   {
     const p = pages[6];
-    // Consent Yes column ~ x 292
-    if (values.consentProcessing === 'Yes') markCheck(p, fontBold, true, 292, 268);
-    if (values.consentPhone === 'Yes') markCheck(p, fontBold, true, 292, 246);
-    if (values.consentSmsEmail === 'Yes') markCheck(p, fontBold, true, 292, 224);
-    if (values.consentFuture === 'Yes') markCheck(p, fontBold, true, 292, 190);
+    markCheck(p, fontBold, values.consentProcessing === 'Yes', 292, 268);
+    markCheck(p, fontBold, values.consentPhone === 'Yes', 292, 246);
+    markCheck(p, fontBold, values.consentSmsEmail === 'Yes', 292, 224);
+    markCheck(p, fontBold, values.consentFuture === 'Yes', 292, 190);
   }
 
-  // ——— Page 8: Office use + acknowledgement ———
+  // ——— Page 8: §17 Office use + §18 Acknowledgement ———
   {
     const p = pages[7];
     drawValue(p, font, values.recommendedLender, L + 140, 700, 8, 150);
     drawValue(p, font, values.loanProduct, R + 120, 700, 8, 140);
     drawValue(p, font, values.eligibilityAmount, L + 160, 666, 8, 140);
     drawValue(p, font, values.requestedAmount, R + 150, 666, 8, 120);
-    drawValue(p, font, values.status, L + 140, 610, 8, 160);
+    drawValue(p, font, values.submittedToLender, L + 160, 632, 8, 140);
+    drawValue(p, font, values.lenderRef, R + 160, 632, 8, 120);
+    drawValue(p, font, values.qcStatus, L + 100, 610, 8, 160);
+    drawValue(p, font, values.bankStage, R + 120, 610, 8, 140);
+    drawValue(p, font, values.status, L + 140, 588, 8, 160);
     drawValue(p, font, values.applicationNumber, R + 160, 588, 8, 120);
 
     drawValue(p, font, values.signatureName, L + 40, 330, 8, 180);
@@ -538,9 +622,8 @@ export async function buildBankLoanApplicationFormPdf(payload) {
     drawValue(p, font, values.coApplicantName, R + 140, 264, 8, 140);
   }
 
-  // Page 9 is disclaimer-only — leave as-is (matches attached blank format).
+  // Page 9 — disclaimer only (leave blank of filled data).
 
-  // Small system stamp on page 1 so staff know it is system-filled.
   pages[0].drawText('SYSTEM-FILLED FROM APPLICATION DATA', {
     x: 360,
     y: 760,
@@ -550,8 +633,4 @@ export async function buildBankLoanApplicationFormPdf(payload) {
   });
 
   return Buffer.from(await doc.save());
-}
-
-export function getBlankBankLoanApplicationFormPath() {
-  return resolveBlankTemplatePath();
 }
