@@ -211,13 +211,13 @@ export function summarizeDecision(ruleResults, { eligibleMin = 70, conditionalMi
     (r) => r.status === 'FAIL' && String(r.severity).toLowerCase() === 'critical',
   );
   if (criticalFail) {
-    return { decision: 'NOT_ELIGIBLE', reason: 'Critical rule failed' };
+    return { decision: 'NOT_ELIGIBLE', reason: 'Does not meet this lender’s key eligibility criteria' };
   }
   if (probability >= eligibleMin) {
-    return { decision: 'ELIGIBLE', reason: 'Meets probability and soft rules' };
+    return { decision: 'ELIGIBLE', reason: 'Good match for this lender based on your profile' };
   }
   if (probability >= conditionalMin) {
-    return { decision: 'CONDITIONAL', reason: 'Borderline probability or soft mismatches' };
+    return { decision: 'CONDITIONAL', reason: 'May need extra review by this lender' };
   }
-  return { decision: 'NOT_ELIGIBLE', reason: 'Below conditional threshold' };
+  return { decision: 'NOT_ELIGIBLE', reason: 'Lower match for this lender based on your profile' };
 }

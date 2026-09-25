@@ -175,6 +175,7 @@ export async function approveGeoPolicyVersion(versionId, approvedBy) {
 /**
  * Create a draft geo version from bulk sheet rows (Geo_Coverage / Location_Rules).
  * bankId resolved via lenderCode map or bank name.
+ * Inserts are batched for large Location_Rules sheets (thousands of PINs).
  */
 export async function createGeoVersionFromSheetRows({
   rows,
@@ -192,6 +193,8 @@ export async function createGeoVersionFromSheetRows({
 
   const ownsConnection = !conn;
   const db = conn || (await pool.getConnection());
+  const BATCH_SIZE = Math.max(50, Number(process.env.GEO_IMPORT_BATCH_SIZE || 250));
+
   try {
     if (ownsConnection) await db.beginTransaction();
 
@@ -214,32 +217,62 @@ export async function createGeoVersionFromSheetRows({
       },
     );
 
-    let inserted = 0;
+    // Resolve lender codes once — avoid N SELECTs for large Location_Rules sheets.
+    const resolvedBanks = { ...lenderIdMap };
+    const missingKeys = new Set();
     for (const raw of rows || []) {
-      const lenderKey =
-        raw.Lender_Code ||
-        raw.Lender_ID ||
-        raw.lender_code ||
-        raw.Bank_Code ||
-        raw.bank_code ||
-        '';
-      let bankId =
-        lenderIdMap[lenderKey] ||
-        lenderIdMap[String(lenderKey).toUpperCase()] ||
-        raw.bank_id ||
-        null;
-
-      if (!bankId && lenderKey) {
-        const [[bank]] = await db.query(
-          `SELECT id FROM banks
-           WHERE UPPER(COALESCE(lender_code, '')) = UPPER(:code)
-              OR UPPER(name) = UPPER(:code)
-           LIMIT 1`,
-          { code: String(lenderKey).trim() },
-        );
-        bankId = bank?.id || null;
+      const lenderKey = String(
+        raw.Lender_Code
+          || raw.Lender_ID
+          || raw.lender_code
+          || raw.Bank_Code
+          || raw.bank_code
+          || '',
+      ).trim();
+      if (!lenderKey) continue;
+      if (
+        resolvedBanks[lenderKey]
+        || resolvedBanks[lenderKey.toUpperCase()]
+        || raw.bank_id
+      ) {
+        continue;
       }
-      if (!bankId) continue;
+      missingKeys.add(lenderKey);
+    }
+    for (const code of missingKeys) {
+      const [[bank]] = await db.query(
+        `SELECT id FROM banks
+         WHERE UPPER(COALESCE(lender_code, '')) = UPPER(:code)
+            OR UPPER(name) = UPPER(:code)
+         LIMIT 1`,
+        { code },
+      );
+      if (bank?.id) {
+        resolvedBanks[code] = bank.id;
+        resolvedBanks[code.toUpperCase()] = bank.id;
+      }
+    }
+
+    const pending = [];
+    let skippedNoBank = 0;
+    for (const raw of rows || []) {
+      const lenderKey = String(
+        raw.Lender_Code
+          || raw.Lender_ID
+          || raw.lender_code
+          || raw.Bank_Code
+          || raw.bank_code
+          || '',
+      ).trim();
+      const bankId =
+        resolvedBanks[lenderKey]
+        || resolvedBanks[lenderKey.toUpperCase()]
+        || raw.bank_id
+        || null;
+      if (!bankId) {
+        skippedNoBank += 1;
+        continue;
+      }
 
       const pin = normalizePin(
         raw.PIN_Code || raw.Serviceable_PIN || raw.Pincode || raw.pincode || raw.PIN,
@@ -252,35 +285,66 @@ export async function createGeoVersionFromSheetRows({
       );
       const geoLevel = pin ? 'pincode' : districtName ? 'district' : stateName ? 'state' : 'pincode';
 
+      pending.push({
+        id: newId(),
+        version_id: versionId,
+        bank_id: bankId,
+        geo_level: geoLevel,
+        state_name: stateName,
+        district_name: districtName,
+        tehsil_name: tehsilName,
+        pincode: pin,
+        coverage_type: coverageType,
+        branch_code: raw.Branch_ID || raw.Branch_Code || raw.branch_code || null,
+        radius_km: raw.Radius_KM || raw.radius_km || null,
+        remarks: raw.Remarks || raw.remarks || null,
+        priority: pin ? 100 : districtName ? 50 : 10,
+      });
+    }
+
+    let inserted = 0;
+    for (let i = 0; i < pending.length; i += BATCH_SIZE) {
+      const chunk = pending.slice(i, i + BATCH_SIZE);
+      // Build one multi-row INSERT per batch (named params per row).
+      const valuesSql = chunk
+        .map(
+          (_row, idx) =>
+            `(:id_${idx}, :version_id_${idx}, :bank_id_${idx}, :geo_level_${idx}, :state_name_${idx}, :district_name_${idx}, :tehsil_name_${idx}, :pincode_${idx}, :coverage_type_${idx}, :branch_code_${idx}, :radius_km_${idx}, :remarks_${idx}, :priority_${idx})`,
+        )
+        .join(',\n');
+      const params = {};
+      chunk.forEach((row, idx) => {
+        params[`id_${idx}`] = row.id;
+        params[`version_id_${idx}`] = row.version_id;
+        params[`bank_id_${idx}`] = row.bank_id;
+        params[`geo_level_${idx}`] = row.geo_level;
+        params[`state_name_${idx}`] = row.state_name;
+        params[`district_name_${idx}`] = row.district_name;
+        params[`tehsil_name_${idx}`] = row.tehsil_name;
+        params[`pincode_${idx}`] = row.pincode;
+        params[`coverage_type_${idx}`] = row.coverage_type;
+        params[`branch_code_${idx}`] = row.branch_code;
+        params[`radius_km_${idx}`] = row.radius_km;
+        params[`remarks_${idx}`] = row.remarks;
+        params[`priority_${idx}`] = row.priority;
+      });
       await db.execute(
         `INSERT INTO lender_geo_coverage (
            id, version_id, bank_id, geo_level, state_name, district_name, tehsil_name,
            pincode, coverage_type, branch_code, radius_km, remarks, priority
-         ) VALUES (
-           :id, :version_id, :bank_id, :geo_level, :state_name, :district_name, :tehsil_name,
-           :pincode, :coverage_type, :branch_code, :radius_km, :remarks, :priority
-         )`,
-        {
-          id: newId(),
-          version_id: versionId,
-          bank_id: bankId,
-          geo_level: geoLevel,
-          state_name: stateName,
-          district_name: districtName,
-          tehsil_name: tehsilName,
-          pincode: pin,
-          coverage_type: coverageType,
-          branch_code: raw.Branch_ID || raw.Branch_Code || raw.branch_code || null,
-          radius_km: raw.Radius_KM || raw.radius_km || null,
-          remarks: raw.Remarks || raw.remarks || null,
-          priority: pin ? 100 : districtName ? 50 : 10,
-        },
+         ) VALUES ${valuesSql}`,
+        params,
       );
-      inserted += 1;
+      inserted += chunk.length;
     }
 
     if (ownsConnection) await db.commit();
-    return { versionId, inserted, status: 'pending_approval' };
+    return {
+      versionId,
+      inserted,
+      skippedNoBank,
+      status: 'pending_approval',
+    };
   } catch (err) {
     if (ownsConnection) await db.rollback();
     throw err;

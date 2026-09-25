@@ -1108,9 +1108,11 @@ export async function commitImportJob(jobId, committedBy) {
     throw e;
   }
   if (job.status === 'committed') {
-    const e = new Error('Import job already committed');
-    e.status = 409;
-    throw e;
+    const prev =
+      typeof job.commit_result_json === 'string'
+        ? JSON.parse(job.commit_result_json)
+        : job.commit_result_json;
+    return prev || { alreadyCommitted: true };
   }
   // Allow commit from validated (force) or approved
 
@@ -1181,61 +1183,7 @@ export async function commitImportJob(jobId, committedBy) {
       result.policyPackError = err.message;
     }
 
-    try {
-      await ensureLenderGeoPolicySchema(conn);
-      const geoRows = [
-        ...(sheets.Geo_Coverage || []),
-        ...(sheets.Location_Rules || []).map((r) => ({
-          Lender_Code: r.Lender_Code || r.Lender_ID,
-          PIN_Code: r.PIN_Code || r.Serviceable_PIN || r.Pincode,
-          Coverage_Type: r.Coverage_Type || r.Coverage || (r.Serviceable_PIN ? 'INCLUDE' : 'INCLUDE'),
-          State: r.State,
-          District: r.District,
-          Tehsil: r.Tehsil,
-          Remarks: r.Remarks || r.Rule_ID || null,
-          Change_Reason: r.Change_Reason || 'Location_Rules import',
-          Branch_Code: r.Branch_ID || r.Branch_Code,
-          Radius_KM: r.Radius_KM,
-        })),
-      ];
-      if (geoRows.length) {
-        const lenderIdMap = {};
-        for (const [key, val] of Object.entries(idMap.lenders || {})) {
-          const bankId = typeof val === 'string' ? val : val?.bankId;
-          if (!bankId) continue;
-          lenderIdMap[key] = bankId;
-          lenderIdMap[String(key).toUpperCase()] = bankId;
-        }
-        for (const row of sheets.Lenders || []) {
-          const bankId = lenderIdMap[row.Lender_ID];
-          if (bankId && row.Lender_Code) {
-            lenderIdMap[row.Lender_Code] = bankId;
-            lenderIdMap[String(row.Lender_Code).toUpperCase()] = bankId;
-          }
-        }
-        const geo = await createGeoVersionFromSheetRows({
-          rows: geoRows,
-          uploadedBy: committedBy,
-          sourceJobId: jobId,
-          changeReason:
-            geoRows.find((r) => r.Change_Reason)?.Change_Reason ||
-            'Bulk upload Geo_Coverage / Location_Rules',
-          effectiveFrom: geoRows.find((r) => r.Effective_From)?.Effective_From || null,
-          effectiveTo: geoRows.find((r) => r.Effective_To)?.Effective_To || null,
-          versionLabel: `bulk-geo-${jobId.slice(0, 8)}`,
-          lenderIdMap,
-          conn,
-        });
-        result.geoVersionId = geo.versionId;
-        result.geoRowsInserted = geo.inserted;
-        result.geoStatus = geo.status;
-        result.geoNote =
-          'Geo version created as pending_approval — Super Admin must approve before live eligibility uses it.';
-      }
-    } catch (err) {
-      result.geoError = err.message;
-    }
-
+    // Mark committed before geo — large Location_Rules must not roll back lenders/products/rules.
     await conn.execute(
       `UPDATE lender_policy_import_jobs SET
          status = 'committed',
@@ -1252,13 +1200,92 @@ export async function commitImportJob(jobId, committedBy) {
     );
 
     await conn.commit();
-    return result;
   } catch (err) {
     await conn.rollback();
-    throw err;
+    const wrapped = new Error(
+      err?.message
+        ? `Publish failed while saving lenders/products/rules: ${err.message}`
+        : 'Publish failed while saving lenders/products/rules',
+    );
+    wrapped.status = err?.status || 500;
+    wrapped.cause = err;
+    throw wrapped;
   } finally {
     conn.release();
   }
+
+  // Geo coverage (often thousands of PIN rows) runs after core publish succeeds.
+  try {
+    await ensureLenderGeoPolicySchema(pool);
+    const geoRows = [
+      ...(sheets.Geo_Coverage || []),
+      ...(sheets.Location_Rules || []).map((r) => ({
+        Lender_Code: r.Lender_Code || r.Lender_ID,
+        PIN_Code: r.PIN_Code || r.Serviceable_PIN || r.Pincode,
+        Coverage_Type: r.Coverage_Type || r.Coverage || (r.Serviceable_PIN ? 'INCLUDE' : 'INCLUDE'),
+        State: r.State,
+        District: r.District,
+        Tehsil: r.Tehsil,
+        Remarks: r.Remarks || r.Rule_ID || null,
+        Change_Reason: r.Change_Reason || 'Location_Rules import',
+        Branch_Code: r.Branch_ID || r.Branch_Code,
+        Radius_KM: r.Radius_KM,
+      })),
+    ];
+    if (geoRows.length) {
+      const lenderIdMap = {};
+      for (const [key, val] of Object.entries(idMap.lenders || {})) {
+        const bankId = typeof val === 'string' ? val : val?.bankId;
+        if (!bankId) continue;
+        lenderIdMap[key] = bankId;
+        lenderIdMap[String(key).toUpperCase()] = bankId;
+      }
+      for (const row of sheets.Lenders || []) {
+        const bankId = lenderIdMap[row.Lender_ID];
+        if (bankId && row.Lender_Code) {
+          lenderIdMap[row.Lender_Code] = bankId;
+          lenderIdMap[String(row.Lender_Code).toUpperCase()] = bankId;
+        }
+      }
+      const geo = await createGeoVersionFromSheetRows({
+        rows: geoRows,
+        uploadedBy: committedBy,
+        sourceJobId: jobId,
+        changeReason:
+          geoRows.find((r) => r.Change_Reason)?.Change_Reason ||
+          'Bulk upload Geo_Coverage / Location_Rules',
+        effectiveFrom: geoRows.find((r) => r.Effective_From)?.Effective_From || null,
+        effectiveTo: geoRows.find((r) => r.Effective_To)?.Effective_To || null,
+        versionLabel: `bulk-geo-${jobId.slice(0, 8)}`,
+        lenderIdMap,
+      });
+      result.geoVersionId = geo.versionId;
+      result.geoRowsInserted = geo.inserted;
+      result.geoRowsSkippedNoBank = geo.skippedNoBank || 0;
+      result.geoStatus = geo.status;
+      result.geoNote =
+        'Geo version created as pending_approval — Super Admin must approve before live eligibility uses it.';
+    }
+  } catch (err) {
+    console.error('[lender-policy-import:geo]', err?.message || err);
+    result.geoError = err.message;
+    result.geoNote =
+      'Lenders/products/rules were published, but geo Location_Rules import failed. Retry geo from Lender geo policy or re-publish after fixing lender codes.';
+  }
+
+  try {
+    await pool.execute(
+      `UPDATE lender_policy_import_jobs SET
+         commit_result_json = :result,
+         updated_at = NOW()
+       WHERE id = :id`,
+      { id: jobId, result: JSON.stringify(result) },
+    );
+  } catch (err) {
+    console.warn('[lender-policy-import] could not update commit_result after geo:', err?.message);
+  }
+
+  return result;
 }
 
 export function buildPolicyTemplateWorkbook() {
