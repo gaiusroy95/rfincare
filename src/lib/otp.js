@@ -13,6 +13,17 @@ import {
 } from './msg91.js';
 import { getOtpProviderSettings } from './otpProviderSettings.js';
 
+/** Placeholder / synthetic emails must never require an email OTP channel. */
+export function isSyntheticLeadEmail(email) {
+  const value = String(email || '').trim().toLowerCase();
+  if (!value) return true;
+  return (
+    value.endsWith('@leads.rfincare.local')
+    || value.endsWith('@guest.rfincare.local')
+    || value.endsWith('@rfincare.local')
+  );
+}
+
 export function generateOtp() {
   return String(Math.floor(100000 + Math.random() * 900000));
 }
@@ -532,7 +543,7 @@ export async function sendDualChannelOtp({
     );
   }
 
-  if (settings.requireEmailOtp !== false && email) {
+  if (settings.requireEmailOtp !== false && email && !isSyntheticLeadEmail(email)) {
     parallel.push(
       runEmailChannel().then((r) => {
         outcomes.email = r;
@@ -601,7 +612,7 @@ export async function sendDualChannelOtp({
   // Public flows (appointment, etc.): still issue OTPs that were accepted server-side even if
   // a provider returned soft warnings — never leak provider text to the client.
   const publicMobileOk = mobileChannelOk;
-  const publicEmailOk = emailDelivered;
+  const publicEmailOk = emailDelivered && !isSyntheticLeadEmail(email);
 
   return {
     mobileOtp: settings.requireMobileOtp !== false && publicMobileOk ? mobileOtp : null,
@@ -614,7 +625,11 @@ export async function sendDualChannelOtp({
     smsDelivered,
     whatsappDelivered,
     requireMobileOtp: settings.requireMobileOtp !== false && publicMobileOk,
-    requireEmailOtp: settings.requireEmailOtp !== false && publicEmailOk,
+    // Synthetic guest emails never require email OTP for eligibility.
+    requireEmailOtp:
+      settings.requireEmailOtp !== false
+      && publicEmailOk
+      && !isSyntheticLeadEmail(email),
     // Ops-only; public routes must omit this from JSON responses.
     warnings: publicFacing ? [] : warnings,
     delivery: outcomes,

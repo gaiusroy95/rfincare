@@ -292,7 +292,7 @@ cmsRouter.get('/credlaxmi-banner', async (_req, res, next) => {
   }
 });
 
-cmsRouter.put('/credlaxmi-banner', async (req, res, next) => {
+async function handleUpsertCredLaxmiBanner(req, res, next) {
   try {
     if (!['admin', 'super_admin'].includes(req.auth.role)) {
       return res.status(403).json({ error: 'Only admin can update CredLaxmi banner' });
@@ -302,7 +302,11 @@ cmsRouter.put('/credlaxmi-banner', async (req, res, next) => {
   } catch (err) {
     next(err);
   }
-});
+}
+
+cmsRouter.put('/credlaxmi-banner', handleUpsertCredLaxmiBanner);
+// POST alias — some CDNs/proxies block or mishandle PUT.
+cmsRouter.post('/credlaxmi-banner', handleUpsertCredLaxmiBanner);
 
 cmsRouter.get('/flash-tiles/categories', async (_req, res, next) => {
   try {

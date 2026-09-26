@@ -1,8 +1,11 @@
 import { fetchWithTimeout } from "./fetchWithTimeout.js";
 const MSG91_OTP_URL = "https://control.msg91.com/api/v5/otp";
 const MSG91_EMAIL_URL = "https://control.msg91.com/api/v5/email/send";
+const MSG91_EMAIL_TEMPLATES_URL = "https://control.msg91.com/api/v5/email/templates";
 const MSG91_FLOW_URL = "https://control.msg91.com/api/v5/flow/";
 const MSG91_SMS_HTTP_URL = "https://control.msg91.com/api/sendhttp.php";
+const MSG91_NOTIFICATION_TEMPLATE_SLUG = "rfincare_notification";
+let cachedNotificationTemplateId = null;
 const MSG91_WHATSAPP_URLS = [
   "https://api.msg91.com/api/v5/whatsapp/whatsapp-outbound-message/bulk/",
   "https://control.msg91.com/api/v5/whatsapp/whatsapp-outbound-message/bulk/"
@@ -83,6 +86,8 @@ function getMsg91EmailConfig(overrides = {}) {
     fromEmail: overrides.msg91EmailFromEmail || process.env.MSG91_EMAIL_FROM_EMAIL || process.env.MSG91_EMAIL_FROM || "",
     fromName: overrides.msg91EmailFromName || process.env.MSG91_EMAIL_FROM_NAME || "Rfincare",
     emailOtpTemplateId: overrides.msg91EmailOtpTemplateId || process.env.MSG91_EMAIL_OTP_TEMPLATE_ID || "",
+    /** Dedicated non-OTP template ({{SUBJECT}} / {{BODY}}); falls back to auto-provisioned slug. */
+    transactionalTemplateId: overrides.msg91EmailTransactionalTemplateId || process.env.MSG91_EMAIL_TRANSACTIONAL_TEMPLATE_ID || "",
     otpVariableName: overrides.msg91EmailOtpVariable || process.env.MSG91_EMAIL_OTP_VARIABLE || "OTP_CODE"
   };
 }
@@ -419,61 +424,33 @@ async function sendMsg91EmailOtp({
     templateId: config.emailOtpTemplateId
   };
 }
-async function sendMsg91TransactionalEmail({
-  to,
-  subject,
-  text,
-  html,
-  recipientName,
-  config: overrides = {}
-}) {
-  const config = getMsg91EmailConfig(overrides);
-  if (!config.authKey || !config.domain || !config.fromEmail) {
+function toMsg91Attachment(attachment) {
+  if (!attachment) return null;
+  const fileName = String(attachment.filename || attachment.fileName || "attachment.bin");
+  if (attachment.filePath || attachment.path?.startsWith?.("http")) {
     return {
-      sent: false,
-      provider: "msg91",
-      reason: "msg91_email_not_configured"
+      fileName,
+      filePath: attachment.filePath || attachment.path
     };
   }
-  const toEmail = String(to || "").trim().toLowerCase();
-  if (!toEmail) {
-    return { sent: false, provider: "msg91", reason: "no_recipient" };
-  }
-  const body = {
-    recipients: [
-      {
-        to: [
-          {
-            email: toEmail,
-            name: recipientName || toEmail
-          }
-        ]
-      }
-    ],
-    from: {
-      name: config.fromName,
-      email: config.fromEmail
-    },
-    domain: config.domain,
-    subject: String(subject || "Rfincare notification"),
-    body: {
-      html: html || `<pre style="font-family:sans-serif;white-space:pre-wrap">${String(text || "")}</pre>`,
-      text: text || ""
-    }
+  const raw = attachment.content;
+  if (raw == null) return null;
+  const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(String(raw), "utf8");
+  const mime = String(attachment.contentType || attachment.content_type || "application/octet-stream").split(";")[0].trim() || "application/octet-stream";
+  return {
+    fileName,
+    file: `data:${mime};base64,${buf.toString("base64")}`
   };
-  if (config.emailOtpTemplateId && process.env.MSG91_EMAIL_FORCE_TEMPLATE === "true") {
-    body.template_id = config.emailOtpTemplateId;
-    body.recipients[0].variables = {
-      SUBJECT: String(subject || ""),
-      BODY: String(text || ""),
-      MESSAGE: String(text || "")
-    };
-    delete body.subject;
-    delete body.body;
-  }
+}
+async function resolveMsg91TransactionalTemplateId(config) {
+  const explicit = String(
+    config.transactionalTemplateId || process.env.MSG91_EMAIL_TRANSACTIONAL_TEMPLATE_ID || ""
+  ).trim();
+  if (explicit) return explicit;
+  if (cachedNotificationTemplateId) return cachedNotificationTemplateId;
   try {
-    const res = await fetchWithTimeout(
-      MSG91_EMAIL_URL,
+    const createRes = await fetchWithTimeout(
+      MSG91_EMAIL_TEMPLATES_URL,
       {
         method: "POST",
         headers: {
@@ -481,28 +458,161 @@ async function sendMsg91TransactionalEmail({
           "Content-Type": "application/json",
           Accept: "application/json"
         },
-        body: JSON.stringify(body),
-        timeoutMessage: "MSG91 transactional email timed out."
+        body: JSON.stringify({
+          name: "Rfincare Notification",
+          slug: MSG91_NOTIFICATION_TEMPLATE_SLUG,
+          subject: "{{SUBJECT}}",
+          body: '<div style="font-family:system-ui,sans-serif;white-space:pre-wrap;line-height:1.5">{{BODY}}</div>'
+        }),
+        timeoutMessage: "MSG91 email template create timed out."
       },
       MSG91_FETCH_TIMEOUT_MS
     );
-    await parseMsg91Response(res);
-    return {
-      sent: true,
-      provider: "msg91",
-      mode: "transactional_email",
-      domain: config.domain,
-      from: config.fromEmail
-    };
+    const text = await createRes.text();
+    let data = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = null;
+    }
+    if (createRes.ok || /already|exist|duplicate/i.test(String(data?.message || data?.msg || text || ""))) {
+      const slug = data?.data?.slug || data?.slug || data?.data?.template_id || data?.template_id || MSG91_NOTIFICATION_TEMPLATE_SLUG;
+      cachedNotificationTemplateId = String(slug);
+      return cachedNotificationTemplateId;
+    }
+    console.warn(
+      "[msg91:email:template]",
+      String(data?.message || data?.msg || text || `HTTP ${createRes.status}`).slice(0, 300)
+    );
   } catch (err) {
-    console.error("[msg91:email]", err?.message || err);
+    console.warn("[msg91:email:template]", err?.message || err);
+  }
+  const otpTpl = String(config.emailOtpTemplateId || "").trim();
+  return otpTpl || MSG91_NOTIFICATION_TEMPLATE_SLUG;
+}
+async function postMsg91Email(payload) {
+  const res = await fetchWithTimeout(
+    MSG91_EMAIL_URL,
+    {
+      method: "POST",
+      headers: {
+        authkey: payload._authKey,
+        "Content-Type": "application/json",
+        Accept: "application/json"
+      },
+      body: JSON.stringify(payload.body),
+      timeoutMessage: "MSG91 transactional email timed out."
+    },
+    MSG91_FETCH_TIMEOUT_MS
+  );
+  await parseMsg91Response(res);
+}
+async function sendMsg91TransactionalEmail({
+  to,
+  subject,
+  text,
+  html,
+  recipientName,
+  attachments = [],
+  config: overrides = {}
+}) {
+  const config = getMsg91EmailConfig(overrides);
+  if (!config.authKey || !config.domain || !config.fromEmail) {
     return {
       sent: false,
       provider: "msg91",
-      reason: "msg91_email_failed",
-      warningInternal: err?.message || "MSG91 email failed"
+      reason: "msg91_email_not_configured",
+      warningInternal: "MSG91 email needs MSG91_AUTH_KEY, MSG91_EMAIL_DOMAIN, and MSG91_EMAIL_FROM_EMAIL (or the same fields in Admin → OTP settings)."
     };
   }
+  const toEmail = String(to || "").trim().toLowerCase();
+  if (!toEmail) {
+    return { sent: false, provider: "msg91", reason: "no_recipient" };
+  }
+  const subjectLine = String(subject || "Rfincare notification");
+  const textBody = String(text || "");
+  const htmlBody = html || `<pre style="font-family:sans-serif;white-space:pre-wrap">${textBody}</pre>`;
+  const msg91Attachments = (Array.isArray(attachments) ? attachments : []).map(toMsg91Attachment).filter(Boolean);
+  const basePayload = {
+    recipients: [
+      {
+        to: [
+          {
+            email: toEmail,
+            name: recipientName || toEmail
+          }
+        ],
+        variables: {
+          SUBJECT: subjectLine,
+          BODY: textBody,
+          MESSAGE: textBody,
+          HTML_BODY: htmlBody,
+          COMPANY: "Rfincare",
+          NAME: recipientName || toEmail
+        }
+      }
+    ],
+    from: {
+      name: config.fromName,
+      email: config.fromEmail
+    },
+    domain: config.domain
+  };
+  if (msg91Attachments.length) {
+    basePayload.attachments = msg91Attachments;
+  }
+  const templateId = await resolveMsg91TransactionalTemplateId(config);
+  const attempts = [];
+  attempts.push({
+    label: "template",
+    body: {
+      ...basePayload,
+      template_id: templateId
+    }
+  });
+  attempts.push({
+    label: "raw_body",
+    body: {
+      ...basePayload,
+      subject: subjectLine,
+      body: { html: htmlBody, text: textBody }
+    }
+  });
+  if (msg91Attachments.length) {
+    const withoutAtt = {
+      ...basePayload,
+      template_id: templateId
+    };
+    delete withoutAtt.attachments;
+    attempts.push({ label: "template_no_attachments", body: withoutAtt });
+  }
+  let lastError = null;
+  for (const attempt of attempts) {
+    try {
+      await postMsg91Email({ _authKey: config.authKey, body: attempt.body });
+      return {
+        sent: true,
+        provider: "msg91",
+        mode: "transactional_email",
+        channel: "msg91",
+        domain: config.domain,
+        from: config.fromEmail,
+        templateId: attempt.body.template_id || null,
+        attachmentCount: Array.isArray(attempt.body.attachments) ? attempt.body.attachments.length : 0,
+        attempt: attempt.label
+      };
+    } catch (err) {
+      lastError = err;
+      console.warn(`[msg91:email:${attempt.label}]`, err?.message || err);
+    }
+  }
+  console.error("[msg91:email]", lastError?.message || lastError);
+  return {
+    sent: false,
+    provider: "msg91",
+    reason: "msg91_email_failed",
+    warningInternal: lastError?.message || "MSG91 email failed"
+  };
 }
 async function testMsg91Connection(overrides = {}) {
   const config = getMsg91Config(overrides);

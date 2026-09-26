@@ -1,9 +1,26 @@
 function getStorageProviderName() {
-  const raw = String(process.env.STORAGE_PROVIDER || "local").trim().toLowerCase();
-  return raw === "s3" ? "s3" : "local";
+  const raw = String(process.env.STORAGE_PROVIDER || "").trim().toLowerCase();
+  const cfg = getS3Config();
+  const s3Ready = Boolean(cfg.bucket && cfg.accessKeyId && cfg.secretAccessKey);
+  if (raw === "s3") return "s3";
+  if (raw === "local") {
+    if (s3Ready && process.env.FORCE_LOCAL_STORAGE !== "true") {
+      console.warn(
+        "[storage] STORAGE_PROVIDER=local but S3 credentials are set — using s3 so uploads survive deploys"
+      );
+      return "s3";
+    }
+    return "local";
+  }
+  return s3Ready ? "s3" : "local";
 }
 function isCloudStorage() {
   return getStorageProviderName() === "s3";
+}
+function isEphemeralUploadHost() {
+  return Boolean(
+    process.env.K_SERVICE || process.env.CLOUD_RUN_JOB || process.env.RENDER || process.env.RAILWAY_ENVIRONMENT || process.env.FLY_APP_NAME
+  );
 }
 function getS3Config() {
   return {
@@ -30,5 +47,6 @@ export {
   assertS3Config,
   getS3Config,
   getStorageProviderName,
-  isCloudStorage
+  isCloudStorage,
+  isEphemeralUploadHost
 };

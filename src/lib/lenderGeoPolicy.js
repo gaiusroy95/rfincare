@@ -193,10 +193,15 @@ export async function createGeoVersionFromSheetRows({
 
   const ownsConnection = !conn;
   const db = conn || (await pool.getConnection());
-  const BATCH_SIZE = Math.max(50, Number(process.env.GEO_IMPORT_BATCH_SIZE || 250));
+  const BATCH_SIZE = Math.max(50, Number(process.env.GEO_IMPORT_BATCH_SIZE || 500));
 
   try {
     if (ownsConnection) await db.beginTransaction();
+    try {
+      await db.execute(`SET LOCAL statement_timeout = '180s'`);
+    } catch {
+      /* ignore */
+    }
 
     const versionId = newId();
     await db.execute(

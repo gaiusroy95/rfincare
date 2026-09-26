@@ -6,14 +6,16 @@ function requireEnv(name) {
   return v;
 }
 
-export function signAccessToken({ userId, role, email }) {
+export function signAccessToken({ userId, role, email, applicationId }) {
   const secret = requireEnv('JWT_ACCESS_SECRET');
-  const ttl = Number(process.env.JWT_ACCESS_TTL_SECONDS || 900);
-  return jwt.sign(
-    { sub: userId, role, email, typ: 'access' },
-    secret,
-    { expiresIn: ttl },
-  );
+  // Applicant onboarding tokens are longer-lived (no refresh_tokens row without auth_users).
+  const defaultTtl = role === 'agent_applicant'
+    ? Number(process.env.JWT_APPLICANT_ACCESS_TTL_SECONDS || 60 * 60 * 24 * 7)
+    : Number(process.env.JWT_ACCESS_TTL_SECONDS || 900);
+  const ttl = defaultTtl;
+  const payload = { sub: userId, role, email, typ: 'access' };
+  if (applicationId) payload.applicationId = applicationId;
+  return jwt.sign(payload, secret, { expiresIn: ttl });
 }
 
 export function signRefreshToken({ tokenId, userId }) {

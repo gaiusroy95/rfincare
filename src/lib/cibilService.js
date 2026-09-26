@@ -231,10 +231,12 @@ async function sandboxPull({ vendor, application, customer, extra }) {
   }
 
   const score = 680 + Math.floor(Math.random() * 120);
+  const reportPath = writeLocalSandboxPdf({ vendor, application, customer, score });
   return {
     status: 'success',
     creditScore: score,
-    reportPath: writeLocalSandboxPdf({ vendor, application, customer, score }),
+    reportPath,
+    pdfUrl: null,
     response: {
       sandbox: true,
       localFallback: true,
@@ -253,6 +255,7 @@ async function surepassPull({ vendor, application, customer, extra, allowMissing
       status: 'failed',
       creditScore: null,
       reportPath: null,
+      pdfUrl: null,
       errorMessage: result.errorMessage,
       response: result.response || { reason: result.reason },
     };
@@ -276,6 +279,7 @@ async function surepassPull({ vendor, application, customer, extra, allowMissing
       status: result.pdfBuffer ? 'success' : 'failed',
       creditScore: null,
       reportPath,
+      pdfUrl: result.pdfUrl || null,
       errorMessage: result.pdfBuffer ? null : 'Surepass returned no credit score or PDF',
       response: result.response,
     };
@@ -285,6 +289,7 @@ async function surepassPull({ vendor, application, customer, extra, allowMissing
     status: 'success',
     creditScore: result.creditScore,
     reportPath,
+    pdfUrl: result.pdfUrl || null,
     response: {
       vendor: 'surepass',
       path: result.path,
@@ -302,12 +307,59 @@ async function productionPull({ vendor, application, customer, extra }) {
       status: 'failed',
       creditScore: null,
       reportPath: null,
+      pdfUrl: null,
       errorMessage:
         'Surepass credentials missing. Set SUREPASS_TOKEN or SUREPASS_ID_NUMBER + SUREPASS_PASSWORD (or save API key on the bureau vendor).',
       response: { error: 'missing_credentials' },
     };
   }
   return surepassPull({ vendor, application, customer, extra });
+}
+
+/** Resolve Experian row (create placeholder if missing) then TransUnion / active fallback. */
+async function resolveGuestPullVendors(pool) {
+  let experian = await getVendorByKey(pool, 'experian');
+  if (!experian) {
+    await pool.execute(
+      `INSERT INTO cibil_vendors (vendor_key, display_name, sandbox_mode, is_active, updated_at)
+       VALUES ('experian', 'Experian', TRUE, FALSE, NOW())
+       ON CONFLICT (vendor_key) DO NOTHING`,
+    );
+    experian = await getVendorByKey(pool, 'experian');
+  }
+  const transunion =
+    (await getVendorByKey(pool, 'transunion_cibil')) || (await getActiveVendor(pool));
+  return { experian, transunion };
+}
+
+function pickGuestDownloadUrl(result) {
+  const pdfUrl = result?.pdfUrl || result?.response?.pdfUrl || null;
+  if (pdfUrl && /^https?:\/\//i.test(String(pdfUrl))) return String(pdfUrl);
+  if (result?.reportPath) return String(result.reportPath);
+  if (pdfUrl) return String(pdfUrl);
+  return null;
+}
+
+async function runGuestBureauPull({ vendor, application, customer, extra }) {
+  if (!vendor) {
+    return {
+      vendor: null,
+      useSandbox: false,
+      result: {
+        status: 'failed',
+        creditScore: null,
+        reportPath: null,
+        pdfUrl: null,
+        errorMessage: 'No CIBIL vendor configured',
+        response: { error: 'no_vendor' },
+      },
+    };
+  }
+  const useSandbox = Boolean(vendor.sandbox_mode);
+  const result = useSandbox
+    ? await sandboxPull({ vendor, application, customer, extra })
+    : await productionPull({ vendor, application, customer, extra });
+  return { vendor, useSandbox, result };
 }
 
 export async function pullCibilForApplication(applicationId, { forceSandbox = false } = {}) {
@@ -666,13 +718,14 @@ export async function pullCibilForEmployee(demographics, employeeUserId, options
 }
 
 /**
- * Guest / homepage CIBIL check — captures demographics, stores lead, returns Surepass or sandbox pull.
+ * Guest / homepage CIBIL check — prefer Experian PDF report, fall back to TransUnion CIBIL.
+ * Captures demographics, stores lead, returns score + download URL.
  */
 export async function pullCibilForGuest(demographics, { upsertLead } = {}) {
   await ensureMilestone4Schema();
   const pool = getPool();
-  const vendor = await getActiveVendor(pool);
-  if (!vendor) {
+  const { experian, transunion } = await resolveGuestPullVendors(pool);
+  if (!experian && !transunion) {
     const e = new Error('CIBIL check is temporarily unavailable. Please try again later.');
     e.status = 503;
     throw e;
@@ -701,10 +754,52 @@ export async function pullCibilForGuest(demographics, { upsertLead } = {}) {
     consent: true,
   };
 
-  const useSandbox = Boolean(vendor.sandbox_mode);
-  const result = useSandbox
-    ? await sandboxPull({ vendor, application: stubApplication, customer: stubCustomer, extra })
-    : await productionPull({ vendor, application: stubApplication, customer: stubCustomer, extra });
+  const attempts = [];
+  let chosen = null;
+
+  // Homepage guest rule: Experian first, then TransUnion CIBIL soft-fallback.
+  if (experian) {
+    const attempt = await runGuestBureauPull({
+      vendor: experian,
+      application: stubApplication,
+      customer: stubCustomer,
+      extra,
+    });
+    attempts.push({
+      vendorKey: experian.vendor_key,
+      status: attempt.result.status,
+      errorMessage: attempt.result.errorMessage || null,
+    });
+    if (attempt.result.status === 'success') chosen = attempt;
+  }
+
+  if (!chosen && transunion && transunion.vendor_key !== experian?.vendor_key) {
+    const attempt = await runGuestBureauPull({
+      vendor: transunion,
+      application: stubApplication,
+      customer: stubCustomer,
+      extra,
+    });
+    attempts.push({
+      vendorKey: transunion.vendor_key,
+      status: attempt.result.status,
+      errorMessage: attempt.result.errorMessage || null,
+    });
+    if (attempt.result.status === 'success') chosen = attempt;
+  }
+
+  const vendor = chosen?.vendor || experian || transunion;
+  const useSandbox = chosen ? chosen.useSandbox : Boolean(vendor?.sandbox_mode);
+  const result = chosen?.result || {
+    status: 'failed',
+    creditScore: null,
+    reportPath: null,
+    pdfUrl: null,
+    errorMessage:
+      attempts.map((a) => a.errorMessage).filter(Boolean).join(' | ')
+      || 'Could not fetch CIBIL score from Experian or TransUnion',
+    response: { attempts },
+  };
 
   let leadId = null;
   if (typeof upsertLead === 'function') {
@@ -721,12 +816,17 @@ export async function pullCibilForGuest(demographics, { upsertLead } = {}) {
           data: JSON.stringify({
             source: 'homepage_cibil',
             demographics,
+            contactVerification: demographics.contactVerification || null,
             cibil: {
               status: result.status,
               creditScore: result.creditScore,
-              vendorKey: vendor.vendor_key,
-              vendorName: vendor.display_name,
+              vendorKey: vendor?.vendor_key || null,
+              vendorName: vendor?.display_name || null,
               sandboxMode: useSandbox,
+              reportPath: result.reportPath || null,
+              pdfUrl: result.pdfUrl || null,
+              pullRule: 'guest_experian_then_transunion',
+              attempts,
               checkedAt: new Date().toISOString(),
             },
           }),
@@ -738,17 +838,25 @@ export async function pullCibilForGuest(demographics, { upsertLead } = {}) {
   if (result.status !== 'success') {
     const e = new Error(result.errorMessage || 'Could not fetch CIBIL score');
     e.status = 422;
+    e.leadId = leadId;
+    e.bureauAttempts = attempts;
     throw e;
   }
 
   const band = scoreBand(result.creditScore || 0);
+  const downloadUrl = pickGuestDownloadUrl(result);
   return {
     leadId,
     creditScore: result.creditScore,
     band: result.creditScore ? band : 'unknown',
     bandLabel: result.creditScore ? BAND_LABELS[band] : 'Report generated',
-    vendorName: vendor.display_name,
+    vendorKey: vendor?.vendor_key || null,
+    vendorName: vendor?.display_name || null,
     sandboxMode: useSandbox,
+    reportPath: result.reportPath || null,
+    reportUrl: downloadUrl,
+    pdfUrl: downloadUrl,
+    pullRule: 'guest_experian_then_transunion',
     checkedAt: new Date().toISOString(),
   };
 }

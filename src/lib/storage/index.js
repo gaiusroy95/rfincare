@@ -1,4 +1,4 @@
-import { getStorageProviderName, isCloudStorage } from './config.js';
+import { getStorageProviderName, isCloudStorage, isEphemeralUploadHost } from './config.js';
 import {
   getLocalObjectStream,
   getLocalPublicUrl,
@@ -13,7 +13,7 @@ import {
 } from './s3Provider.js';
 import { normalizeStorageKey, toStoredPath } from './keys.js';
 
-export { getStorageProviderName, isCloudStorage, getS3Config } from './config.js';
+export { getStorageProviderName, isCloudStorage, getS3Config, isEphemeralUploadHost } from './config.js';
 export { normalizeStorageKey, toStoredPath, buildObjectKey, sanitizeFileName } from './keys.js';
 
 /**
@@ -35,7 +35,12 @@ export async function openStoredFile(storedPath) {
   const key = normalizeStorageKey(storedPath);
   if (!key) return null;
   if (isCloudStorage()) {
-    return getS3ObjectStream(key);
+    const fromS3 = await getS3ObjectStream(key);
+    if (fromS3?.stream) return fromS3;
+    // Migration fallback: object may still exist only on local disk from older deploys.
+    const local = await getLocalObjectStream(key);
+    if (local?.stream) return local;
+    return null;
   }
   return getLocalObjectStream(key);
 }
@@ -55,7 +60,8 @@ export async function storedFileExists(storedPath) {
   const key = normalizeStorageKey(storedPath);
   if (!key) return false;
   if (isCloudStorage()) {
-    return s3ObjectExists(key);
+    if (await s3ObjectExists(key)) return true;
+    return localObjectExists(key);
   }
   return localObjectExists(key);
 }
@@ -65,6 +71,12 @@ export function getStorageArchitecture() {
   return {
     provider: getStorageProviderName(),
     cloud: isCloudStorage(),
+    ephemeralHost: isEphemeralUploadHost(),
+    durable: isCloudStorage() || !isEphemeralUploadHost(),
     bucket: isCloudStorage() ? process.env.S3_BUCKET || null : null,
+    warning:
+      !isCloudStorage() && isEphemeralUploadHost()
+        ? 'Local disk on ephemeral host — set STORAGE_PROVIDER=s3 or documents will vanish after restart'
+        : null,
   };
 }

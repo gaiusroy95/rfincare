@@ -1,4 +1,4 @@
-import { getStorageProviderName, isCloudStorage } from "./config.js";
+import { getStorageProviderName, isCloudStorage, isEphemeralUploadHost } from "./config.js";
 import {
   getLocalObjectStream,
   getLocalPublicUrl,
@@ -12,7 +12,7 @@ import {
   s3ObjectExists
 } from "./s3Provider.js";
 import { normalizeStorageKey, toStoredPath } from "./keys.js";
-import { getStorageProviderName as getStorageProviderName2, isCloudStorage as isCloudStorage2, getS3Config } from "./config.js";
+import { getStorageProviderName as getStorageProviderName2, isCloudStorage as isCloudStorage2, getS3Config, isEphemeralUploadHost as isEphemeralUploadHost2 } from "./config.js";
 import { normalizeStorageKey as normalizeStorageKey2, toStoredPath as toStoredPath2, buildObjectKey, sanitizeFileName } from "./keys.js";
 async function saveUploadedFile({ buffer, originalName, folder = "", mimeType }) {
   if (!buffer?.length) {
@@ -27,7 +27,11 @@ async function openStoredFile(storedPath) {
   const key = normalizeStorageKey(storedPath);
   if (!key) return null;
   if (isCloudStorage()) {
-    return getS3ObjectStream(key);
+    const fromS3 = await getS3ObjectStream(key);
+    if (fromS3?.stream) return fromS3;
+    const local = await getLocalObjectStream(key);
+    if (local?.stream) return local;
+    return null;
   }
   return getLocalObjectStream(key);
 }
@@ -44,7 +48,8 @@ async function storedFileExists(storedPath) {
   const key = normalizeStorageKey(storedPath);
   if (!key) return false;
   if (isCloudStorage()) {
-    return s3ObjectExists(key);
+    if (await s3ObjectExists(key)) return true;
+    return localObjectExists(key);
   }
   return localObjectExists(key);
 }
@@ -52,7 +57,10 @@ function getStorageArchitecture() {
   return {
     provider: getStorageProviderName(),
     cloud: isCloudStorage(),
-    bucket: isCloudStorage() ? process.env.S3_BUCKET || null : null
+    ephemeralHost: isEphemeralUploadHost(),
+    durable: isCloudStorage() || !isEphemeralUploadHost(),
+    bucket: isCloudStorage() ? process.env.S3_BUCKET || null : null,
+    warning: !isCloudStorage() && isEphemeralUploadHost() ? "Local disk on ephemeral host — set STORAGE_PROVIDER=s3 or documents will vanish after restart" : null
   };
 }
 export {
@@ -62,6 +70,7 @@ export {
   getStorageProviderName2 as getStorageProviderName,
   getStoredPublicUrl,
   isCloudStorage2 as isCloudStorage,
+  isEphemeralUploadHost2 as isEphemeralUploadHost,
   normalizeStorageKey2 as normalizeStorageKey,
   openStoredFile,
   sanitizeFileName,

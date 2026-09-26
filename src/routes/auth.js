@@ -64,6 +64,20 @@ function clearRefreshCookie(res) {
 
 async function issueTokens({ userId, email, role, req }) {
   const pool = getPool();
+
+  // refresh_tokens.user_id FK → auth_users(id). Never insert without a live auth row.
+  const [[auth]] = await pool.execute(
+    `SELECT id FROM auth_users WHERE id = :id LIMIT 1`,
+    { id: userId },
+  );
+  if (!auth?.id) {
+    const err = new Error(
+      'Account could not be prepared for login. Please try verifying OTP again, or use a different email.',
+    );
+    err.status = 409;
+    throw err;
+  }
+
   const tokenId = newId();
   const refreshJwt = signRefreshToken({ tokenId, userId });
   const refreshHash = sha256Hex(refreshJwt);
@@ -86,6 +100,164 @@ async function issueTokens({ userId, email, role, req }) {
 
   const accessJwt = signAccessToken({ userId, email, role });
   return { accessJwt, refreshJwt };
+}
+
+/**
+ * Ensure auth_users + user_profiles exist for application OTP session.
+ * Handles orphan profiles (profile without auth_users) that caused:
+ * refresh_tokens FK violation fk_refresh_tokens_user.
+ */
+async function ensureCustomerAuthSession(pool, {
+  phone,
+  email,
+  fullName,
+}) {
+  const normalizedEmail = String(email || '').trim().toLowerCase();
+  const normalizedPhone = String(phone || '').replace(/\D/g, '').slice(-10);
+
+  // Prefer an existing auth account by email (source of truth for refresh_tokens FK).
+  const [[authByEmail]] = await pool.execute(
+    `SELECT id, email FROM auth_users WHERE email = :email LIMIT 1`,
+    { email: normalizedEmail },
+  );
+
+  if (authByEmail?.id) {
+    const userId = authByEmail.id;
+    const [[profile]] = await pool.execute(
+      `SELECT id, role, email FROM user_profiles WHERE id = :id LIMIT 1`,
+      { id: userId },
+    );
+    if (!profile) {
+      await ensureMilestone3Schema();
+      await pool.execute(
+        `INSERT INTO user_profiles (id, email, full_name, phone, role, account_status, is_active)
+         VALUES (:id, :email, :fullName, :phone, 'customer', 'active', TRUE)`,
+        {
+          id: userId,
+          email: normalizedEmail,
+          fullName: fullName ?? null,
+          phone: normalizedPhone,
+        },
+      );
+    } else {
+      await pool.execute(
+        `UPDATE user_profiles SET
+           phone = COALESCE(phone, :phone),
+           full_name = COALESCE(full_name, :fullName),
+           email = COALESCE(email, :email)
+         WHERE id = :id`,
+        {
+          id: userId,
+          phone: normalizedPhone,
+          fullName: fullName ?? null,
+          email: normalizedEmail,
+        },
+      );
+    }
+    return {
+      userId,
+      email: authByEmail.email || normalizedEmail,
+      role: profile?.role || 'customer',
+    };
+  }
+
+  // Match profile by phone/email — may be orphaned (no auth_users row).
+  const [[profile]] = await pool.execute(
+    `SELECT up.id, up.email, up.role, au.id AS auth_id
+     FROM user_profiles up
+     LEFT JOIN auth_users au ON au.id = up.id
+     WHERE up.phone = :phone OR up.email = :email
+     ORDER BY (up.phone = :phone) DESC, (up.email = :email) DESC
+     LIMIT 1`,
+    { phone: normalizedPhone, email: normalizedEmail },
+  );
+
+  if (profile?.id && profile.auth_id) {
+    await pool.execute(
+      `UPDATE user_profiles SET
+         phone = COALESCE(phone, :phone),
+         full_name = COALESCE(full_name, :fullName)
+       WHERE id = :id`,
+      { id: profile.id, phone: normalizedPhone, fullName: fullName ?? null },
+    );
+    return {
+      userId: profile.id,
+      email: profile.email || normalizedEmail,
+      role: profile.role || 'customer',
+    };
+  }
+
+  if (profile?.id && !profile.auth_id) {
+    // Recreate auth_users for orphan profile id (same id keeps loan FKs intact).
+    const password = `RFC${crypto.randomBytes(4).toString('hex')}A1!`;
+    const passwordHash = await bcrypt.hash(password, 12);
+    const profileEmail = profile.email || normalizedEmail;
+    try {
+      await pool.execute(
+        `INSERT INTO auth_users (id, email, password_hash) VALUES (:id, :email, :ph)`,
+        { id: profile.id, email: profileEmail, ph: passwordHash },
+      );
+    } catch (insertErr) {
+      // Email collision on another auth id — fall through to brand-new pair below
+      // only if we cannot attach; prefer reusing colliding auth by email.
+      const [[again]] = await pool.execute(
+        `SELECT id, email FROM auth_users WHERE email = :email LIMIT 1`,
+        { email: profileEmail },
+      );
+      if (again?.id) {
+        return {
+          userId: again.id,
+          email: again.email || profileEmail,
+          role: profile.role || 'customer',
+        };
+      }
+      throw insertErr;
+    }
+    await pool.execute(
+      `UPDATE user_profiles SET
+         phone = COALESCE(phone, :phone),
+         full_name = COALESCE(full_name, :fullName),
+         email = COALESCE(email, :email)
+       WHERE id = :id`,
+      {
+        id: profile.id,
+        phone: normalizedPhone,
+        fullName: fullName ?? null,
+        email: profileEmail,
+      },
+    );
+    return {
+      userId: profile.id,
+      email: profileEmail,
+      role: profile.role || 'customer',
+    };
+  }
+
+  // Brand-new customer.
+  const userId = newId();
+  const password = `RFC${crypto.randomBytes(4).toString('hex')}A1!`;
+  const passwordHash = await bcrypt.hash(password, 12);
+  await ensureMilestone3Schema();
+  await pool.execute(
+    `INSERT INTO auth_users (id, email, password_hash) VALUES (:id, :email, :ph)`,
+    { id: userId, email: normalizedEmail, ph: passwordHash },
+  );
+  await pool.execute(
+    `INSERT INTO user_profiles (id, email, full_name, phone, role, account_status, is_active)
+     VALUES (:id, :email, :fullName, :phone, 'customer', 'active', TRUE)`,
+    {
+      id: userId,
+      email: normalizedEmail,
+      fullName: fullName ?? null,
+      phone: normalizedPhone,
+    },
+  );
+  try {
+    await assignUniqueCustomerCode(pool, userId);
+  } catch {
+    /* best-effort */
+  }
+  return { userId, email: normalizedEmail, role: 'customer' };
 }
 
 authRouter.post('/signup', async (req, res, next) => {
@@ -1159,51 +1331,16 @@ authRouter.post('/application/verify-otp', async (req, res, next) => {
 
     await pool.execute(`UPDATE lead_otps SET verified_at = NOW() WHERE id = :id`, { id: otpRow.id });
 
-    let [[profile]] = await pool.execute(
-      `SELECT id, email, role FROM user_profiles
-       WHERE phone = :phone OR email = :email
-       ORDER BY (phone = :phone) DESC
-       LIMIT 1`,
-      { phone, email },
-    );
-
-    let userId;
-    let profileEmail = email;
-    let role = 'customer';
-
-    if (!profile) {
-      userId = newId();
-      const password = `RFC${crypto.randomBytes(4).toString('hex')}A1!`;
-      const passwordHash = await bcrypt.hash(password, 12);
-      await pool.execute(
-        `INSERT INTO auth_users (id, email, password_hash) VALUES (:id, :email, :ph)`,
-        { id: userId, email, ph: passwordHash },
-      );
-      await pool.execute(
-        `INSERT INTO user_profiles (id, email, full_name, phone, role, account_status, is_active)
-         VALUES (:id, :email, :fullName, :phone, 'customer', 'active', 1)`,
-        {
-          id: userId,
-          email,
-          fullName: input.fullName ?? null,
-          phone,
-        },
-      );
-    } else {
-      userId = profile.id;
-      profileEmail = profile.email;
-      role = profile.role;
-      await pool.execute(
-        `UPDATE user_profiles SET phone = COALESCE(phone, :phone), full_name = COALESCE(full_name, :fullName)
-         WHERE id = :id`,
-        { id: userId, phone, fullName: input.fullName ?? null },
-      );
-    }
+    const session = await ensureCustomerAuthSession(pool, {
+      phone,
+      email,
+      fullName: input.fullName ?? null,
+    });
 
     const { accessJwt, refreshJwt } = await issueTokens({
-      userId,
-      email: profileEmail,
-      role,
+      userId: session.userId,
+      email: session.email,
+      role: session.role,
       req,
     });
     setRefreshCookie(res, refreshJwt);
@@ -1213,10 +1350,16 @@ authRouter.post('/application/verify-otp', async (req, res, next) => {
         verified: true,
         accessJwt,
         refreshJwt,
-        user: { id: userId, email: profileEmail, role },
+        user: { id: session.userId, email: session.email, role: session.role },
       }),
     );
   } catch (err) {
+    const raw = String(err?.message || '');
+    if (/foreign key|fk_refresh_tokens|refresh_tokens|violates/i.test(raw)) {
+      const e = new Error('OTP verified, but sign-in could not be completed. Please try again.');
+      e.status = 409;
+      return next(e);
+    }
     next(err);
   }
 });

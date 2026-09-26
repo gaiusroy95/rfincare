@@ -621,6 +621,7 @@ async function pullCibilForGuest(demographics, { upsertLead } = {}) {
           data: JSON.stringify({
             source: "homepage_cibil",
             demographics,
+            contactVerification: demographics.contactVerification || null,
             cibil: {
               status: result.status,
               creditScore: result.creditScore,

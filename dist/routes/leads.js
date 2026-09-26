@@ -3,7 +3,7 @@ import { z } from "zod";
 import { getPool } from "../db/pool.js";
 import { ensureOnboardingSchema } from "../db/ensureOnboardingSchema.js";
 import { newId } from "../lib/ids.js";
-import { hashOtp, sendDualChannelOtp, sendOtpNotification, toPublicOtpMessage } from "../lib/otp.js";
+import { hashOtp, isSyntheticLeadEmail, sendDualChannelOtp, sendOtpNotification, toPublicOtpMessage } from "../lib/otp.js";
 import { getOtpProviderSettings } from "../lib/otpProviderSettings.js";
 import {
   createResumeToken,
@@ -19,6 +19,7 @@ import { normalizeAgentCode } from "../lib/agentAttribution.js";
 import { ensureAgentCodeForUser } from "../lib/agentCode.js";
 import { applyReferralToLead, ensureReferralSchema } from "../lib/referralTracking.js";
 import {
+  assignUnassignedLeadsBacklog,
   ensureLeadAssignmentSchema,
   ensureLeadTatClock,
   enrichLeadTatFields,
@@ -26,6 +27,7 @@ import {
   getLeadPerformanceReport,
   listLeadActivities,
   listRedZoneLeads,
+  notifyLeadStakeholders,
   processTatMissReassignments,
   recordLeadActivity,
   recordLeadContact,
@@ -220,10 +222,14 @@ leadsRouter.post("/", async (req, res, next) => {
     body = attached.body;
     const agentUserId = attached.agentUserId;
     const employeeUserId = attached.employeeUserId;
+    if (!agentUserId && !employeeUserId) {
+      const { sanitizeGuestLeadAttribution } = await import("../lib/agentAttribution.js");
+      body = sanitizeGuestLeadAttribution(body);
+    }
     const fullName = body.fullName || body.full_name || "";
     const sessionKey = body.sessionKey || body.session_key || null;
     const leadKind = String(body.leadKind || body.lead_kind || "").toLowerCase();
-    const source = body.source || (agentUserId ? "agent_portal" : null) || (employeeUserId && leadKind === "agent" ? "employee_agent_lead" : null) || (employeeUserId ? "employee_portal" : null) || "eligibility";
+    const source = body.source || (agentUserId ? "agent_portal" : null) || (employeeUserId && leadKind === "agent" ? "employee_agent_lead" : null) || (employeeUserId ? "employee_portal" : null) || "direct";
     let callConsentVerified = false;
     if (employeeUserId || agentUserId) {
       const { assertCallConsentToken } = await import("../lib/callConsentOtp.js");
@@ -256,6 +262,13 @@ leadsRouter.post("/", async (req, res, next) => {
       });
     }
     await applyAgentCodeToLead(pool, row?.id, body);
+    if (!agentUserId && !employeeUserId && !normalizeAgentCode(body.sourcedAgentCode || body.agentCode) && row?.id) {
+      await pool.execute(
+        `UPDATE marketing_leads SET sourced_agent_code = NULL WHERE id = :id`,
+        { id: row.id }
+      ).catch(() => {
+      });
+    }
     let assigneeId = body.assignedTo || body.assigned_to || null;
     let stampAgentCode = normalizeAgentCode(
       body.sourcedAgentCode || body.sourced_agent_code || body.agentCode
@@ -286,28 +299,38 @@ leadsRouter.post("/", async (req, res, next) => {
     }
     if (row?.id && (assigneeId || stampAgentCode)) {
       try {
-        await pool.execute(
-          `UPDATE marketing_leads
-           SET assigned_to = COALESCE(:assignee, assigned_to),
-               status = CASE WHEN :assignee IS NOT NULL THEN 'assigned' ELSE status END,
-               sourced_agent_code = COALESCE(:code, sourced_agent_code),
-               source = COALESCE(NULLIF(TRIM(source), ''), :source),
-               assignment_method = CASE
-                 WHEN :assignee IS NOT NULL THEN COALESCE(assignment_method, 'manual')
-                 ELSE assignment_method
-               END,
-               updated_at = NOW()
-           WHERE id = :id`,
-          {
-            id: row.id,
-            assignee: assigneeId || null,
-            code: stampAgentCode || null,
-            source
-          }
-        );
         if (assigneeId) {
+          await pool.execute(
+            `UPDATE marketing_leads
+             SET assigned_to = CAST(:assignee AS CHAR(36)),
+                 status = 'assigned',
+                 sourced_agent_code = COALESCE(CAST(:code AS TEXT), sourced_agent_code),
+                 source = COALESCE(NULLIF(TRIM(source), ''), CAST(:source AS TEXT)),
+                 assignment_method = COALESCE(assignment_method, 'manual'),
+                 updated_at = NOW()
+             WHERE id = CAST(:id AS CHAR(36))`,
+            {
+              id: row.id,
+              assignee: assigneeId,
+              code: stampAgentCode || null,
+              source
+            }
+          );
           await ensureLeadTatClock(pool, row.id).catch(() => {
           });
+        } else {
+          await pool.execute(
+            `UPDATE marketing_leads
+             SET sourced_agent_code = COALESCE(CAST(:code AS TEXT), sourced_agent_code),
+                 source = COALESCE(NULLIF(TRIM(source), ''), CAST(:source AS TEXT)),
+                 updated_at = NOW()
+             WHERE id = CAST(:id AS CHAR(36))`,
+            {
+              id: row.id,
+              code: stampAgentCode,
+              source
+            }
+          );
         }
       } catch {
       }
@@ -388,10 +411,11 @@ leadsRouter.get("/assignment-settings", authenticate, async (req, res, next) => 
     }
     res.json({ ...settings, leadScope });
   } catch (err) {
+    console.error("[leads:assignment-settings:get]", err?.message || err);
     next(err);
   }
 });
-leadsRouter.put("/assignment-settings", authenticate, async (req, res, next) => {
+async function handleSaveAssignmentSettings(req, res, next) {
   try {
     if (!canManageLeads(req.auth.role)) {
       const e = new Error("Insufficient permissions");
@@ -409,11 +433,26 @@ leadsRouter.put("/assignment-settings", authenticate, async (req, res, next) => 
       notifyEmailEnabled: req.body?.notifyEmailEnabled ?? req.body?.notify_email_enabled,
       notifyWhatsappEnabled: req.body?.notifyWhatsappEnabled ?? req.body?.notify_whatsapp_enabled
     });
+    await processTatMissReassignments(pool, { limit: 25 }).catch((err) => {
+      console.warn("[leads:assignment-settings:tat-reassign]", err?.message || err);
+      return null;
+    });
+    await assignUnassignedLeadsBacklog(pool, { limit: 50 }).catch((err) => {
+      console.warn("[leads:assignment-settings:backlog]", err?.message || err);
+      return null;
+    });
     res.json(settings);
   } catch (err) {
+    console.error("[leads:assignment-settings:save]", err?.message || err);
+    if (!err.status) {
+      err.status = 500;
+      err.message = err.message || "Could not save TAT settings. Check database connectivity and migrations.";
+    }
     next(err);
   }
-});
+}
+leadsRouter.put("/assignment-settings", authenticate, handleSaveAssignmentSettings);
+leadsRouter.post("/assignment-settings", authenticate, handleSaveAssignmentSettings);
 leadsRouter.get("/red-zone", authenticate, async (req, res, next) => {
   try {
     if (!canReadLeads(req.auth.role)) {
@@ -603,21 +642,69 @@ leadsRouter.post("/start-verification", async (req, res, next) => {
     const pool = getPool();
     const attached = await attachAuthenticatedAgentCode(req, pool, body);
     body = attached.body;
+    if (!attached.agentUserId && !attached.employeeUserId) {
+      const { sanitizeGuestLeadAttribution } = await import("../lib/agentAttribution.js");
+      body = sanitizeGuestLeadAttribution(body);
+    }
     const fullName = body.fullName || body.full_name || "";
     const sessionKey = body.sessionKey || body.session_key || null;
     const phone = String(body.phone).replace(/\D/g, "").slice(-10);
-    const email = body.email.trim().toLowerCase();
+    const { eligibilityPlaceholderEmail } = await import("../lib/marketingLeads.js");
+    const email = String(body.email || "").trim().toLowerCase() || eligibilityPlaceholderEmail(phone);
     const { row } = await upsertMarketingLead(pool, {
       fullName,
       email,
       phone,
       loanType: body.loanType || body.loan_type || null,
-      source: body.source || "eligibility",
+      source: body.source || "direct",
       consentAccepted: Boolean(body.consentAccepted || body.consent_accepted),
       sessionKey,
-      status: "new"
+      status: "pending_otp"
     });
-    await applyAgentCodeToLead(pool, row?.id, body);
+    if (body.sourcedAgentCode || body.referralCode || body.referral_code) {
+      await applyAgentCodeToLead(pool, row?.id, body);
+    } else if (row?.id) {
+      await pool.execute(
+        `UPDATE marketing_leads SET sourced_agent_code = NULL WHERE id = :id`,
+        { id: row.id }
+      ).catch(() => {
+      });
+    }
+    const eligibilityDraft = body.eligibilityData || body.eligibility_data || null;
+    if (row?.id && (eligibilityDraft || body.loanAmount || body.panNumber || body.gender)) {
+      const draft = {
+        ...typeof eligibilityDraft === "object" && eligibilityDraft ? eligibilityDraft : {},
+        journeyStage: "pending_otp",
+        consentAcceptedAt: eligibilityDraft && eligibilityDraft.consentAcceptedAt || (/* @__PURE__ */ new Date()).toISOString()
+      };
+      await pool.execute(
+        `UPDATE marketing_leads SET
+           status = 'pending_otp',
+           eligibility_data = :data::jsonb,
+           loan_amount = COALESCE(:loan_amount, loan_amount),
+           employment_type = COALESCE(:employment_type, employment_type),
+           updated_at = NOW()
+         WHERE id = :id`,
+        {
+          id: row.id,
+          data: JSON.stringify(draft),
+          loan_amount: body.loanAmount != null || body.loan_amount != null ? Number(body.loanAmount ?? body.loan_amount) : null,
+          employment_type: body.employmentType || body.employment_type || null
+        }
+      ).catch(async () => {
+        await pool.execute(
+          `UPDATE marketing_leads SET status = 'pending_otp', updated_at = NOW() WHERE id = :id`,
+          { id: row.id }
+        ).catch(() => {
+        });
+      });
+    } else if (row?.id) {
+      await pool.execute(
+        `UPDATE marketing_leads SET status = 'pending_otp', updated_at = NOW() WHERE id = :id`,
+        { id: row.id }
+      ).catch(() => {
+      });
+    }
     const settings = await getOtpProviderSettings();
     let otpResult;
     try {
@@ -682,21 +769,40 @@ leadsRouter.post("/request-otp", async (req, res, next) => {
   try {
     const { phone, email, leadId } = z.object({
       phone: z.string().min(10),
-      email: z.string().email(),
+      email: z.union([z.string().email(), z.literal("")]).optional(),
       leadId: z.string().optional()
     }).parse(req.body);
     const pool = getPool();
     const settings = await getOtpProviderSettings();
+    const { eligibilityPlaceholderEmail } = await import("../lib/marketingLeads.js");
+    const normalizedPhone = String(phone).replace(/\D/g, "").slice(-10);
+    const resolvedEmail = String(email || "").trim().toLowerCase() || eligibilityPlaceholderEmail(normalizedPhone);
+    const [[recent]] = await pool.execute(
+      `SELECT COUNT(*)::int AS cnt FROM lead_otps
+       WHERE ${sqlParamEquals("phone", "phone")}
+         AND ${sqlLiteralEquals("purpose", "lead_verify")}
+         AND ${sqlLiteralEquals("channel", "sms")}
+         AND created_at > NOW() - INTERVAL '60 minutes'`,
+      { phone: normalizedPhone }
+    ).catch(() => [[{ cnt: 0 }]]);
+    if (Number(recent?.cnt || 0) >= 5) {
+      return res.status(429).json({
+        error: "Maximum OTP resend attempts reached. Please try again later."
+      });
+    }
     let resolvedLeadId = leadId || null;
     if (!resolvedLeadId) {
-      const existing = await findMarketingLeadByContact(pool, { email, phone });
+      const existing = await findMarketingLeadByContact(pool, {
+        email: resolvedEmail,
+        phone: normalizedPhone
+      });
       resolvedLeadId = existing?.id || null;
     }
     let otpResult;
     try {
       otpResult = await sendDualChannelOtp({
-        phone,
-        email,
+        phone: normalizedPhone,
+        email: resolvedEmail,
         settings,
         publicFacing: true
       });
@@ -707,12 +813,30 @@ leadsRouter.post("/request-otp", async (req, res, next) => {
     const deliverySettings = effectiveOtpSettings(settings, otpResult);
     const otpIds = await persistLeadOtps(pool, {
       leadId: resolvedLeadId,
-      email,
-      phone,
+      email: resolvedEmail,
+      phone: normalizedPhone,
       settings: deliverySettings,
       mobileOtp: otpResult.mobileOtp,
       emailOtp: otpResult.emailOtp
     });
+    if (resolvedLeadId) {
+      try {
+        const [[leadRow]] = await pool.execute(
+          `SELECT eligibility_data FROM marketing_leads WHERE id = :id LIMIT 1`,
+          { id: resolvedLeadId }
+        );
+        const prev = typeof leadRow?.eligibility_data === "object" ? leadRow.eligibility_data : leadRow?.eligibility_data ? JSON.parse(leadRow.eligibility_data) : {};
+        const next2 = {
+          ...prev || {},
+          otpMeta: { ...prev?.otpMeta || {}, failCount: 0 }
+        };
+        await pool.execute(
+          `UPDATE marketing_leads SET eligibility_data = :data::jsonb, status = COALESCE(status, 'pending_otp') WHERE id = :id`,
+          { id: resolvedLeadId, data: JSON.stringify(next2) }
+        );
+      } catch {
+      }
+    }
     res.json(
       formatOtpSendResponse({
         settings,
@@ -731,67 +855,115 @@ leadsRouter.post("/verify-otp", async (req, res, next) => {
   try {
     const body = z.object({
       phone: z.string().min(10),
-      email: z.string().email(),
+      email: z.union([z.string().email(), z.literal("")]).optional(),
       mobileOtp: z.string().length(6).optional(),
       emailOtp: z.string().length(6).optional(),
       otp: z.string().length(6).optional(),
       leadId: z.string().optional()
     }).parse(req.body);
-    const settings = await getOtpProviderSettings();
-    const mobileCode = body.mobileOtp || (settings.requireEmailOtp === false ? body.otp : void 0);
-    const emailCode = body.emailOtp || (settings.requireMobileOtp === false ? body.otp : void 0);
-    if (settings.requireMobileOtp && !mobileCode) {
-      return res.status(400).json({ error: "Mobile OTP is required." });
-    }
-    if (settings.requireEmailOtp && !emailCode) {
-      return res.status(400).json({ error: "Email OTP is required." });
-    }
     const pool = getPool();
-    let smsRow = null;
-    let emailRow = null;
     const phone = normalizeLeadPhone(body.phone);
-    const email = body.email.trim().toLowerCase();
-    const devTestOtp = process.env.LOG_OTP === "true" && (!settings.requireMobileOtp || mobileCode === "123456") && (!settings.requireEmailOtp || emailCode === "123456");
-    if (settings.requireMobileOtp && mobileCode) {
-      const [[row]] = await pool.execute(
-        devTestOtp ? `SELECT id, lead_id FROM lead_otps
-             WHERE ${sqlParamEquals("phone", "phone")}
-               AND ${sqlLiteralEquals("purpose", "lead_verify")}
-               AND ${sqlLiteralEquals("channel", "sms")}
-               AND verified_at IS NULL AND expires_at > NOW()
-             ORDER BY created_at DESC LIMIT 1` : `SELECT id, lead_id FROM lead_otps
-             WHERE ${sqlParamEquals("phone", "phone")}
-               AND ${sqlParamEquals("otp_hash", "hash")}
-               AND ${sqlLiteralEquals("purpose", "lead_verify")}
-               AND ${sqlLiteralEquals("channel", "sms")}
-               AND verified_at IS NULL AND expires_at > NOW()
-             ORDER BY created_at DESC LIMIT 1`,
-        devTestOtp ? { phone } : { phone, hash: hashOtp(mobileCode) }
-      );
-      smsRow = row;
-      if (!smsRow) {
-        return res.status(401).json({ error: "Invalid or expired mobile OTP." });
+    const { eligibilityPlaceholderEmail } = await import("../lib/marketingLeads.js");
+    const email = String(body.email || "").trim().toLowerCase() || eligibilityPlaceholderEmail(phone);
+    const MAX_VERIFY_ATTEMPTS = 5;
+    if (body.leadId) {
+      try {
+        const [[leadRow]] = await pool.execute(
+          `SELECT eligibility_data FROM marketing_leads WHERE id = :id LIMIT 1`,
+          { id: body.leadId }
+        );
+        const prev = typeof leadRow?.eligibility_data === "object" ? leadRow.eligibility_data : leadRow?.eligibility_data ? JSON.parse(leadRow.eligibility_data) : {};
+        if (Number(prev?.otpMeta?.failCount || 0) >= MAX_VERIFY_ATTEMPTS) {
+          return res.status(429).json({
+            error: "Too many incorrect OTP attempts. Please request a new OTP."
+          });
+        }
+      } catch {
       }
     }
-    if (settings.requireEmailOtp && emailCode) {
-      const [[row]] = await pool.execute(
-        devTestOtp ? `SELECT id, lead_id FROM lead_otps
-             WHERE ${sqlParamEquals("email", "email")}
-               AND ${sqlLiteralEquals("purpose", "lead_verify")}
-               AND ${sqlLiteralEquals("channel", "email")}
-               AND verified_at IS NULL AND expires_at > NOW()
-             ORDER BY created_at DESC LIMIT 1` : `SELECT id, lead_id FROM lead_otps
-             WHERE ${sqlParamEquals("email", "email")}
-               AND ${sqlParamEquals("otp_hash", "hash")}
-               AND ${sqlLiteralEquals("purpose", "lead_verify")}
-               AND ${sqlLiteralEquals("channel", "email")}
-               AND verified_at IS NULL AND expires_at > NOW()
-             ORDER BY created_at DESC LIMIT 1`,
-        devTestOtp ? { email } : { email, hash: hashOtp(emailCode) }
-      );
-      emailRow = row;
-      if (!emailRow) {
-        return res.status(401).json({ error: "Invalid or expired email OTP." });
+    const [[pendingSms]] = await pool.execute(
+      `SELECT id, lead_id, otp_hash FROM lead_otps
+       WHERE ${sqlParamEquals("phone", "phone")}
+         AND ${sqlLiteralEquals("purpose", "lead_verify")}
+         AND ${sqlLiteralEquals("channel", "sms")}
+         AND verified_at IS NULL AND expires_at > NOW()
+       ORDER BY created_at DESC LIMIT 1`,
+      { phone }
+    );
+    const [[expiredSms]] = !pendingSms ? await pool.execute(
+      `SELECT id FROM lead_otps
+           WHERE ${sqlParamEquals("phone", "phone")}
+             AND ${sqlLiteralEquals("purpose", "lead_verify")}
+             AND ${sqlLiteralEquals("channel", "sms")}
+             AND verified_at IS NULL AND expires_at <= NOW()
+           ORDER BY created_at DESC LIMIT 1`,
+      { phone }
+    ) : [[null]];
+    const skipEmail = isSyntheticLeadEmail(email);
+    const [[pendingEmail]] = skipEmail ? [[null]] : await pool.execute(
+      `SELECT id, lead_id, otp_hash FROM lead_otps
+           WHERE ${sqlParamEquals("email", "email")}
+             AND ${sqlLiteralEquals("purpose", "lead_verify")}
+             AND ${sqlLiteralEquals("channel", "email")}
+             AND verified_at IS NULL AND expires_at > NOW()
+           ORDER BY created_at DESC LIMIT 1`,
+      { email }
+    );
+    const needMobile = Boolean(pendingSms);
+    const needEmail = Boolean(pendingEmail);
+    if (!needMobile && !needEmail) {
+      return res.status(401).json({
+        error: expiredSms ? "OTP has expired. Please request a new OTP." : "OTP has expired. Please request a new OTP."
+      });
+    }
+    const mobileCode = body.mobileOtp || body.otp || (needMobile && !needEmail ? body.otp : void 0);
+    const emailCode = body.emailOtp || (needEmail && !needMobile ? body.otp : void 0);
+    if (needMobile && !mobileCode) {
+      return res.status(400).json({ error: "Mobile OTP is required." });
+    }
+    if (needEmail && !emailCode) {
+      return res.status(400).json({ error: "Email OTP is required." });
+    }
+    const devTestOtp = process.env.LOG_OTP === "true" && (!needMobile || mobileCode === "123456") && (!needEmail || emailCode === "123456");
+    let smsRow = null;
+    let emailRow = null;
+    const bumpFail = async () => {
+      if (!body.leadId) return;
+      try {
+        const [[leadRow]] = await pool.execute(
+          `SELECT eligibility_data FROM marketing_leads WHERE id = :id LIMIT 1`,
+          { id: body.leadId }
+        );
+        const prev = typeof leadRow?.eligibility_data === "object" ? leadRow.eligibility_data : leadRow?.eligibility_data ? JSON.parse(leadRow.eligibility_data) : {};
+        const next2 = {
+          ...prev || {},
+          otpMeta: {
+            ...prev?.otpMeta || {},
+            failCount: Number(prev?.otpMeta?.failCount || 0) + 1,
+            lastFailAt: (/* @__PURE__ */ new Date()).toISOString()
+          }
+        };
+        await pool.execute(
+          `UPDATE marketing_leads SET eligibility_data = :data::jsonb WHERE id = :id`,
+          { id: body.leadId, data: JSON.stringify(next2) }
+        );
+      } catch {
+      }
+    };
+    if (needMobile) {
+      if (devTestOtp || pendingSms.otp_hash === hashOtp(mobileCode)) {
+        smsRow = pendingSms;
+      } else {
+        await bumpFail();
+        return res.status(401).json({ error: "Invalid OTP. Please enter the correct OTP." });
+      }
+    }
+    if (needEmail) {
+      if (devTestOtp || pendingEmail.otp_hash === hashOtp(emailCode)) {
+        emailRow = pendingEmail;
+      } else {
+        await bumpFail();
+        return res.status(401).json({ error: "Invalid OTP. Please enter the correct OTP." });
       }
     }
     const idsToMark = [smsRow?.id, emailRow?.id].filter(Boolean);
@@ -803,10 +975,36 @@ leadsRouter.post("/verify-otp", async (req, res, next) => {
       phone
     }))?.id;
     if (targetLeadId) {
-      await pool.execute(
-        `UPDATE marketing_leads SET consent_verified_at = NOW(), status = 'verified' WHERE id = :id`,
-        { id: targetLeadId }
-      );
+      try {
+        const [[leadRow]] = await pool.execute(
+          `SELECT eligibility_data FROM marketing_leads WHERE id = :id LIMIT 1`,
+          { id: targetLeadId }
+        );
+        const prev = typeof leadRow?.eligibility_data === "object" ? leadRow.eligibility_data : leadRow?.eligibility_data ? JSON.parse(leadRow.eligibility_data) : {};
+        const next2 = {
+          ...prev || {},
+          journeyStage: "otp_verified",
+          mobileVerified: true,
+          mobileVerifiedAt: (/* @__PURE__ */ new Date()).toISOString(),
+          consentVerifiedAt: (/* @__PURE__ */ new Date()).toISOString(),
+          otpMeta: { ...prev?.otpMeta || {}, failCount: 0 }
+        };
+        await pool.execute(
+          `UPDATE marketing_leads SET
+             consent_accepted = TRUE,
+             consent_verified_at = NOW(),
+             status = 'verified',
+             eligibility_data = :data::jsonb,
+             updated_at = NOW()
+           WHERE id = :id`,
+          { id: targetLeadId, data: JSON.stringify(next2) }
+        );
+      } catch {
+        await pool.execute(
+          `UPDATE marketing_leads SET consent_verified_at = NOW(), status = 'verified' WHERE id = :id`,
+          { id: targetLeadId }
+        );
+      }
       const [[row]] = await pool.execute(`SELECT * FROM marketing_leads WHERE id = :id`, {
         id: targetLeadId
       });
@@ -1140,7 +1338,7 @@ leadsRouter.get("/", authenticate, async (req, res, next) => {
     const params = {};
     if (assignedFilter === "me") {
       if (role === "employee" || role === "agent") {
-        where.push("ml.assigned_to = :userId");
+        where.push("ml.assigned_to = CAST(:userId AS CHAR(36))");
         params.userId = req.auth.userId;
       } else if (role !== "admin" && role !== "super_admin") {
         const e = new Error("assignedTo=me is only for employees and agents");
@@ -1150,13 +1348,13 @@ leadsRouter.get("/", authenticate, async (req, res, next) => {
     } else if (assignedFilter === "team" && role === "employee") {
       const scope = await resolveEmployeeLeadScope(pool, req.auth.userId);
       if (scope.scope !== "team") {
-        where.push("ml.assigned_to = :userId");
+        where.push("ml.assigned_to = CAST(:userId AS CHAR(36))");
         params.userId = req.auth.userId;
       }
     } else if (!assignedFilter && role === "employee") {
       const scope = await resolveEmployeeLeadScope(pool, req.auth.userId);
       if (scope.scope === "assigned") {
-        where.push("ml.assigned_to = :userId");
+        where.push("ml.assigned_to = CAST(:userId AS CHAR(36))");
         params.userId = req.auth.userId;
       }
     }
@@ -1165,7 +1363,7 @@ leadsRouter.get("/", authenticate, async (req, res, next) => {
         return res.status(400).json({ error: "month must be in YYYY-MM format" });
       }
       where.push(
-        `to_char(GREATEST(ml.created_at, ml.updated_at) AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM') = :monthFilter`
+        `to_char(GREATEST(ml.created_at, ml.updated_at) AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM') = CAST(:monthFilter AS TEXT)`
       );
       params.monthFilter = monthFilter;
     }
@@ -1281,7 +1479,7 @@ leadsRouter.patch("/:id/assign", authenticate, async (req, res, next) => {
         `SELECT up.id, up.role, ao.agent_code
          FROM user_profiles up
          LEFT JOIN agent_onboarding ao ON ao.user_id = up.id
-         WHERE up.id = :id
+         WHERE up.id = CAST(:id AS CHAR(36))
          LIMIT 1`,
         { id: assigneeId }
       );
@@ -1295,21 +1493,32 @@ leadsRouter.patch("/:id/assign", authenticate, async (req, res, next) => {
     if (assigneeId && sourcedAgentCode) {
       await pool.execute(
         `UPDATE marketing_leads
-         SET assigned_to = :assignee,
+         SET assigned_to = CAST(:assignee AS CHAR(36)),
              status = 'assigned',
-             sourced_agent_code = :code,
-             assignment_method = 'manual'
-         WHERE id = :id`,
+             sourced_agent_code = CAST(:code AS TEXT),
+             assignment_method = 'manual',
+             updated_at = NOW()
+         WHERE id = CAST(:id AS CHAR(36))`,
         { id: req.params.id, assignee: assigneeId, code: sourcedAgentCode }
+      );
+    } else if (assigneeId) {
+      await pool.execute(
+        `UPDATE marketing_leads
+         SET assigned_to = CAST(:assignee AS CHAR(36)),
+             status = 'assigned',
+             assignment_method = 'manual',
+             updated_at = NOW()
+         WHERE id = CAST(:id AS CHAR(36))`,
+        { id: req.params.id, assignee: assigneeId }
       );
     } else {
       await pool.execute(
         `UPDATE marketing_leads
-         SET assigned_to = :assignee,
-             status = CASE WHEN :assignee IS NULL THEN status ELSE 'assigned' END,
-             assignment_method = CASE WHEN :assignee IS NULL THEN assignment_method ELSE 'manual' END
-         WHERE id = :id`,
-        { id: req.params.id, assignee: assigneeId }
+         SET assigned_to = NULL,
+             assignment_method = NULL,
+             updated_at = NOW()
+         WHERE id = CAST(:id AS CHAR(36))`,
+        { id: req.params.id }
       );
     }
     if (assigneeId) {
@@ -1329,14 +1538,36 @@ leadsRouter.patch("/:id/assign", authenticate, async (req, res, next) => {
       `SELECT ml.*,
               up.full_name AS assignee_name,
               up.role AS assignee_role,
-              COALESCE(ao.agent_code, eo.employee_code) AS assignee_code
+              COALESCE(ao.agent_code, eo.employee_code) AS assignee_code,
+              NULLIF(TRIM(COALESCE(eo.email, up.email, '')), '') AS assignee_email,
+              up.phone AS assignee_phone,
+              eo.lead_level AS assignee_lead_level
        FROM marketing_leads ml
        LEFT JOIN user_profiles up ON up.id = ml.assigned_to
        LEFT JOIN agent_onboarding ao ON ao.user_id = up.id AND up.role = 'agent'
        LEFT JOIN employee_onboarding eo ON eo.user_id = up.id AND up.role = 'employee'
-       WHERE ml.id = :id`,
+       WHERE ml.id = CAST(:id AS CHAR(36))`,
       { id: req.params.id }
     );
+    if (assigneeId && row) {
+      const settings = await getLeadAssignmentSettings(pool).catch(() => null);
+      const tatMinutes = settings?.firstContactTatMinutes || 20;
+      await notifyLeadStakeholders(pool, {
+        lead: row,
+        assignee: {
+          id: assigneeId,
+          full_name: row.assignee_name,
+          email: row.assignee_email,
+          phone: row.assignee_phone,
+          lead_level: row.assignee_lead_level || 1
+        },
+        eventType: "lead_assigned",
+        title: "New lead assigned",
+        message: `Lead ${row.full_name || req.params.id} (${row.phone || "no phone"}) assigned to you. First contact within ${tatMinutes} minutes.`
+      }).catch((err) => {
+        console.warn("[leads:assign:notify]", err?.message || err);
+      });
+    }
     res.json(formatLead(row));
   } catch (err) {
     next(err);

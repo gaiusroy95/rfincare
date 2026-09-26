@@ -132,14 +132,56 @@ adminIntegrationsRouter.post(
         }
       })() : app.data || {};
       const attachments = [];
-      const packagePath = data.application_package_pdf;
+      let packagePath = data.application_package_pdf;
+      if (!packagePath) {
+        try {
+          const { buildBankLoanApplicationFormPdf } = await import("../lib/bankLoanApplicationFormPdf.js");
+          const { getUploadDir } = await import("../lib/uploadPaths.js");
+          const { mkdirSync, writeFileSync } = await import("node:fs");
+          const { resolve } = await import("node:path");
+          const [documents] = await pool.execute(
+            `SELECT document_type, document_name, mime_type, created_at
+             FROM customer_documents WHERE application_id = :id ORDER BY created_at ASC`,
+            { id: app.id }
+          ).catch(() => [[]]);
+          const [consents] = await pool.execute(
+            `SELECT consent_type, is_granted, granted_at
+             FROM application_consents WHERE application_id = :id ORDER BY granted_at ASC`,
+            { id: app.id }
+          ).catch(() => [[]]);
+          const pdfBuffer = await buildBankLoanApplicationFormPdf({
+            row: app,
+            data,
+            documents: documents || [],
+            consents: consents || []
+          });
+          const packageDir = resolve(getUploadDir(), "application-packages");
+          mkdirSync(packageDir, { recursive: true });
+          const safeNumber = String(app.application_number || app.id).replace(/[^\w-]/g, "_");
+          const fileName = `${safeNumber}.pdf`;
+          writeFileSync(resolve(packageDir, fileName), pdfBuffer);
+          packagePath = `/uploads/application-packages/${fileName}`;
+          const merged = {
+            ...data,
+            application_package_pdf: packagePath,
+            application_package_generated_at: (/* @__PURE__ */ new Date()).toISOString(),
+            application_package_format: "bank_loan_application_form_v2_official_template"
+          };
+          await pool.execute(`UPDATE loan_applications SET data = :data WHERE id = :id`, {
+            id: app.id,
+            data: JSON.stringify(merged)
+          });
+        } catch (regenErr) {
+          console.warn("[share-to-bank] PDF regenerate failed:", regenErr.message);
+        }
+      }
       if (packagePath) {
         try {
           const rel = String(packagePath).replace(/^\/uploads\//, "");
           const full = resolveUploadFilePath(rel);
           const content = await readFile(full);
           attachments.push({
-            filename: `${app.application_number || app.id.slice(0, 8)}-application-pack.pdf`,
+            filename: `${app.application_number || app.id.slice(0, 8)}-Rfincare_Bank_Loan_Application_Form.pdf`,
             content
           });
         } catch {

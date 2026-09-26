@@ -72,10 +72,29 @@ function createUploadMiddleware({
     };
   }
   const disk = multer({ storage: diskStorageFor(subfolder), ...options });
+  const attachLocalStoredPath = (req, _res, next) => {
+    const files = [];
+    if (req.file) files.push(req.file);
+    if (Array.isArray(req.files)) files.push(...req.files);
+    else if (req.files && typeof req.files === "object") {
+      for (const group of Object.values(req.files)) {
+        if (Array.isArray(group)) files.push(...group);
+      }
+    }
+    for (const file of files) {
+      if (!file) continue;
+      const key = file.filename || null;
+      if (key) {
+        file.storageKey = key;
+        file.storedPath = `/uploads/${String(key).replace(/^\/uploads\//, "")}`;
+      }
+    }
+    next();
+  };
   return {
-    single: (field) => disk.single(field),
-    array: (field, maxCount) => disk.array(field, maxCount),
-    fields: (fields) => disk.fields(fields)
+    single: (field) => [disk.single(field), attachLocalStoredPath],
+    array: (field, maxCount) => [disk.array(field, maxCount), attachLocalStoredPath],
+    fields: (fields) => [disk.fields(fields), attachLocalStoredPath]
   };
 }
 function spreadUpload(uploadFactory, method, ...args) {

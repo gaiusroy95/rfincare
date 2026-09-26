@@ -27,6 +27,10 @@ import { entriesToObject, readEnvFile } from '../lib/envFile.js';
 import { getPlatformArchitecture } from '../lib/architecture.js';
 import { pullCibilForGuest } from '../lib/cibilService.js';
 import { upsertMarketingLead } from '../lib/marketingLeads.js';
+import {
+  HOMEPAGE_CIBIL_CONSENT_WORDING,
+  insertConsentEvidence,
+} from '../lib/consentEvidence.js';
 import { getMarketOverview } from '../lib/marketQuotes.js';
 
 export const publicContentRouter = Router();
@@ -267,6 +271,60 @@ publicContentRouter.post('/success-stories', storyPhotoUpload.single('photo'), a
   }
 });
 
+publicContentRouter.post('/cibil/contact/request-otp', async (req, res, next) => {
+  try {
+    const body = z
+      .object({
+        phone: z.string().min(10),
+        mobile: z.string().min(10).optional(),
+        email: z.string().email(),
+      })
+      .parse(req.body);
+    const { requestHomepageCibilContactOtp } = await import('../lib/cibilConsentOtp.js');
+    const result = await requestHomepageCibilContactOtp({
+      phone: body.phone || body.mobile,
+      email: body.email,
+    });
+    res.json({
+      sent: result.sent,
+      phone: result.phone,
+      email: result.email,
+      expiresInSeconds: result.expiresInSeconds,
+      requireMobileOtp: result.requireMobileOtp,
+      requireEmailOtp: result.requireEmailOtp,
+      consentLink: result.consentLink,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+publicContentRouter.post('/cibil/contact/verify-otp', async (req, res, next) => {
+  try {
+    const body = z
+      .object({
+        phone: z.string().min(10),
+        mobile: z.string().min(10).optional(),
+        email: z.string().email(),
+        mobileOtp: z.string().min(4).max(8).optional(),
+        emailOtp: z.string().min(4).max(8).optional(),
+        otp: z.string().min(4).max(8).optional(),
+      })
+      .parse(req.body);
+    const { verifyHomepageCibilContactOtp } = await import('../lib/cibilConsentOtp.js');
+    const result = await verifyHomepageCibilContactOtp({
+      phone: body.phone || body.mobile,
+      email: body.email,
+      mobileOtp: body.mobileOtp,
+      emailOtp: body.emailOtp,
+      otp: body.otp,
+    });
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
 publicContentRouter.post('/cibil/check', async (req, res, next) => {
   try {
     const CibilGuestSchema = z.object({
@@ -279,32 +337,84 @@ publicContentRouter.post('/cibil/check', async (req, res, next) => {
       pincode: z.string().regex(/^\d{6}$/, 'Enter a valid 6-digit pincode'),
       gender: z.enum(['male', 'female', 'other']).optional(),
       consentAccepted: z.literal(true, { errorMap: () => ({ message: 'Consent is required' }) }),
+      consentToken: z.string().min(16, 'Contact OTP verification is required'),
+      otpId: z.string().min(1).optional().nullable(),
+      emailOtpId: z.string().min(1).optional().nullable(),
     });
 
     const input = CibilGuestSchema.parse(req.body);
     const phone = String(input.phone).replace(/\D/g, '').slice(-10);
+    const email = input.email.trim().toLowerCase();
+
+    if (!input.otpId) {
+      const e = new Error('Mobile OTP verification is required before fetching your CIBIL score');
+      e.status = 400;
+      throw e;
+    }
+
+    const { assertHomepageCibilContactToken } = await import('../lib/cibilConsentOtp.js');
+    const verification = await assertHomepageCibilContactToken({
+      phone,
+      email,
+      consentToken: input.consentToken,
+      otpId: input.otpId,
+      emailOtpId: input.emailOtpId || null,
+    });
 
     const result = await pullCibilForGuest(
       {
         fullName: input.fullName.trim(),
-        email: input.email.trim().toLowerCase(),
+        email,
         phone,
         dateOfBirth: input.dateOfBirth,
         panNumber: input.panNumber.toUpperCase(),
         city: input.city.trim(),
         pincode: input.pincode,
         gender: input.gender || null,
+        contactVerification: {
+          phoneVerified: true,
+          emailVerified: Boolean(verification.emailVerified || input.emailOtpId),
+          marketingConsent: true,
+          consentAcceptedAt: new Date().toISOString(),
+          source: 'homepage_cibil',
+          consentWording: HOMEPAGE_CIBIL_CONSENT_WORDING,
+        },
       },
       {
-        upsertLead: (pool) =>
-          upsertMarketingLead(pool, {
+        upsertLead: async (pool) => {
+          const lead = await upsertMarketingLead(pool, {
             fullName: input.fullName.trim(),
-            email: input.email.trim(),
+            email,
             phone,
             source: 'homepage_cibil',
             consentAccepted: true,
             status: 'verified',
-          }),
+          });
+          const leadId = lead?.row?.id || null;
+          // TRAI evidence: store after OTP verify even if bureau pull later fails.
+          if (leadId) {
+            await insertConsentEvidence(
+              {
+                phone,
+                leadId,
+                relationship: `lead:${leadId}`,
+                relationshipDate: new Date(),
+                consentWording: HOMEPAGE_CIBIL_CONSENT_WORDING,
+                ipAddress: req.ip || req.headers['x-forwarded-for'] || null,
+                userAgent: req.headers['user-agent'] || null,
+                metadata: {
+                  otpId: input.otpId,
+                  emailOtpId: input.emailOtpId || null,
+                  emailVerified: Boolean(verification.emailVerified || input.emailOtpId),
+                },
+              },
+              pool,
+            ).catch((err) => {
+              console.warn('[cibil/check] consent_evidence insert failed:', err?.message || err);
+            });
+          }
+          return lead;
+        },
       },
     );
 
@@ -363,7 +473,7 @@ publicContentRouter.post('/eligibility/check', async (req, res, next) => {
       eligibilityPlaceholderEmail,
     } = await import('../lib/marketingLeads.js');
     const { applyReferralToLead, ensureReferralSchema } = await import('../lib/referralTracking.js');
-    const { normalizeAgentCode } = await import('../lib/agentAttribution.js');
+    const { resolvePublicWebsiteAttribution } = await import('../lib/agentAttribution.js');
 
     const engineInput = {
       loanType: input.loanType,
@@ -386,10 +496,9 @@ publicContentRouter.post('/eligibility/check', async (req, res, next) => {
     const status = probability >= 80 ? 'high' : probability >= 60 ? 'medium' : 'low';
     const checkedAt = new Date().toISOString();
 
-    const agentCode = normalizeAgentCode(
-      input.sourcedAgentCode || input.agentCode || input.referralCode,
-    );
-    const source = agentCode ? 'website_agent_referral' : 'website';
+    const attribution = resolvePublicWebsiteAttribution(input);
+    const agentCode = attribution.agentCode;
+    const source = attribution.source;
 
     const eligibilityData = {
       journeyStage: 'eligibility_checked',
@@ -435,23 +544,32 @@ publicContentRouter.post('/eligibility/check', async (req, res, next) => {
       source,
       consentAccepted: true,
       sessionKey: input.sessionKey || null,
-      status: 'new',
+      // Do not downgrade OTP-verified leads back to 'new'.
+      status: null,
       skipAutoAssign: false,
     });
 
     if (row?.id) {
       await ensureReferralSchema(pool).catch(() => {});
-      await applyReferralToLead(pool, row.id, {
-        sourcedAgentCode: agentCode,
-        agentCode,
-        referralCode: input.referralCode,
-        referralProgram: input.referralProgram,
-      }).catch(() => {});
+      if (agentCode || attribution.referralCode) {
+        await applyReferralToLead(pool, row.id, {
+          sourcedAgentCode: agentCode,
+          agentCode,
+          referralCode: attribution.referralCode || input.referralCode,
+          referralProgram: attribution.referralProgram || input.referralProgram,
+        }).catch(() => {});
+      }
 
       if (agentCode) {
         await pool.execute(
           `UPDATE marketing_leads SET sourced_agent_code = COALESCE(:code, sourced_agent_code) WHERE id = :id`,
           { id: row.id, code: agentCode },
+        ).catch(() => {});
+      } else {
+        // Direct website — clear any prior sticky agent code on the same phone/session lead.
+        await pool.execute(
+          `UPDATE marketing_leads SET sourced_agent_code = NULL WHERE id = :id`,
+          { id: row.id },
         ).catch(() => {});
       }
 
@@ -463,12 +581,21 @@ publicContentRouter.post('/eligibility/check', async (req, res, next) => {
            employment_type = :employment_type,
            loan_type = COALESCE(:loan_type, loan_type),
            consent_accepted = TRUE,
+           consent_verified_at = COALESCE(consent_verified_at, NOW()),
+           status = CASE
+             WHEN status IN ('pending_otp', 'new', 'unverified') THEN 'verified'
+             ELSE status
+           END,
            updated_at = NOW()
          WHERE id = :id`,
         {
           id: row.id,
           score: probability,
-          data: JSON.stringify(eligibilityData),
+          data: JSON.stringify({
+            ...eligibilityData,
+            journeyStage: 'eligibility_checked',
+            mobileVerified: true,
+          }),
           loan_amount: input.loanAmount,
           employment_type: input.employmentType,
           loan_type: input.loanType,
@@ -482,12 +609,17 @@ publicContentRouter.post('/eligibility/check', async (req, res, next) => {
              loan_amount = :loan_amount,
              employment_type = :employment_type,
              loan_type = COALESCE(:loan_type, loan_type),
+             status = 'verified',
              updated_at = NOW()
            WHERE id = :id`,
           {
             id: row.id,
             score: probability,
-            data: JSON.stringify(eligibilityData),
+            data: JSON.stringify({
+              ...eligibilityData,
+              journeyStage: 'eligibility_checked',
+              mobileVerified: true,
+            }),
             loan_amount: input.loanAmount,
             employment_type: input.employmentType,
             loan_type: input.loanType,

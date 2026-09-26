@@ -55,6 +55,7 @@ import { portalEmployeeMilestone4Router } from './routes/portalEmployeeMilestone
 import { portalAgentMilestone4Router } from './routes/portalAgentMilestone4.js';
 import { portalEligibilityRouter } from './routes/portalEligibility.js';
 import { partnersRouter } from './routes/partners.js';
+import { agentOnboardingRouter } from './routes/agentOnboarding.js';
 import { creditCardsRouter } from './routes/creditCards.js';
 import { creditCardSavingsRouter } from './routes/creditCardSavings.js';
 import { insuranceProductsRouter } from './routes/insuranceProducts.js';
@@ -155,6 +156,8 @@ export function createApp({ serveStatic = true } = {}) {
   app.use('/document-requirements', documentRequirementsRouter);
   app.use('/partners', partnersRouter);
   app.use('/api/partners', partnersRouter);
+  app.use('/agent-onboarding', agentOnboardingRouter);
+  app.use('/api/agent-onboarding', agentOnboardingRouter);
   app.use('/credit-cards', creditCardsRouter);
   app.use('/api/credit-cards', creditCardsRouter);
   app.use('/public/credit-card-savings', creditCardSavingsRouter);

@@ -11,6 +11,11 @@ import {
   sendMsg91Whatsapp
 } from "./msg91.js";
 import { getOtpProviderSettings } from "./otpProviderSettings.js";
+function isSyntheticLeadEmail(email) {
+  const value = String(email || "").trim().toLowerCase();
+  if (!value) return true;
+  return value.endsWith("@leads.rfincare.local") || value.endsWith("@guest.rfincare.local") || value.endsWith("@rfincare.local");
+}
 function generateOtp() {
   return String(Math.floor(1e5 + Math.random() * 9e5));
 }
@@ -339,12 +344,33 @@ async function sendOtpNotification({
     return { sent: true, channels: [] };
   }
   const results = await Promise.allSettled(tasks);
-  const errMsg = aggregateChannelErrors(results);
-  if (errMsg) {
-    logOtpDeliveryWarnings([errMsg]);
-    const err = new Error(toPublicOtpMessage(errMsg));
-    err.status = results.find((r) => r.reason?.status)?.reason?.status || 502;
-    throw err;
+  const primaryIndexes = labels.map((label, index) => ({ label, index })).filter(({ label }) => label === "sms" || label === "email").map(({ index }) => index);
+  const primarySucceeded = primaryIndexes.some((index) => {
+    const result = results[index];
+    if (result.status !== "fulfilled") return false;
+    const value = result.value;
+    if (value?.delivered === false && value?.sent === false) return false;
+    if (value?.sent === false && value?.provider === "console") {
+      return process.env.LOG_OTP === "true" || process.env.NODE_ENV !== "production";
+    }
+    return value?.sent !== false;
+  });
+  if (primarySucceeded) {
+    results.forEach((result, index) => {
+      if (result.status === "rejected") {
+        logOtpDeliveryWarnings([
+          `${labels[index]} OTP failed (non-blocking): ${result.reason?.message || "send failed"}`
+        ]);
+      }
+    });
+  } else {
+    const errMsg = aggregateChannelErrors(results);
+    if (errMsg) {
+      logOtpDeliveryWarnings([errMsg]);
+      const err = new Error(toPublicOtpMessage(errMsg));
+      err.status = results.find((r) => r.reason?.status)?.reason?.status || 502;
+      throw err;
+    }
   }
   const out = { sent: true, channels: labels };
   results.forEach((r, i) => {
@@ -413,7 +439,7 @@ async function sendDualChannelOtp({
       })
     );
   }
-  if (settings.requireEmailOtp !== false && email) {
+  if (settings.requireEmailOtp !== false && email && !isSyntheticLeadEmail(email)) {
     parallel.push(
       runEmailChannel().then((r) => {
         outcomes.email = r;
@@ -461,7 +487,7 @@ async function sendDualChannelOtp({
     throw err;
   }
   const publicMobileOk = mobileChannelOk;
-  const publicEmailOk = emailDelivered;
+  const publicEmailOk = emailDelivered && !isSyntheticLeadEmail(email);
   return {
     mobileOtp: settings.requireMobileOtp !== false && publicMobileOk ? mobileOtp : null,
     emailOtp: settings.requireEmailOtp !== false && publicEmailOk ? emailOtp : null,
@@ -473,7 +499,8 @@ async function sendDualChannelOtp({
     smsDelivered,
     whatsappDelivered,
     requireMobileOtp: settings.requireMobileOtp !== false && publicMobileOk,
-    requireEmailOtp: settings.requireEmailOtp !== false && publicEmailOk,
+    // Synthetic guest emails never require email OTP for eligibility.
+    requireEmailOtp: settings.requireEmailOtp !== false && publicEmailOk && !isSyntheticLeadEmail(email),
     // Ops-only; public routes must omit this from JSON responses.
     warnings: publicFacing ? [] : warnings,
     delivery: outcomes
@@ -483,6 +510,7 @@ export {
   generateOtp,
   getOtpInfrastructureStatus,
   hashOtp,
+  isSyntheticLeadEmail,
   sendDualChannelOtp,
   sendOtpNotification,
   toPublicOtpMessage

@@ -462,6 +462,16 @@ documentsRouter.post(
       const storedFileName = file.storedPath || (file.filename ? `/uploads/${String(file.filename).replace(/^\/uploads\//, "")}` : null) || basename(file.path || "");
       const filePath = storedFileName;
       const documentUrl = `/documents/${docId}/download`;
+      const { uploadExists } = await import("../lib/uploadPaths.js");
+      const persisted = await uploadExists(filePath, [file.filename, file.path]);
+      if (!persisted) {
+        const e = new Error(
+          "Upload did not persist on the server. Configure durable object storage (STORAGE_PROVIDER=s3) and try again."
+        );
+        e.status = 500;
+        e.code = "UPLOAD_NOT_PERSISTED";
+        throw e;
+      }
       await pool.execute(
         `INSERT INTO customer_documents
          (id, customer_id, application_id, document_type, document_name, file_path, document_url, file_size, mime_type, status, uploaded_by, uploaded_at)
@@ -530,7 +540,10 @@ documentsRouter.get(
       const opened = await streamStoredUpload(doc.file_path, [doc.document_name, doc.document_url]);
       if (!opened?.stream) {
         return res.status(404).json({
-          error: "Document file not found on server. The file may need to be re-uploaded by the customer."
+          error: "Document file not found on server. The upload was lost from ephemeral disk — ask the customer to re-upload. Ops: set STORAGE_PROVIDER=s3 so new uploads are retained.",
+          code: "FILE_MISSING",
+          reuploadRequired: true,
+          documentId: doc.id
         });
       }
       const filename = doc.document_name || normalizeStoredUploadName(doc.file_path) || "document";

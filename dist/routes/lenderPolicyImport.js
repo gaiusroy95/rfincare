@@ -220,6 +220,8 @@ lenderPolicyImportRouter.post(
       const result = await commitImportJob(req.params.id, req.auth.userId);
       res.json({ success: true, result });
     } catch (err) {
+      console.error("[lender-policy-import:commit]", err?.message || err);
+      if (!err.status) err.status = 500;
       next(err);
     }
   }

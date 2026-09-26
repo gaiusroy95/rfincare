@@ -27,6 +27,7 @@ const DEFAULTS = {
     msg91EmailFromEmail: "",
     msg91EmailFromName: "",
     msg91EmailOtpTemplateId: "",
+    msg91EmailTransactionalTemplateId: "",
     msg91EmailOtpVariable: "OTP_CODE",
     otpMessageTemplate: "Your Rfincare verification code is {{otp}}. Valid for 10 minutes."
   }
@@ -83,6 +84,7 @@ function mergeEnvIntoProviderConfig(settings) {
   fill("msg91EmailFromEmail", ["MSG91_EMAIL_FROM_EMAIL", "MSG91_EMAIL_FROM"]);
   fill("msg91EmailFromName", ["MSG91_EMAIL_FROM_NAME"]);
   fill("msg91EmailOtpTemplateId", ["MSG91_EMAIL_OTP_TEMPLATE_ID"]);
+  fill("msg91EmailTransactionalTemplateId", ["MSG91_EMAIL_TRANSACTIONAL_TEMPLATE_ID"]);
   fill("msg91EmailOtpVariable", ["MSG91_EMAIL_OTP_VARIABLE"]);
   const senderNorm = String(cfg.msg91SenderId || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
   if (senderNorm.length === 6) {

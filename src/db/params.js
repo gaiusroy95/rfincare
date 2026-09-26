@@ -43,11 +43,16 @@ const BOOL_COLUMNS = new Set([
 /** Named params that map to boolean columns but are not snake_case column names. */
 const BOOL_ALIASES = new Set([
   'active',
+  'auto_reassign',
+  'notify_email',
+  'notify_wa',
+  'notify_whatsapp',
   'pub',
   'req_email',
   'req_mobile',
   'req_whatsapp',
   'require_email',
+  'round_robin',
   'sandbox',
 ]);
 
@@ -113,7 +118,9 @@ export function isBooleanParam(name) {
     || n.endsWith('_benefits')
     || n.endsWith('_conversion')
     || n.endsWith('_access')
-    || /(?:Benefits|Waiver|Cover|Access|Conversion)$/.test(raw)
+    || n.startsWith('notify_')
+    || n.startsWith('auto_')
+    || /(?:Benefits|Waiver|Cover|Access|Conversion|Enabled)$/.test(raw)
   ) {
     return true;
   }

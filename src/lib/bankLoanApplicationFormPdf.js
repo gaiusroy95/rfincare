@@ -203,7 +203,11 @@ export function buildBankLoanApplicationValues({ row, data: rawData, documents =
     avgMonthlyCredit: formatInr(field(data, 'averageMonthlyCredit', 'average_monthly_credit')),
 
     coApplicantName: co
-      ? dash([field(co, 'firstName', 'first_name'), field(co, 'lastName', 'last_name')].filter(Boolean).join(' '))
+      ? dash([
+        field(co, 'title'),
+        field(co, 'firstName', 'first_name'),
+        field(co, 'lastName', 'last_name'),
+      ].filter(Boolean).join(' '))
       : '',
     coFatherName: dash(co && field(co, 'fatherName', 'father_name', 'spouseName', 'spouse_name')),
     coRelationship: dash(co && field(co, 'relationship')),

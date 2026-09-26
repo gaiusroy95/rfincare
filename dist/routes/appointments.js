@@ -8,7 +8,7 @@ import { buildIcsInvite } from "../lib/ics.js";
 import { createGoogleCalendarEvent, googleCalendarConfigured } from "../lib/googleCalendar.js";
 import { hashOtp, sendDualChannelOtp, toPublicOtpMessage } from "../lib/otp.js";
 import { getOtpProviderSettings } from "../lib/otpProviderSettings.js";
-import { sendMsg91TransactionalSms } from "../lib/msg91.js";
+import { sendMsg91TransactionalSms, isMsg91Configured } from "../lib/msg91.js";
 const appointmentsRouter = Router();
 let schemaReady = false;
 async function ensureAppointmentsSchema() {
@@ -106,6 +106,181 @@ function formatDisplay(date) {
     hour: "2-digit",
     minute: "2-digit"
   });
+}
+async function sendAppointmentEmail(opts) {
+  let result = await sendEmail(opts);
+  if (result?.sent) return result;
+  if (opts.attachments?.length) {
+    console.warn("[appointments:email] retrying without attachments", {
+      to: opts.to,
+      reason: result?.reason || result?.warningInternal
+    });
+    result = await sendEmail({ ...opts, attachments: void 0 });
+  }
+  if (!result?.sent && result?.warningInternal) {
+    console.error("[appointments:email]", result.warningInternal, { to: opts.to });
+  }
+  return result;
+}
+async function notifyAppointmentStaff({
+  pool,
+  salesEmail,
+  salesSubject,
+  salesText,
+  icsAttachment,
+  appointmentId,
+  whenLabel,
+  customerName,
+  customerPhone,
+  topic
+}) {
+  const outcome = {
+    emailSent: false,
+    inAppNotified: 0,
+    smsSent: 0,
+    recipients: []
+  };
+  try {
+    const [employees] = await pool.execute(
+      `SELECT up.id, up.full_name, up.role, up.phone,
+              NULLIF(TRIM(COALESCE(eo.email, '')), '') AS official_email,
+              NULLIF(TRIM(COALESCE(up.email, '')), '') AS profile_email,
+              COALESCE(eo.lead_level, 0)::int AS lead_level
+       FROM user_profiles up
+       LEFT JOIN employee_onboarding eo ON eo.user_id = up.id
+       WHERE up.role = 'employee'
+         AND COALESCE(up.is_active, TRUE) = TRUE
+         AND COALESCE(eo.lead_level, 0) >= 2
+       ORDER BY eo.lead_level ASC, up.full_name ASC
+       LIMIT 25`
+    ).catch(() => [[]]);
+    const [admins] = await pool.execute(
+      `SELECT id, email, phone, full_name, role
+       FROM user_profiles
+       WHERE role IN ('admin', 'super_admin')
+         AND COALESCE(is_active, TRUE) = TRUE
+       LIMIT 15`
+    ).catch(() => [[]]);
+    const staff = [
+      ...(employees || []).map((e) => ({
+        id: e.id,
+        role: "employee",
+        email: e.official_email || e.profile_email || null,
+        phone: e.phone,
+        full_name: e.full_name,
+        lead_level: e.lead_level
+      })),
+      ...(admins || []).map((a) => ({
+        id: a.id,
+        role: a.role,
+        email: a.email,
+        phone: a.phone,
+        full_name: a.full_name,
+        lead_level: null
+      }))
+    ];
+    const emailTargets = /* @__PURE__ */ new Set();
+    if (salesEmail) emailTargets.add(String(salesEmail).trim().toLowerCase());
+    for (const s of staff) {
+      if (s.email) emailTargets.add(String(s.email).trim().toLowerCase());
+    }
+    const primaryTo = String(salesEmail || "").trim().toLowerCase() || [...emailTargets][0];
+    const bccList = [...emailTargets].filter((e) => e && e !== primaryTo);
+    const primaryMail = await sendAppointmentEmail({
+      to: primaryTo,
+      bcc: bccList.length ? bccList : void 0,
+      subject: salesSubject,
+      text: salesText,
+      html: `<pre style="font-family:sans-serif;white-space:pre-wrap">${salesText}</pre>`,
+      attachments: icsAttachment ? [icsAttachment] : void 0,
+      recipientName: "Rfincare Sales"
+    });
+    outcome.emailSent = Boolean(primaryMail?.sent);
+    outcome.recipients = primaryMail?.sent ? [primaryTo, ...primaryMail?.channel === "smtp" ? bccList : []] : [];
+    if (!outcome.emailSent && primaryTo) {
+      const solo = await sendAppointmentEmail({
+        to: primaryTo,
+        subject: salesSubject,
+        text: salesText,
+        html: `<pre style="font-family:sans-serif;white-space:pre-wrap">${salesText}</pre>`,
+        attachments: icsAttachment ? [icsAttachment] : void 0,
+        recipientName: "Rfincare Sales"
+      });
+      outcome.emailSent = Boolean(solo?.sent);
+      if (solo?.sent) outcome.recipients = [primaryTo];
+    }
+    const deliveredViaSmtpBcc = Boolean(primaryMail?.sent && primaryMail?.channel === "smtp");
+    if (outcome.emailSent && bccList.length && !deliveredViaSmtpBcc) {
+      for (const addr of bccList.slice(0, 10)) {
+        try {
+          const r = await sendAppointmentEmail({
+            to: addr,
+            subject: salesSubject,
+            text: salesText,
+            html: `<pre style="font-family:sans-serif;white-space:pre-wrap">${salesText}</pre>`,
+            recipientName: "Rfincare Team"
+          });
+          if (r?.sent) outcome.recipients.push(addr);
+        } catch {
+        }
+      }
+    }
+    try {
+      const { createStaffNotification } = await import("./notifications.js");
+      const title = `New expert appointment — ${customerName}`;
+      const message = [
+        `${customerName} booked a Talk to Expert call.`,
+        `When: ${whenLabel} (IST)`,
+        `Topic: ${topic}`,
+        `Phone: +91-${customerPhone}`,
+        `Appointment ID: ${appointmentId}`
+      ].join("\n");
+      for (const s of staff) {
+        try {
+          await createStaffNotification(pool, {
+            userId: s.id,
+            role: s.role,
+            eventType: "expert_appointment_booked",
+            title,
+            message,
+            data: {
+              appointmentId,
+              path: "/employee-dashboard"
+            }
+          });
+          outcome.inAppNotified += 1;
+        } catch (notifErr) {
+          console.warn("[appointments:in-app]", notifErr?.message || notifErr);
+        }
+      }
+    } catch (importErr) {
+      console.warn("[appointments:in-app:import]", importErr?.message || importErr);
+    }
+    if (isMsg91Configured()) {
+      const smsBody = [
+        `Rfincare: new appointment`,
+        `${customerName}`,
+        `When: ${whenLabel}`,
+        `Topic: ${topic}`,
+        `+91-${customerPhone}`
+      ].join("\n").slice(0, 300);
+      const seenPhones = /* @__PURE__ */ new Set();
+      for (const s of staff) {
+        const phone = String(s.phone || "").replace(/\D/g, "").slice(-10);
+        if (!phone || phone.length !== 10 || seenPhones.has(phone)) continue;
+        seenPhones.add(phone);
+        try {
+          const sms = await sendMsg91TransactionalSms({ phone, message: smsBody });
+          if (sms?.sent) outcome.smsSent += 1;
+        } catch (smsErr) {
+          console.warn("[appointments:staff-sms]", smsErr?.message || smsErr);
+        }
+      }
+    }
+  } catch (err) {
+    console.error("[appointments:staff-notify]", err?.message || err);
+  }
+  return outcome;
 }
 async function verifyOtpAndCreateVerification(pool, { email, phone, mobileOtp, emailOtp }) {
   const settings = await getOtpProviderSettings();
@@ -390,37 +565,41 @@ appointmentsRouter.post("/", async (req, res, next) => {
       "",
       `Appointment ID: ${id}`
     ].filter(Boolean).join("\n");
-    const [customerMail, salesMail] = await Promise.all([
-      sendEmail({
+    let customerMail = { sent: false, reason: "not_attempted" };
+    try {
+      customerMail = await sendAppointmentEmail({
         to: input.email,
         subject: customerSubject,
         text: customerText,
         html: `<pre style="font-family:sans-serif;white-space:pre-wrap">${customerText}</pre>`,
         attachments: [icsAttachment],
-        recipientName: input.fullName
-      }),
-      sendEmail({
-        to: salesEmail,
-        subject: salesSubject,
-        text: salesText,
-        html: `<pre style="font-family:sans-serif;white-space:pre-wrap">${salesText}</pre>`,
-        attachments: [icsAttachment],
-        recipientName: "Rfincare Sales"
-      })
-    ]);
-    if (customerMail?.warningInternal) {
-      console.error("[appointments:email:customer]", customerMail.warningInternal);
+        recipientName: input.fullName,
+        replyTo: salesEmail
+      });
+    } catch (mailErr) {
+      console.error("[appointments:email:customer]", mailErr?.message || mailErr);
+      customerMail = { sent: false, reason: "email_error", warningInternal: mailErr?.message };
     }
-    if (salesMail?.warningInternal) {
-      console.error("[appointments:email:sales]", salesMail.warningInternal);
-    }
+    const staffNotify = await notifyAppointmentStaff({
+      pool,
+      salesEmail,
+      salesSubject,
+      salesText,
+      icsAttachment,
+      appointmentId: id,
+      whenLabel,
+      customerName: input.fullName,
+      customerPhone: input.phone,
+      topic: topicLabel
+    });
     let sms = { sent: false, reason: "sms_not_sent" };
     try {
       const smsText = [
         `Rfincare: appointment confirmed.`,
-        `When: ${whenLabel}`,
+        `When: ${whenLabel} (IST)`,
         `Topic: ${topicLabel}`,
-        `Duration: ${durationMinutes} minutes`
+        `Duration: ${durationMinutes} min`,
+        `We will call +91-${input.phone}.`
       ].join("\n");
       sms = await sendMsg91TransactionalSms({
         phone: input.phone,
@@ -434,7 +613,8 @@ appointmentsRouter.post("/", async (req, res, next) => {
       };
     }
     const customerEmailSent = customerMail?.sent === true;
-    const salesEmailSent = salesMail?.sent === true;
+    const salesEmailSent = staffNotify.emailSent === true;
+    const icsAttached = customerEmailSent && Number(customerMail?.attachmentCount || 0) > 0 && !customerMail?.attachmentsDropped;
     const anyEmailFailed = !customerEmailSent || !salesEmailSent;
     await pool.execute(
       `UPDATE appointment_otp_verifications SET used_at = NOW() WHERE id = :id`,
@@ -452,17 +632,31 @@ appointmentsRouter.post("/", async (req, res, next) => {
         eventLink: google.htmlLink || null
       },
       emails: {
-        customer: { sent: customerEmailSent, channel: customerMail?.channel || null },
-        sales: { sent: salesEmailSent, channel: salesMail?.channel || null },
+        customer: {
+          sent: customerEmailSent,
+          channel: customerMail?.channel || null,
+          calendarInviteAttached: icsAttached
+        },
+        sales: {
+          sent: salesEmailSent,
+          channel: salesEmailSent ? "email" : null,
+          inAppNotified: staffNotify.inAppNotified,
+          smsSent: staffNotify.smsSent
+        },
         salesEmail
       },
       sms: { sent: Boolean(sms?.sent) },
+      staffNotify: {
+        emailSent: salesEmailSent,
+        inAppNotified: staffNotify.inAppNotified,
+        smsSent: staffNotify.smsSent
+      },
       message: anyEmailFailed ? "Appointment booked. If you do not receive a confirmation email shortly, our team will still contact you at the scheduled time." : "Appointment booked. Confirmation emails sent to you and our sales team.",
       // Customer-safe notices only (no SMTP/MSG91 credential text).
       notificationWarnings: {
         emailWarnings: [
           customerEmailSent ? null : publicEmailDeliveryMessage(customerMail),
-          salesEmailSent ? null : publicEmailDeliveryMessage(salesMail)
+          salesEmailSent ? null : "Sales team notification email could not be delivered right now. Your booking is still confirmed."
         ].filter(Boolean),
         smsWarning: sms?.sent ? null : "SMS confirmation could not be sent right now. Your appointment is still confirmed."
       }

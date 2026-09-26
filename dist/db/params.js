@@ -34,11 +34,16 @@ const BOOL_COLUMNS = /* @__PURE__ */ new Set([
 ]);
 const BOOL_ALIASES = /* @__PURE__ */ new Set([
   "active",
+  "auto_reassign",
+  "notify_email",
+  "notify_wa",
+  "notify_whatsapp",
   "pub",
   "req_email",
   "req_mobile",
   "req_whatsapp",
   "require_email",
+  "round_robin",
   "sandbox"
 ]);
 const CAMEL_BOOL_PARAMS = /* @__PURE__ */ new Set([
@@ -83,7 +88,7 @@ function isBooleanParam(name) {
   }
   if (n.startsWith("require_") || snake.startsWith("require_")) return true;
   if (/^supports[A-Z]/.test(raw) || /^taxBenefit/.test(raw)) return true;
-  if (n.endsWith("_enabled") || n.endsWith("_active") || n.endsWith("_waiver") || n.endsWith("_cover") || n.endsWith("_benefits") || n.endsWith("_conversion") || n.endsWith("_access") || /(?:Benefits|Waiver|Cover|Access|Conversion)$/.test(raw)) {
+  if (n.endsWith("_enabled") || n.endsWith("_active") || n.endsWith("_waiver") || n.endsWith("_cover") || n.endsWith("_benefits") || n.endsWith("_conversion") || n.endsWith("_access") || n.startsWith("notify_") || n.startsWith("auto_") || /(?:Benefits|Waiver|Cover|Access|Conversion|Enabled)$/.test(raw)) {
     return true;
   }
   return false;

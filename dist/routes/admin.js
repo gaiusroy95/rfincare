@@ -324,12 +324,17 @@ adminRouter.get(
       } catch {
       }
       const [employees] = await pool.execute(
-        `SELECT up.id, up.full_name, up.email, up.account_status, up.onboarding_status,
-                eo.employee_code, eo.username, eo.lead_level
+        `SELECT up.id, up.full_name, up.email, up.account_status, up.onboarding_status, up.is_active,
+                eo.employee_code, eo.username, eo.lead_level, eo.onboarding_status AS eo_status,
+                eo.lead_available
          FROM user_profiles up
          LEFT JOIN employee_onboarding eo ON eo.user_id = up.id
          WHERE up.role = 'employee'
-         ORDER BY up.full_name ASC, up.email ASC`
+           AND COALESCE(up.is_active, TRUE) = TRUE
+           AND COALESCE(up.account_status, 'active') NOT IN ('suspended', 'inactive', 'terminated')
+           AND COALESCE(eo.onboarding_status, up.onboarding_status, 'active')
+               NOT IN ('inactive', 'terminated', 'rejected', 'on_leave')
+         ORDER BY eo.lead_level ASC NULLS LAST, up.full_name ASC, up.email ASC`
       );
       const [agents] = await pool.execute(
         `SELECT up.id, up.full_name, up.email, up.account_status, up.onboarding_status,

@@ -9,6 +9,7 @@ import { ensureCibilCoreTables } from './db/ensureMilestone4Schema.js';
 import { syncSurepassVendorFromEnv } from './lib/cibilService.js';
 import { ensurePushNotificationSchema } from './db/ensurePushNotificationSchema.js';
 import { ensurePartnerRegistrationSchema } from './db/ensurePartnerRegistrationSchema.js';
+import { ensureAgentOnboardingSchema } from './db/ensureAgentOnboardingSchema.js';
 import { ensureTranslationCacheSchema } from './db/ensureTranslationCacheSchema.js';
 import { ensureMarketingSchema } from './lib/marketingSettings.js';
 import { ensureReferralSchema } from './lib/referralTracking.js';
@@ -32,6 +33,26 @@ mkdirSync(getUploadDir(), { recursive: true });
 
 if (isCloudStorage()) {
   assertS3Config();
+} else if (
+  process.env.K_SERVICE
+  || process.env.CLOUD_RUN_JOB
+  || process.env.RENDER
+  || process.env.RAILWAY_ENVIRONMENT
+) {
+  // eslint-disable-next-line no-console
+  console.error(
+    '[storage] CRITICAL: STORAGE_PROVIDER=local on an ephemeral host (Cloud Run/Render). '
+      + 'Customer documents will disappear after restart or across instances. '
+      + 'Set STORAGE_PROVIDER=s3 with S3_BUCKET / S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY '
+      + '(GCS HMAC or Supabase S3 endpoint also work). Set ALLOW_EPHEMERAL_UPLOADS=true only for emergency testing.',
+  );
+  if (process.env.ALLOW_EPHEMERAL_UPLOADS !== 'true' && process.env.NODE_ENV === 'production') {
+    // eslint-disable-next-line no-console
+    console.error(
+      '[storage] Refusing to start without durable storage. Configure S3 or set ALLOW_EPHEMERAL_UPLOADS=true.',
+    );
+    process.exit(1);
+  }
 }
 
 const app = createApp({
@@ -44,6 +65,7 @@ async function bootstrap() {
     await syncSurepassVendorFromEnv(getPool());
     await ensurePushNotificationSchema();
     await ensurePartnerRegistrationSchema();
+    await ensureAgentOnboardingSchema();
     await ensureTranslationCacheSchema();
     await ensureMarketingSchema();
     await ensureReferralSchema(getPool());

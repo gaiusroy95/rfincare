@@ -129,12 +129,38 @@ const SHEET_HEADER_SAMPLES = {
       Product_Name: 'Demo Home Loan',
       Product_Category: 'home_loan',
       Status: 'ACTIVE',
-      Minimum_Loan_Amount: 500000,
-      Maximum_Loan_Amount: 50000000,
-      Minimum_Tenure_Months: 12,
-      Maximum_Tenure_Months: 360,
+      Apply_URL: 'https://bank.example.com/apply',
       Interest_Rate_From: 8.5,
       Interest_Rate_To: 11.5,
+      Processing_Fee_Percentage: 1,
+      Processing_Fee_Fixed: '',
+      Other_Charges: 'Legal fee, stamp duty, GST on fees',
+      Prepayment_Charges: 'Nil after 12 EMIs',
+      Foreclosure_Charges: 'As per bank policy',
+      Foreclosure_Fee_Pct: 4,
+      Foreclosure_Allowed_After_Months: 12,
+      Part_Payment_Fee_Pct: 2,
+      Bouncing_Charges: 500,
+      Late_Fee_Pct: 2,
+      Late_Payment_Fee_Fixed: '',
+      Late_Payment_Charges: '2% of EMI or ₹500',
+      Documentation_Charges: 'As applicable',
+      Minimum_Loan_Amount: 500000,
+      Maximum_Loan_Amount: 50000000,
+      Minimum_Tenure_Years: 1,
+      Maximum_Tenure_Years: 30,
+      Minimum_Tenure_Months: 12,
+      Maximum_Tenure_Months: 360,
+      Disbursal_Timeline: '48-72 hours after approval',
+      Collateral_Required: 'None / Property mortgage',
+      Features: 'Up to ₹2 Cr|Flexible repayment',
+      Eligibility_Criteria: 'Minimum age 21|Minimum annual income ₹5 Lakh',
+      Policies: 'No co-applicant required|Balance transfer allowed',
+      Documentation_Required: 'PAN & Aadhaar|Last 3 months salary slips',
+      Product_Type: 'Floating',
+      Target_Customer: 'Salaried',
+      Purpose: 'Purchase',
+      Policy_Version: 'v1',
     },
   ],
   Applicant_Rules: [{ Rule_ID: 'APP001', Product_ID: 'PRD001', Minimum_Age: 21, Maximum_Age: 65 }],
@@ -292,6 +318,29 @@ function toNumber(value, fallback = null) {
   if (value === '' || value == null) return fallback;
   const n = Number(String(value).replace(/,/g, ''));
   return Number.isFinite(n) ? n : fallback;
+}
+
+/** Set number only when cell has a value (empty Excel cells do not wipe existing product data). */
+function assignNumber(target, key, raw) {
+  if (raw === '' || raw == null) return;
+  const n = toNumber(raw);
+  if (n != null) target[key] = n;
+}
+
+/** Set trimmed text only when non-empty. */
+function assignText(target, key, raw) {
+  if (raw === '' || raw == null) return;
+  const s = String(raw).trim();
+  if (s) target[key] = s;
+}
+
+function firstPresent(row, ...keys) {
+  for (const key of keys) {
+    if (row?.[key] !== undefined && row?.[key] !== null && String(row[key]).trim() !== '') {
+      return row[key];
+    }
+  }
+  return undefined;
 }
 
 function toDateOrNull(value) {
@@ -694,49 +743,259 @@ async function upsertProduct(conn, row, idMap) {
     return code === productCode || extId === String(row.Product_ID);
   });
 
-  const feesForProduct = (idMap.feesByProduct?.[row.Product_ID] || [])[0];
-  const processingFee =
-    feesForProduct && String(feesForProduct.Fee_Type || '').toLowerCase().includes('processing')
-      ? feesForProduct.Calculation_Method === 'PERCENTAGE'
-        ? `${feesForProduct.Value}%`
-        : `₹${feesForProduct.Value}`
-      : undefined;
+  const feesForProduct = idMap.feesByProduct?.[String(row.Product_ID || '').trim()] || [];
+  const processingFeeRow =
+    feesForProduct.find((f) =>
+      String(f.Fee_Type || f.fee_type || '')
+        .toLowerCase()
+        .includes('processing'),
+    ) || null;
+  const feeMethod = String(
+    processingFeeRow?.Calculation_Method || processingFeeRow?.calculation_method || '',
+  )
+    .trim()
+    .toUpperCase();
+  const feeValue = toNumber(processingFeeRow?.Value ?? processingFeeRow?.value);
+  const isPctFee =
+    feeMethod === 'PERCENTAGE'
+    || feeMethod === 'PERCENT'
+    || feeMethod === 'PCT'
+    || feeMethod.includes('PERCENT');
+  const isFixedFee =
+    feeMethod === 'FIXED'
+    || feeMethod === 'FLAT'
+    || feeMethod === 'AMOUNT'
+    || feeMethod.includes('FIXED')
+    || feeMethod.includes('FLAT');
 
-  const obligation = (idMap.obligationsByProduct?.[row.Product_ID] || [])[0];
+  let processingFeePercentage = undefined;
+  let processingFeeFixed = undefined;
+  let processingFee = undefined;
+
+  // Prefer Products-sheet fee columns (classic form fields); fall back to Fees sheet.
+  const sheetPct = toNumber(
+    firstPresent(row, 'Processing_Fee_Percentage', 'Processing_Fee_Pct', 'processing_fee_percentage'),
+  );
+  const sheetFixed = toNumber(
+    firstPresent(row, 'Processing_Fee_Fixed', 'Processing_Fee_Amount', 'processing_fee_fixed'),
+  );
+  if (sheetPct != null) {
+    processingFeePercentage = sheetPct;
+    processingFee = `${sheetPct}%`;
+  }
+  if (sheetFixed != null) {
+    processingFeeFixed = sheetFixed;
+    if (processingFeePercentage == null) processingFee = `₹${sheetFixed}`;
+  }
+
+  if (processingFeePercentage == null && processingFeeFixed == null && processingFeeRow && feeValue != null) {
+    if (isPctFee) {
+      processingFeePercentage = feeValue;
+      processingFee = `${feeValue}%`;
+    } else if (isFixedFee || feeMethod) {
+      processingFeeFixed = feeValue;
+      processingFee = `₹${feeValue}`;
+    } else {
+      processingFeePercentage = feeValue;
+      processingFee = `${feeValue}%`;
+    }
+  }
+
+  const obligation = (idMap.obligationsByProduct?.[String(row.Product_ID || '').trim()] || [])[0];
+
+  const minLoan = toNumber(firstPresent(row, 'Minimum_Loan_Amount', 'Min_Loan_Amount', 'min_loan_amount'));
+  const maxLoan = toNumber(firstPresent(row, 'Maximum_Loan_Amount', 'Max_Loan_Amount', 'max_loan_amount'));
+  const minTenureMonths = toNumber(
+    firstPresent(row, 'Minimum_Tenure_Months', 'Min_Tenure_Months', 'min_tenure_months'),
+  );
+  const maxTenureMonths = toNumber(
+    firstPresent(row, 'Maximum_Tenure_Months', 'Max_Tenure_Months', 'max_tenure_months'),
+  );
+  let minTenureYears = toNumber(
+    firstPresent(row, 'Minimum_Tenure_Years', 'Min_Tenure_Years', 'min_tenure_years'),
+  );
+  let maxTenureYears = toNumber(
+    firstPresent(row, 'Maximum_Tenure_Years', 'Max_Tenure_Years', 'max_tenure_years'),
+  );
+  if (minTenureYears == null && minTenureMonths != null) {
+    minTenureYears = Math.round((minTenureMonths / 12) * 100) / 100;
+  }
+  if (maxTenureYears == null && maxTenureMonths != null) {
+    maxTenureYears = Math.round((maxTenureMonths / 12) * 100) / 100;
+  }
+  const resolvedMinMonths =
+    minTenureMonths != null
+      ? minTenureMonths
+      : minTenureYears != null
+        ? Math.round(minTenureYears * 12)
+        : null;
+  const resolvedMaxMonths =
+    maxTenureMonths != null
+      ? maxTenureMonths
+      : maxTenureYears != null
+        ? Math.round(maxTenureYears * 12)
+        : null;
+
+  const rateFrom = toNumber(firstPresent(row, 'Interest_Rate_From', 'Interest_Rate_Min', 'interest_rate_min'));
+  const rateTo = toNumber(firstPresent(row, 'Interest_Rate_To', 'Interest_Rate_Max', 'interest_rate_max'));
+
   const nextData = {
     ...(match ? parseProductData(match.data) : {}),
     product_code: productCode,
     external_product_id: row.Product_ID,
     product_category_slug: cat.slug,
     loan_type: cat.loanType,
-    product_type: row.Product_Type || null,
-    target_customer: row.Target_Customer || null,
-    purpose: row.Purpose || null,
-    policy_version: row.Policy_Version || null,
-    min_loan_amount: toNumber(row.Minimum_Loan_Amount),
-    max_loan_amount: toNumber(row.Maximum_Loan_Amount),
-    min_tenure_months: toNumber(row.Minimum_Tenure_Months),
-    max_tenure_months: toNumber(row.Maximum_Tenure_Months),
-    interest_rate_min: toNumber(row.Interest_Rate_From),
-    interest_rate_max: toNumber(row.Interest_Rate_To),
-    minAmount: toNumber(row.Minimum_Loan_Amount),
-    maxAmount: toNumber(row.Maximum_Loan_Amount),
-    minTenure: toNumber(row.Minimum_Tenure_Months)
-      ? `${toNumber(row.Minimum_Tenure_Months)} months`
-      : undefined,
-    maxTenure: toNumber(row.Maximum_Tenure_Months)
-      ? `${toNumber(row.Maximum_Tenure_Months)} months`
-      : undefined,
-    interestRate:
-      toNumber(row.Interest_Rate_From) != null
-        ? `${toNumber(row.Interest_Rate_From)}% - ${toNumber(row.Interest_Rate_To) ?? ''}%`
-        : undefined,
-    processingFee,
-    maximum_foir_percentage: obligation
-      ? toNumber(obligation.Maximum_FOIR_Percentage)
-      : undefined,
     policy_pack_source: 'lender_policy_bulk_upload',
   };
+
+  assignText(nextData, 'product_type', firstPresent(row, 'Product_Type', 'product_type'));
+  assignText(nextData, 'target_customer', firstPresent(row, 'Target_Customer', 'target_customer'));
+  assignText(nextData, 'purpose', firstPresent(row, 'Purpose', 'purpose'));
+  assignText(nextData, 'policy_version', firstPresent(row, 'Policy_Version', 'policy_version'));
+  assignText(nextData, 'apply_url', firstPresent(row, 'Apply_URL', 'Direct_Apply_Link', 'apply_url', 'Apply_Link'));
+
+  if (minLoan != null) {
+    nextData.min_loan_amount = minLoan;
+    nextData.minAmount = minLoan;
+  }
+  if (maxLoan != null) {
+    nextData.max_loan_amount = maxLoan;
+    nextData.maxAmount = maxLoan;
+  }
+  if (resolvedMinMonths != null) {
+    nextData.min_tenure_months = resolvedMinMonths;
+    nextData.minTenure = `${resolvedMinMonths} months`;
+  }
+  if (resolvedMaxMonths != null) {
+    nextData.max_tenure_months = resolvedMaxMonths;
+    nextData.maxTenure = `${resolvedMaxMonths} months`;
+  }
+  if (minTenureYears != null) nextData.min_tenure_years = minTenureYears;
+  if (maxTenureYears != null) nextData.max_tenure_years = maxTenureYears;
+
+  if (rateFrom != null) nextData.interest_rate_min = rateFrom;
+  if (rateTo != null) nextData.interest_rate_max = rateTo;
+  if (rateFrom != null || rateTo != null) {
+    nextData.interestRate = `${rateFrom ?? ''}%-${rateTo ?? ''}%`.replace(/%-%/, '% - ');
+    if (rateFrom != null && rateTo != null) {
+      nextData.interestRate = `${rateFrom}% - ${rateTo}%`;
+    } else if (rateFrom != null) {
+      nextData.interestRate = `${rateFrom}%`;
+    } else {
+      nextData.interestRate = `${rateTo}%`;
+    }
+  }
+
+  if (processingFeePercentage != null) {
+    nextData.processing_fee_percentage = processingFeePercentage;
+    nextData.processingFeePercentage = processingFeePercentage;
+  }
+  if (processingFeeFixed != null) {
+    nextData.processing_fee_fixed = processingFeeFixed;
+    nextData.processingFeeFixed = processingFeeFixed;
+  }
+  if (processingFee != null) nextData.processingFee = processingFee;
+
+  assignText(nextData, 'other_charges', firstPresent(row, 'Other_Charges', 'other_charges'));
+  assignText(nextData, 'prepayment_charges', firstPresent(row, 'Prepayment_Charges', 'prepayment_charges'));
+  assignText(nextData, 'foreclosure_charges', firstPresent(row, 'Foreclosure_Charges', 'foreclosure_charges'));
+  assignNumber(
+    nextData,
+    'foreclosure_fee_pct',
+    firstPresent(row, 'Foreclosure_Fee_Pct', 'Foreclosure_Fee_Percentage', 'foreclosure_fee_pct'),
+  );
+  assignNumber(
+    nextData,
+    'foreclosure_allowed_after_months',
+    firstPresent(
+      row,
+      'Foreclosure_Allowed_After_Months',
+      'Foreclosure_After_Months',
+      'foreclosure_allowed_after_months',
+    ),
+  );
+  assignNumber(
+    nextData,
+    'part_payment_fee_pct',
+    firstPresent(row, 'Part_Payment_Fee_Pct', 'Part_Payment_Fee_Percentage', 'part_payment_fee_pct'),
+  );
+  assignNumber(
+    nextData,
+    'bouncing_charges',
+    firstPresent(row, 'Bouncing_Charges', 'Bounce_Charges', 'bouncing_charges'),
+  );
+  assignNumber(
+    nextData,
+    'late_fee_pct',
+    firstPresent(row, 'Late_Fee_Pct', 'Late_Fee_Percentage', 'late_fee_pct'),
+  );
+  assignNumber(
+    nextData,
+    'late_payment_fee_fixed',
+    firstPresent(row, 'Late_Payment_Fee_Fixed', 'Late_Fee_Fixed', 'late_payment_fee_fixed'),
+  );
+  assignText(
+    nextData,
+    'late_payment_charges',
+    firstPresent(row, 'Late_Payment_Charges', 'late_payment_charges'),
+  );
+  assignText(
+    nextData,
+    'documentation_charges',
+    firstPresent(row, 'Documentation_Charges', 'documentation_charges'),
+  );
+  assignText(
+    nextData,
+    'disbursal_timeline',
+    firstPresent(row, 'Disbursal_Timeline', 'disbursal_timeline'),
+  );
+  assignText(
+    nextData,
+    'collateral_required',
+    firstPresent(row, 'Collateral_Required', 'collateral_required'),
+  );
+
+  // Multi-line marketplace lists — one item per line in Excel (Alt+Enter) OR separated by |
+  const splitList = (raw) => {
+    if (raw == null || String(raw).trim() === '') return null;
+    return String(raw)
+      .split(/\r?\n|\|/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+  };
+  const features = splitList(
+    firstPresent(row, 'Features', 'Key_Features', 'features', 'key_features'),
+  );
+  if (features) nextData.features = features;
+  const eligibility = splitList(
+    firstPresent(
+      row,
+      'Eligibility_Criteria',
+      'Eligibility',
+      'eligibility_criteria',
+      'eligibility',
+    ),
+  );
+  if (eligibility) nextData.eligibility_criteria = eligibility;
+  const policies = splitList(
+    firstPresent(row, 'Policies', 'Policies_Terms', 'policies', 'policies_terms'),
+  );
+  if (policies) nextData.policies = policies;
+  const docsRequired = splitList(
+    firstPresent(
+      row,
+      'Documentation_Required',
+      'Documents_Required',
+      'documentation_required',
+      'documentationRequired',
+    ),
+  );
+  if (docsRequired) nextData.documentation_required = docsRequired;
+
+  if (obligation) {
+    const foir = toNumber(obligation.Maximum_FOIR_Percentage);
+    if (foir != null) nextData.maximum_foir_percentage = foir;
+  }
 
   if (match) {
     await conn.execute(
@@ -935,6 +1194,227 @@ function inferFieldFromRuleRow(row) {
   return null;
 }
 
+function indexRowsByProductId(rows = []) {
+  const map = {};
+  for (const row of rows) {
+    const pid = String(row?.Product_ID ?? row?.product_id ?? '').trim();
+    if (!pid) continue;
+    if (!map[pid]) map[pid] = [];
+    map[pid].push(row);
+  }
+  return map;
+}
+
+function firstRow(map, productId) {
+  const list = map[String(productId || '').trim()] || [];
+  return list[0] || null;
+}
+
+/** Convert FOIR percent (55) or ratio (0.55) to 0–1 decimal for approval matrix. */
+function normalizeFoir(raw) {
+  const n = toNumber(raw);
+  if (n == null) return null;
+  if (n > 1) return Math.round((n / 100) * 10000) / 10000;
+  return n;
+}
+
+/** Prefer annual income; treat small Minimum_Income values as monthly × 12. */
+function resolveAnnualIncome(incomeRow) {
+  if (!incomeRow) return { min: null, max: null };
+  const annualMin = toNumber(
+    firstPresent(incomeRow, 'Minimum_Annual_Income', 'Min_Annual_Income', 'minimum_annual_income'),
+  );
+  const annualMax = toNumber(
+    firstPresent(incomeRow, 'Maximum_Annual_Income', 'Max_Annual_Income', 'maximum_annual_income'),
+  );
+  let min = annualMin;
+  let max = annualMax;
+  const monthlyMin = toNumber(
+    firstPresent(incomeRow, 'Minimum_Income', 'Min_Income', 'Minimum_Monthly_Income'),
+  );
+  const monthlyMax = toNumber(
+    firstPresent(incomeRow, 'Maximum_Income', 'Max_Income', 'Maximum_Monthly_Income'),
+  );
+  if (min == null && monthlyMin != null) {
+    min = monthlyMin < 100000 ? monthlyMin * 12 : monthlyMin;
+  }
+  if (max == null && monthlyMax != null) {
+    max = monthlyMax < 100000 ? monthlyMax * 12 : monthlyMax;
+  }
+  return { min, max };
+}
+
+/**
+ * Upsert Bank Approval Matrix rules from Products + Applicant/Income/Credit/Obligation/LTV sheets.
+ * One rule per Product_ID (keyed by bank + external_product_id in data, fallback rule_name).
+ */
+async function upsertApprovalMatrixFromSheets(conn, sheets, idMap, result) {
+  result.approvalRulesCreated = 0;
+  result.approvalRulesUpdated = 0;
+  result.approvalRulesSkipped = 0;
+
+  const products = sheets.Products || [];
+  if (!products.length) return;
+
+  const applicantBy = indexRowsByProductId(sheets.Applicant_Rules);
+  const incomeBy = indexRowsByProductId(sheets.Income_Rules);
+  const creditBy = indexRowsByProductId(sheets.Credit_Rules);
+  const obligationBy = indexRowsByProductId(sheets.Obligation_Rules);
+  const tenureBy = indexRowsByProductId(sheets.Tenure_Rules);
+  const ltvBy = indexRowsByProductId(sheets.LTV_Rules);
+
+  let priority = products.length;
+  for (const row of products) {
+    const productId = String(row.Product_ID || '').trim();
+    const product = idMap.products[productId];
+    if (!product?.bankId) {
+      result.approvalRulesSkipped += 1;
+      continue;
+    }
+
+    const productCode = String(row.Product_Code || product.data?.product_code || productId).trim();
+    const productName = String(row.Product_Name || product.data?.product_name || productCode).trim();
+    const ruleName = `${productCode} — ${productName}`.slice(0, 200);
+    const loanType =
+      product.category?.loanType
+      || product.data?.loan_type
+      || mapProductCategory(row.Product_Category).loanType
+      || 'personal_loan';
+
+    const applicant = firstRow(applicantBy, productId);
+    const income = firstRow(incomeBy, productId);
+    const credit = firstRow(creditBy, productId);
+    const obligation = firstRow(obligationBy, productId);
+    const tenure = firstRow(tenureBy, productId);
+    const ltv = firstRow(ltvBy, productId);
+    const { min: minAnnual, max: maxAnnual } = resolveAnnualIncome(income);
+
+    const minAge = toNumber(firstPresent(applicant, 'Minimum_Age', 'Min_Age', 'minimum_age'));
+    const maxAge = toNumber(firstPresent(applicant, 'Maximum_Age', 'Max_Age', 'maximum_age'));
+    const minCibil = toNumber(firstPresent(credit, 'Minimum_CIBIL', 'Min_CIBIL', 'minimum_cibil'));
+    const maxCibil = toNumber(firstPresent(credit, 'Maximum_CIBIL', 'Max_CIBIL', 'maximum_cibil'));
+    const foir = normalizeFoir(
+      firstPresent(
+        obligation,
+        'Maximum_FOIR_Percentage',
+        'Max_FOIR_Percentage',
+        'FOIR',
+        'foir_unsecured',
+      ),
+    );
+    const tenureMonths =
+      toNumber(firstPresent(tenure, 'Maximum_Tenure_Months', 'Max_Tenure_Months'))
+      ?? toNumber(product.data?.max_tenure_months)
+      ?? toNumber(row.Maximum_Tenure_Months);
+    const ltvRatio = toNumber(firstPresent(ltv, 'Maximum_LTV', 'Max_LTV', 'max_ltv'));
+
+    const targetCustomer = String(row.Target_Customer || product.data?.target_customer || '').toLowerCase();
+    const employmentTypes = [];
+    if (/salaried/.test(targetCustomer)) employmentTypes.push('salaried');
+    if (/self|business|professional/.test(targetCustomer)) {
+      employmentTypes.push('self_employed');
+    }
+    if (!employmentTypes.length && targetCustomer) {
+      employmentTypes.push(targetCustomer.replace(/\s+/g, '_'));
+    }
+
+    const data = {
+      loan_type: loanType,
+      min_annual_income: minAnnual,
+      max_annual_income: maxAnnual,
+      min_credit_score: minCibil,
+      max_credit_score: maxCibil,
+      employment_types: employmentTypes,
+      eligible_states: [],
+      eligible_cities: [],
+      min_loan_amount:
+        toNumber(row.Minimum_Loan_Amount) ?? toNumber(product.data?.min_loan_amount) ?? null,
+      max_loan_amount:
+        toNumber(row.Maximum_Loan_Amount) ?? toNumber(product.data?.max_loan_amount) ?? null,
+      min_age: minAge,
+      max_age: maxAge,
+      foir_unsecured: foir,
+      foir_secured: foir,
+      tenure_unsecured_months: tenureMonths,
+      tenure_secured_months: tenureMonths,
+      ltv_ratio: ltvRatio,
+      external_product_id: productId,
+      product_code: productCode,
+      source: 'lender_policy_bulk_upload',
+    };
+
+    const isActive = statusActive(row.Status);
+    const approvalProbability = toNumber(
+      firstPresent(row, 'Approval_Probability', 'approval_probability'),
+      75,
+    ) || 75;
+
+    // Match existing rule by external_product_id in data, else by bank + rule_name.
+    const [existingRows] = await conn.execute(
+      `SELECT id, rule_name, data FROM approval_matrix_rules WHERE bank_id = :bankId`,
+      { bankId: product.bankId },
+    );
+    const match = (existingRows || []).find((r) => {
+      const d = parseProductData(r.data);
+      if (String(d.external_product_id || '') === productId) return true;
+      if (String(d.product_code || '').toUpperCase() === productCode.toUpperCase()) return true;
+      return String(r.rule_name || '') === ruleName;
+    });
+
+    if (match) {
+      const prev = parseProductData(match.data);
+      const merged = { ...prev };
+      for (const [k, v] of Object.entries(data)) {
+        if (v == null) continue;
+        if (Array.isArray(v) && v.length === 0) continue;
+        merged[k] = v;
+      }
+      merged.external_product_id = productId;
+      merged.product_code = productCode;
+      merged.loan_type = loanType;
+      merged.source = 'lender_policy_bulk_upload';
+      await conn.execute(
+        `UPDATE approval_matrix_rules SET
+           rule_name = :rule_name,
+           priority = :priority,
+           is_active = :is_active,
+           approval_probability = :approval_probability,
+           data = :data,
+           updated_at = NOW()
+         WHERE id = :id`,
+        {
+          id: match.id,
+          rule_name: ruleName,
+          priority,
+          is_active: isActive,
+          approval_probability: approvalProbability,
+          data: JSON.stringify(merged),
+        },
+      );
+      result.approvalRulesUpdated += 1;
+    } else {
+      await conn.execute(
+        `INSERT INTO approval_matrix_rules (
+           id, bank_id, rule_name, priority, is_active, approval_probability, data
+         ) VALUES (
+           :id, :bank_id, :rule_name, :priority, :is_active, :approval_probability, :data
+         )`,
+        {
+          id: newId(),
+          bank_id: product.bankId,
+          rule_name: ruleName,
+          priority,
+          is_active: isActive,
+          approval_probability: approvalProbability,
+          data: JSON.stringify(data),
+        },
+      );
+      result.approvalRulesCreated += 1;
+    }
+    priority -= 1;
+  }
+}
+
 async function upsertPolicyPackFromSheets(conn, sheets, idMap, result, committedBy) {
   await ensurePolicyConsoleSchema();
   result.versionsCreated = 0;
@@ -1107,19 +1587,38 @@ export async function commitImportJob(jobId, committedBy) {
     e.status = 400;
     throw e;
   }
-  if (job.status === 'committed') {
-    const prev =
-      typeof job.commit_result_json === 'string'
-        ? JSON.parse(job.commit_result_json)
-        : job.commit_result_json;
-    return prev || { alreadyCommitted: true };
-  }
-  // Allow commit from validated (force) or approved
 
   const sheets =
     typeof job.sheet_payload_json === 'string'
       ? JSON.parse(job.sheet_payload_json)
       : job.sheet_payload_json || {};
+
+  const prevResult =
+    typeof job.commit_result_json === 'string'
+      ? (() => {
+        try {
+          return JSON.parse(job.commit_result_json);
+        } catch {
+          return null;
+        }
+      })()
+      : job.commit_result_json;
+
+  const hasGeoRows =
+    (sheets.Geo_Coverage || []).length > 0 || (sheets.Location_Rules || []).length > 0;
+
+  // Idempotent: already committed AND geo finished (or no geo) → return cached result.
+  // If committed but geo never finished (timeout / crash / prior geoError), retry geo only.
+  if (job.status === 'committed' && prevResult) {
+    const geoSucceeded =
+      Boolean(prevResult.geoVersionId)
+      || prevResult.geoStatus === 'skipped'
+      || prevResult.geoStatus === 'pending_approval'
+      || !hasGeoRows;
+    if (geoSucceeded) {
+      return { ...prevResult, alreadyCommitted: true };
+    }
+  }
 
   const idMap = {
     lenders: {},
@@ -1128,12 +1627,16 @@ export async function commitImportJob(jobId, committedBy) {
     obligationsByProduct: {},
   };
   for (const fee of sheets.Fees || []) {
-    if (!idMap.feesByProduct[fee.Product_ID]) idMap.feesByProduct[fee.Product_ID] = [];
-    idMap.feesByProduct[fee.Product_ID].push(fee);
+    const pid = String(fee.Product_ID ?? fee.product_id ?? '').trim();
+    if (!pid) continue;
+    if (!idMap.feesByProduct[pid]) idMap.feesByProduct[pid] = [];
+    idMap.feesByProduct[pid].push(fee);
   }
   for (const ob of sheets.Obligation_Rules || []) {
-    if (!idMap.obligationsByProduct[ob.Product_ID]) idMap.obligationsByProduct[ob.Product_ID] = [];
-    idMap.obligationsByProduct[ob.Product_ID].push(ob);
+    const pid = String(ob.Product_ID ?? ob.product_id ?? '').trim();
+    if (!pid) continue;
+    if (!idMap.obligationsByProduct[pid]) idMap.obligationsByProduct[pid] = [];
+    idMap.obligationsByProduct[pid].push(ob);
   }
 
   const result = {
@@ -1151,40 +1654,133 @@ export async function commitImportJob(jobId, committedBy) {
       : job.unsupported_sheets_json) || [],
   };
 
-  const conn = await pool.getConnection();
-  try {
-    await conn.beginTransaction();
-
-    for (const row of sheets.Lenders || []) {
-      const r = await upsertLender(conn, row, committedBy, idMap);
-      if (r.action === 'created') result.lendersCreated += 1;
-      if (r.action === 'updated') result.lendersUpdated += 1;
-    }
-    for (const row of sheets.Products || []) {
-      const r = await upsertProduct(conn, row, idMap);
-      if (r.action === 'created') result.productsCreated += 1;
-      if (r.action === 'updated') result.productsUpdated += 1;
-    }
-
+  // ——— Phase 1: lenders + products only (hard fail) ———
+  // Soft secondary sheets must NOT share this transaction: a PostgreSQL error aborts the
+  // whole txn, so a caught pricing/policy error would still poison the final COMMIT UPDATE.
+  if (job.status !== 'committed') {
+    const conn = await pool.getConnection();
     try {
-      await upsertPricingRules(conn, sheets, idMap, result);
+      await conn.beginTransaction();
+      try {
+        await conn.execute(`SET LOCAL statement_timeout = '120s'`);
+      } catch {
+        /* ignore if role cannot set timeout */
+      }
+
+      for (const row of sheets.Lenders || []) {
+        try {
+          const r = await upsertLender(conn, row, committedBy, idMap);
+          if (r.action === 'created') result.lendersCreated += 1;
+          if (r.action === 'updated') result.lendersUpdated += 1;
+        } catch (err) {
+          const code = String(row?.Lender_Code || row?.Lender_ID || '').trim() || 'unknown';
+          const wrapped = new Error(
+            `Lender "${code}" failed: ${err?.message || 'database error'}`,
+          );
+          wrapped.status = 400;
+          wrapped.cause = err;
+          throw wrapped;
+        }
+      }
+      for (const row of sheets.Products || []) {
+        try {
+          const r = await upsertProduct(conn, row, idMap);
+          if (r.action === 'created') result.productsCreated += 1;
+          if (r.action === 'updated') result.productsUpdated += 1;
+        } catch (err) {
+          const code = String(row?.Product_Code || row?.Product_ID || '').trim() || 'unknown';
+          const wrapped = new Error(
+            `Product "${code}" failed: ${err?.message || 'database error'}`,
+          );
+          wrapped.status = 400;
+          wrapped.cause = err;
+          throw wrapped;
+        }
+      }
+
+      await conn.commit();
     } catch (err) {
-      result.pricingError = err.message;
-    }
-    try {
-      await upsertDocumentRules(conn, sheets, idMap, result);
-    } catch (err) {
-      result.documentsError = err.message;
+      try {
+        await conn.rollback();
+      } catch {
+        /* ignore */
+      }
+      const wrapped = new Error(
+        err?.message
+          ? `Publish failed while saving lenders/products: ${err.message}`
+          : 'Publish failed while saving lenders/products',
+      );
+      wrapped.status = err?.status || 500;
+      wrapped.cause = err;
+      throw wrapped;
+    } finally {
+      conn.release();
     }
 
+    // ——— Phase 2: soft dual-writes (own short transactions; never roll back lenders/products) ———
+    const softConn = await pool.getConnection();
     try {
-      await upsertPolicyPackFromSheets(conn, sheets, idMap, result, committedBy);
-    } catch (err) {
-      result.policyPackError = err.message;
+      try {
+        await softConn.beginTransaction();
+        await upsertPricingRules(softConn, sheets, idMap, result);
+        await softConn.commit();
+      } catch (err) {
+        try {
+          await softConn.rollback();
+        } catch {
+          /* ignore */
+        }
+        result.pricingError = err.message;
+        console.warn('[lender-policy-import:pricing]', err?.message || err);
+      }
+
+      try {
+        await softConn.beginTransaction();
+        await upsertDocumentRules(softConn, sheets, idMap, result);
+        await softConn.commit();
+      } catch (err) {
+        try {
+          await softConn.rollback();
+        } catch {
+          /* ignore */
+        }
+        result.documentsError = err.message;
+        console.warn('[lender-policy-import:documents]', err?.message || err);
+      }
+
+      try {
+        await softConn.beginTransaction();
+        await upsertApprovalMatrixFromSheets(softConn, sheets, idMap, result);
+        await softConn.commit();
+      } catch (err) {
+        try {
+          await softConn.rollback();
+        } catch {
+          /* ignore */
+        }
+        result.approvalMatrixError = err.message;
+        console.warn('[lender-policy-import:approval-matrix]', err?.message || err);
+      }
+
+      try {
+        await softConn.beginTransaction();
+        await upsertPolicyPackFromSheets(softConn, sheets, idMap, result, committedBy);
+        await softConn.commit();
+      } catch (err) {
+        try {
+          await softConn.rollback();
+        } catch {
+          /* ignore */
+        }
+        result.policyPackError = err.message;
+        console.warn('[lender-policy-import:policy-pack]', err?.message || err);
+      }
+    } finally {
+      softConn.release();
     }
 
-    // Mark committed before geo — large Location_Rules must not roll back lenders/products/rules.
-    await conn.execute(
+    // Mark committed before geo — large Location_Rules must not block / roll back core data.
+    await pool.execute(
       `UPDATE lender_policy_import_jobs SET
          status = 'committed',
          commit_result_json = :result,
@@ -1198,23 +1794,20 @@ export async function commitImportJob(jobId, committedBy) {
         by: committedBy || null,
       },
     );
-
-    await conn.commit();
-  } catch (err) {
-    await conn.rollback();
-    const wrapped = new Error(
-      err?.message
-        ? `Publish failed while saving lenders/products/rules: ${err.message}`
-        : 'Publish failed while saving lenders/products/rules',
-    );
-    wrapped.status = err?.status || 500;
-    wrapped.cause = err;
-    throw wrapped;
-  } finally {
-    conn.release();
+  } else {
+    // Rebuild idMap for geo retry from already-published lenders sheet.
+    Object.assign(result, prevResult || {});
+    const mapConn = await pool.getConnection();
+    try {
+      for (const row of sheets.Lenders || []) {
+        await upsertLender(mapConn, row, committedBy, idMap);
+      }
+    } finally {
+      mapConn.release();
+    }
   }
 
-  // Geo coverage (often thousands of PIN rows) runs after core publish succeeds.
+  // ——— Phase 3: geo (Location_Rules / Geo_Coverage) ———
   try {
     await ensureLenderGeoPolicySchema(pool);
     const geoRows = [
@@ -1263,14 +1856,18 @@ export async function commitImportJob(jobId, committedBy) {
       result.geoRowsInserted = geo.inserted;
       result.geoRowsSkippedNoBank = geo.skippedNoBank || 0;
       result.geoStatus = geo.status;
+      result.geoError = null;
       result.geoNote =
         'Geo version created as pending_approval — Super Admin must approve before live eligibility uses it.';
+    } else {
+      result.geoStatus = 'skipped';
     }
   } catch (err) {
     console.error('[lender-policy-import:geo]', err?.message || err);
     result.geoError = err.message;
+    result.geoStatus = 'failed';
     result.geoNote =
-      'Lenders/products/rules were published, but geo Location_Rules import failed. Retry geo from Lender geo policy or re-publish after fixing lender codes.';
+      'Lenders/products/rules were published, but geo Location_Rules import failed. Click Publish import again to retry geo only, or fix lender codes under Lender geo policy.';
   }
 
   try {
@@ -1295,8 +1892,8 @@ export function buildPolicyTemplateWorkbook() {
     XLSX.utils.aoa_to_sheet([
       ['Rfincare — Loan Advisory Lender Product Bulk Upload'],
       ['Workflow: Upload → Validate → Preview → Approve → Publish'],
-      ['1. Fill Lenders and Products (required).'],
-      ['2. Optional: Pricing_Rules, Document_Rules, Fees, Obligation_Rules, eligibility rule sheets, Policy_Versions, Matching_Rules, LTV/Risk/Exceptions.'],
+      ['1. Fill Lenders and Products (required). Products sheet includes classic Product Edit fields (rates, fees, charges, tenure, disbursal) plus Features / Eligibility_Criteria / Policies / Documentation_Required (one item per line, or separate with | ).'],
+      ['2. Optional: Pricing_Rules, Document_Rules, Fees, Obligation_Rules, Applicant/Income/Credit sheets. Publish also upserts Bank Approval Matrix (one rule per product) from Products + Applicant/Income/Credit/Obligation/Tenure/LTV.'],
       ['2b. Geo_Coverage (bank-level PIN/district INCLUDE|EXCLUDE|CONDITIONAL|BRANCH_DEPENDENT). Location_Rules also accepted.'],
       ['2c. After Publish, Super Admin must Approve geo version under Admin → Lender geo policy before live eligibility uses it.'],
       [`3. Operators on Rule_Conditions: ${ALLOWED_RULE_OPERATORS.join(', ')}`],

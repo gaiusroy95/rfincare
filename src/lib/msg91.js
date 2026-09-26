@@ -22,8 +22,12 @@ import { fetchWithTimeout } from './fetchWithTimeout.js';
 
 const MSG91_OTP_URL = 'https://control.msg91.com/api/v5/otp';
 const MSG91_EMAIL_URL = 'https://control.msg91.com/api/v5/email/send';
+const MSG91_EMAIL_TEMPLATES_URL = 'https://control.msg91.com/api/v5/email/templates';
 const MSG91_FLOW_URL = 'https://control.msg91.com/api/v5/flow/';
 const MSG91_SMS_HTTP_URL = 'https://control.msg91.com/api/sendhttp.php';
+const MSG91_NOTIFICATION_TEMPLATE_SLUG = 'rfincare_notification';
+/** Cached after first successful ensure/create of the transactional email template. */
+let cachedNotificationTemplateId = null;
 /** Official WhatsApp bulk endpoint (MSG91 OTP docs). control.msg91.com kept as fallback. */
 const MSG91_WHATSAPP_URLS = [
   'https://api.msg91.com/api/v5/whatsapp/whatsapp-outbound-message/bulk/',
@@ -153,6 +157,11 @@ export function getMsg91EmailConfig(overrides = {}) {
     emailOtpTemplateId:
       overrides.msg91EmailOtpTemplateId ||
       process.env.MSG91_EMAIL_OTP_TEMPLATE_ID ||
+      '',
+    /** Dedicated non-OTP template ({{SUBJECT}} / {{BODY}}); falls back to auto-provisioned slug. */
+    transactionalTemplateId:
+      overrides.msg91EmailTransactionalTemplateId ||
+      process.env.MSG91_EMAIL_TRANSACTIONAL_TEMPLATE_ID ||
       '',
     otpVariableName:
       overrides.msg91EmailOtpVariable ||
@@ -601,9 +610,118 @@ export async function sendMsg91EmailOtp({
   };
 }
 
+function toMsg91Attachment(attachment) {
+  if (!attachment) return null;
+  const fileName = String(attachment.filename || attachment.fileName || 'attachment.bin');
+  if (attachment.filePath || attachment.path?.startsWith?.('http')) {
+    return {
+      fileName,
+      filePath: attachment.filePath || attachment.path,
+    };
+  }
+  const raw = attachment.content;
+  if (raw == null) return null;
+  const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(String(raw), 'utf8');
+  const mime = String(attachment.contentType || attachment.content_type || 'application/octet-stream')
+    .split(';')[0]
+    .trim() || 'application/octet-stream';
+  return {
+    fileName,
+    file: `data:${mime};base64,${buf.toString('base64')}`,
+  };
+}
+
+/**
+ * MSG91 Email API requires a template_id. Ensure a reusable {{SUBJECT}}/{{BODY}}
+ * template exists (create once, cache slug). Falls back to configured IDs.
+ */
+async function resolveMsg91TransactionalTemplateId(config) {
+  const explicit = String(
+    config.transactionalTemplateId
+      || process.env.MSG91_EMAIL_TRANSACTIONAL_TEMPLATE_ID
+      || '',
+  ).trim();
+  if (explicit) return explicit;
+  if (cachedNotificationTemplateId) return cachedNotificationTemplateId;
+
+  try {
+    const createRes = await fetchWithTimeout(
+      MSG91_EMAIL_TEMPLATES_URL,
+      {
+        method: 'POST',
+        headers: {
+          authkey: config.authKey,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({
+          name: 'Rfincare Notification',
+          slug: MSG91_NOTIFICATION_TEMPLATE_SLUG,
+          subject: '{{SUBJECT}}',
+          body:
+            '<div style="font-family:system-ui,sans-serif;white-space:pre-wrap;line-height:1.5">'
+            + '{{BODY}}</div>',
+        }),
+        timeoutMessage: 'MSG91 email template create timed out.',
+      },
+      MSG91_FETCH_TIMEOUT_MS,
+    );
+    const text = await createRes.text();
+    let data = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = null;
+    }
+    // Created, or already exists — either way the slug is usable as template_id.
+    if (
+      createRes.ok
+      || /already|exist|duplicate/i.test(String(data?.message || data?.msg || text || ''))
+    ) {
+      const slug =
+        data?.data?.slug
+        || data?.slug
+        || data?.data?.template_id
+        || data?.template_id
+        || MSG91_NOTIFICATION_TEMPLATE_SLUG;
+      cachedNotificationTemplateId = String(slug);
+      return cachedNotificationTemplateId;
+    }
+    console.warn(
+      '[msg91:email:template]',
+      String(data?.message || data?.msg || text || `HTTP ${createRes.status}`).slice(0, 300),
+    );
+  } catch (err) {
+    console.warn('[msg91:email:template]', err?.message || err);
+  }
+
+  // Last resort: configured OTP template (variables SUBJECT/BODY still passed).
+  const otpTpl = String(config.emailOtpTemplateId || '').trim();
+  return otpTpl || MSG91_NOTIFICATION_TEMPLATE_SLUG;
+}
+
+async function postMsg91Email(payload) {
+  const res = await fetchWithTimeout(
+    MSG91_EMAIL_URL,
+    {
+      method: 'POST',
+      headers: {
+        authkey: payload._authKey,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify(payload.body),
+      timeoutMessage: 'MSG91 transactional email timed out.',
+    },
+    MSG91_FETCH_TIMEOUT_MS,
+  );
+  await parseMsg91Response(res);
+}
+
 /**
  * Send a general (non-OTP) email via MSG91 when SMTP is unavailable.
- * Uses verified domain + from address; prefers HTML body over OTP template.
+ * MSG91 Email API requires template_id — free-form body alone is rejected.
+ * Ensures a {{SUBJECT}}/{{BODY}} template, then sends with optional attachments.
  */
 export async function sendMsg91TransactionalEmail({
   to,
@@ -611,6 +729,7 @@ export async function sendMsg91TransactionalEmail({
   text,
   html,
   recipientName,
+  attachments = [],
   config: overrides = {},
 }) {
   const config = getMsg91EmailConfig(overrides);
@@ -619,6 +738,9 @@ export async function sendMsg91TransactionalEmail({
       sent: false,
       provider: 'msg91',
       reason: 'msg91_email_not_configured',
+      warningInternal:
+        'MSG91 email needs MSG91_AUTH_KEY, MSG91_EMAIL_DOMAIN, and MSG91_EMAIL_FROM_EMAIL '
+        + '(or the same fields in Admin → OTP settings).',
     };
   }
 
@@ -627,7 +749,16 @@ export async function sendMsg91TransactionalEmail({
     return { sent: false, provider: 'msg91', reason: 'no_recipient' };
   }
 
-  const body = {
+  const subjectLine = String(subject || 'Rfincare notification');
+  const textBody = String(text || '');
+  const htmlBody =
+    html
+    || `<pre style="font-family:sans-serif;white-space:pre-wrap">${textBody}</pre>`;
+  const msg91Attachments = (Array.isArray(attachments) ? attachments : [])
+    .map(toMsg91Attachment)
+    .filter(Boolean);
+
+  const basePayload = {
     recipients: [
       {
         to: [
@@ -636,6 +767,14 @@ export async function sendMsg91TransactionalEmail({
             name: recipientName || toEmail,
           },
         ],
+        variables: {
+          SUBJECT: subjectLine,
+          BODY: textBody,
+          MESSAGE: textBody,
+          HTML_BODY: htmlBody,
+          COMPANY: 'Rfincare',
+          NAME: recipientName || toEmail,
+        },
       },
     ],
     from: {
@@ -643,57 +782,73 @@ export async function sendMsg91TransactionalEmail({
       email: config.fromEmail,
     },
     domain: config.domain,
-    subject: String(subject || 'Rfincare notification'),
-    body: {
-      html: html || `<pre style="font-family:sans-serif;white-space:pre-wrap">${String(text || '')}</pre>`,
-      text: text || '',
-    },
   };
-
-  // Some MSG91 accounts require a template; include when available as a fallback path.
-  if (config.emailOtpTemplateId && process.env.MSG91_EMAIL_FORCE_TEMPLATE === 'true') {
-    body.template_id = config.emailOtpTemplateId;
-    body.recipients[0].variables = {
-      SUBJECT: String(subject || ''),
-      BODY: String(text || ''),
-      MESSAGE: String(text || ''),
-    };
-    delete body.subject;
-    delete body.body;
+  if (msg91Attachments.length) {
+    basePayload.attachments = msg91Attachments;
   }
 
-  try {
-    const res = await fetchWithTimeout(
-      MSG91_EMAIL_URL,
-      {
-        method: 'POST',
-        headers: {
-          authkey: config.authKey,
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-        },
-        body: JSON.stringify(body),
-        timeoutMessage: 'MSG91 transactional email timed out.',
-      },
-      MSG91_FETCH_TIMEOUT_MS,
-    );
-    await parseMsg91Response(res);
-    return {
-      sent: true,
-      provider: 'msg91',
-      mode: 'transactional_email',
-      domain: config.domain,
-      from: config.fromEmail,
+  const templateId = await resolveMsg91TransactionalTemplateId(config);
+  const attempts = [];
+
+  // 1) Template-based send (required by MSG91 Email API).
+  attempts.push({
+    label: 'template',
+    body: {
+      ...basePayload,
+      template_id: templateId,
+    },
+  });
+
+  // 2) Free-form body (rare accounts); tried only if template fails.
+  attempts.push({
+    label: 'raw_body',
+    body: {
+      ...basePayload,
+      subject: subjectLine,
+      body: { html: htmlBody, text: textBody },
+    },
+  });
+
+  // 3) Template without attachments if attachment payload was rejected.
+  if (msg91Attachments.length) {
+    const withoutAtt = {
+      ...basePayload,
+      template_id: templateId,
     };
-  } catch (err) {
-    console.error('[msg91:email]', err?.message || err);
-    return {
-      sent: false,
-      provider: 'msg91',
-      reason: 'msg91_email_failed',
-      warningInternal: err?.message || 'MSG91 email failed',
-    };
+    delete withoutAtt.attachments;
+    attempts.push({ label: 'template_no_attachments', body: withoutAtt });
   }
+
+  let lastError = null;
+  for (const attempt of attempts) {
+    try {
+      await postMsg91Email({ _authKey: config.authKey, body: attempt.body });
+      return {
+        sent: true,
+        provider: 'msg91',
+        mode: 'transactional_email',
+        channel: 'msg91',
+        domain: config.domain,
+        from: config.fromEmail,
+        templateId: attempt.body.template_id || null,
+        attachmentCount: Array.isArray(attempt.body.attachments)
+          ? attempt.body.attachments.length
+          : 0,
+        attempt: attempt.label,
+      };
+    } catch (err) {
+      lastError = err;
+      console.warn(`[msg91:email:${attempt.label}]`, err?.message || err);
+    }
+  }
+
+  console.error('[msg91:email]', lastError?.message || lastError);
+  return {
+    sent: false,
+    provider: 'msg91',
+    reason: 'msg91_email_failed',
+    warningInternal: lastError?.message || 'MSG91 email failed',
+  };
 }
 
 /** Non-destructive connectivity check for admin UI. */

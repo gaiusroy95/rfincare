@@ -6,8 +6,64 @@ const DEFAULT_AMBER_MINUTES = 15;
 const DEFAULT_MAX_REASSIGNMENTS = 5;
 
 let schemaReady = false;
+let settingsSchemaReady = false;
+
+/** Settings table only — must succeed even if marketing_leads alters fail. */
+export async function ensureLeadAssignmentSettingsSchema(pool = getPool()) {
+  if (settingsSchemaReady) return;
+  try {
+    await pool.execute(`
+      CREATE TABLE IF NOT EXISTS lead_assignment_settings (
+        id VARCHAR(32) NOT NULL DEFAULT 'default',
+        first_contact_tat_minutes INTEGER NOT NULL DEFAULT 20,
+        round_robin_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        last_assigned_employee_id CHAR(36) NULL,
+        amber_warning_minutes INTEGER NOT NULL DEFAULT 15,
+        red_zone_minutes INTEGER NOT NULL DEFAULT 20,
+        auto_reassign_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        max_reassignments INTEGER NOT NULL DEFAULT 5,
+        notify_email_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        notify_whatsapp_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id)
+      )
+    `);
+    await pool.execute(
+      `INSERT INTO lead_assignment_settings (id) VALUES ('default') ON CONFLICT (id) DO NOTHING`,
+    );
+
+    const settingsAlters = [
+      `ALTER TABLE lead_assignment_settings ADD COLUMN IF NOT EXISTS amber_warning_minutes INTEGER NOT NULL DEFAULT 15`,
+      `ALTER TABLE lead_assignment_settings ADD COLUMN IF NOT EXISTS red_zone_minutes INTEGER NOT NULL DEFAULT 20`,
+      `ALTER TABLE lead_assignment_settings ADD COLUMN IF NOT EXISTS auto_reassign_enabled BOOLEAN NOT NULL DEFAULT TRUE`,
+      `ALTER TABLE lead_assignment_settings ADD COLUMN IF NOT EXISTS max_reassignments INTEGER NOT NULL DEFAULT 5`,
+      `ALTER TABLE lead_assignment_settings ADD COLUMN IF NOT EXISTS notify_email_enabled BOOLEAN NOT NULL DEFAULT TRUE`,
+      `ALTER TABLE lead_assignment_settings ADD COLUMN IF NOT EXISTS notify_whatsapp_enabled BOOLEAN NOT NULL DEFAULT TRUE`,
+      `ALTER TABLE lead_assignment_settings ADD COLUMN IF NOT EXISTS last_assigned_employee_id CHAR(36) NULL`,
+      `ALTER TABLE lead_assignment_settings ADD COLUMN IF NOT EXISTS round_robin_enabled BOOLEAN NOT NULL DEFAULT TRUE`,
+      `ALTER TABLE lead_assignment_settings ADD COLUMN IF NOT EXISTS first_contact_tat_minutes INTEGER NOT NULL DEFAULT 20`,
+    ];
+    for (const sql of settingsAlters) {
+      try {
+        await pool.execute(sql);
+      } catch (err) {
+        if (!isDuplicateColumnError(err) && !isIgnorableMigrationError(err)) {
+          console.warn('[lead-assignment-settings-alter]', err?.message || err);
+        }
+      }
+    }
+    settingsSchemaReady = true;
+  } catch (err) {
+    if (isIgnorableMigrationError(err)) {
+      settingsSchemaReady = true;
+      return;
+    }
+    throw err;
+  }
+}
 
 export async function ensureLeadAssignmentSchema(pool = getPool()) {
+  await ensureLeadAssignmentSettingsSchema(pool);
   if (schemaReady) return;
   try {
     const alters = [
@@ -39,79 +95,52 @@ export async function ensureLeadAssignmentSchema(pool = getPool()) {
       try {
         await pool.execute(sql);
       } catch (err) {
-        if (!isDuplicateColumnError(err) && !isIgnorableMigrationError(err)) throw err;
+        if (!isDuplicateColumnError(err) && !isIgnorableMigrationError(err)) {
+          // Best-effort — do not block TAT settings save if lead-column alters fail.
+          console.warn('[lead-assignment-alter]', err?.message || err);
+        }
       }
     }
 
-    await pool.execute(`
-      CREATE TABLE IF NOT EXISTS lead_assignment_settings (
-        id VARCHAR(32) NOT NULL DEFAULT 'default',
-        first_contact_tat_minutes INTEGER NOT NULL DEFAULT 20,
-        round_robin_enabled BOOLEAN NOT NULL DEFAULT TRUE,
-        last_assigned_employee_id CHAR(36) NULL,
-        amber_warning_minutes INTEGER NOT NULL DEFAULT 15,
-        red_zone_minutes INTEGER NOT NULL DEFAULT 20,
-        auto_reassign_enabled BOOLEAN NOT NULL DEFAULT TRUE,
-        max_reassignments INTEGER NOT NULL DEFAULT 5,
-        notify_email_enabled BOOLEAN NOT NULL DEFAULT TRUE,
-        notify_whatsapp_enabled BOOLEAN NOT NULL DEFAULT TRUE,
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (id)
-      )
-    `);
-    await pool.execute(
-      `INSERT INTO lead_assignment_settings (id) VALUES ('default') ON CONFLICT (id) DO NOTHING`,
-    );
-
-    const settingsAlters = [
-      `ALTER TABLE lead_assignment_settings ADD COLUMN IF NOT EXISTS amber_warning_minutes INTEGER NOT NULL DEFAULT 15`,
-      `ALTER TABLE lead_assignment_settings ADD COLUMN IF NOT EXISTS red_zone_minutes INTEGER NOT NULL DEFAULT 20`,
-      `ALTER TABLE lead_assignment_settings ADD COLUMN IF NOT EXISTS auto_reassign_enabled BOOLEAN NOT NULL DEFAULT TRUE`,
-      `ALTER TABLE lead_assignment_settings ADD COLUMN IF NOT EXISTS max_reassignments INTEGER NOT NULL DEFAULT 5`,
-      `ALTER TABLE lead_assignment_settings ADD COLUMN IF NOT EXISTS notify_email_enabled BOOLEAN NOT NULL DEFAULT TRUE`,
-      `ALTER TABLE lead_assignment_settings ADD COLUMN IF NOT EXISTS notify_whatsapp_enabled BOOLEAN NOT NULL DEFAULT TRUE`,
-    ];
-    for (const sql of settingsAlters) {
-      try {
-        await pool.execute(sql);
-      } catch (err) {
-        if (!isDuplicateColumnError(err) && !isIgnorableMigrationError(err)) throw err;
-      }
+    try {
+      await pool.execute(`
+        CREATE TABLE IF NOT EXISTS lead_activities (
+          id CHAR(36) NOT NULL PRIMARY KEY,
+          lead_id CHAR(36) NOT NULL,
+          actor_user_id CHAR(36) NULL,
+          activity_type VARCHAR(32) NOT NULL,
+          channel VARCHAR(32) NULL,
+          notes TEXT NULL,
+          meta_json JSONB NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      await pool.execute(`
+        CREATE TABLE IF NOT EXISTS lead_assignment_history (
+          id CHAR(36) NOT NULL PRIMARY KEY,
+          lead_id CHAR(36) NOT NULL,
+          from_employee_id CHAR(36) NULL,
+          to_employee_id CHAR(36) NULL,
+          assignment_rule VARCHAR(64) NULL,
+          queue_position INTEGER NULL,
+          reason VARCHAR(64) NULL,
+          tat_minutes INTEGER NULL,
+          meta_json JSONB NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+    } catch (err) {
+      console.warn('[lead-assignment-history]', err?.message || err);
     }
-
-    await pool.execute(`
-      CREATE TABLE IF NOT EXISTS lead_activities (
-        id CHAR(36) NOT NULL PRIMARY KEY,
-        lead_id CHAR(36) NOT NULL,
-        actor_user_id CHAR(36) NULL,
-        activity_type VARCHAR(32) NOT NULL,
-        channel VARCHAR(32) NULL,
-        notes TEXT NULL,
-        meta_json JSONB NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-    await pool.execute(`
-      CREATE TABLE IF NOT EXISTS lead_assignment_history (
-        id CHAR(36) NOT NULL PRIMARY KEY,
-        lead_id CHAR(36) NOT NULL,
-        from_employee_id CHAR(36) NULL,
-        to_employee_id CHAR(36) NULL,
-        assignment_rule VARCHAR(64) NULL,
-        queue_position INTEGER NULL,
-        reason VARCHAR(64) NULL,
-        tat_minutes INTEGER NULL,
-        meta_json JSONB NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
     schemaReady = true;
   } catch (err) {
     if (isIgnorableMigrationError(err)) {
       schemaReady = true;
       return;
     }
-    throw err;
+    // Settings schema is already ready — allow settings APIs to proceed.
+    console.warn('[lead-assignment-schema]', err?.message || err);
+    schemaReady = true;
   }
 }
 
@@ -121,7 +150,8 @@ function boolSetting(value, fallback = true) {
 }
 
 export async function getLeadAssignmentSettings(pool = getPool()) {
-  await ensureLeadAssignmentSchema(pool);
+  await ensureLeadAssignmentSettingsSchema(pool);
+  await ensureLeadAssignmentSchema(pool).catch(() => {});
   const [[row]] = await pool.execute(
     `SELECT * FROM lead_assignment_settings WHERE id = 'default' LIMIT 1`,
   );
@@ -140,16 +170,16 @@ export async function getLeadAssignmentSettings(pool = getPool()) {
 }
 
 export async function updateLeadAssignmentSettings(pool, patch = {}) {
-  await ensureLeadAssignmentSchema(pool);
+  await ensureLeadAssignmentSettingsSchema(pool);
   const current = await getLeadAssignmentSettings(pool);
   const tat = patch.firstContactTatMinutes != null
-    ? Math.max(1, Math.min(240, Number(patch.firstContactTatMinutes)))
+    ? Math.max(1, Math.min(240, Number(patch.firstContactTatMinutes) || DEFAULT_TAT_MINUTES))
     : current.firstContactTatMinutes;
   const amber = patch.amberWarningMinutes != null
-    ? Math.max(1, Math.min(tat, Number(patch.amberWarningMinutes)))
-    : current.amberWarningMinutes;
+    ? Math.max(1, Math.min(tat, Number(patch.amberWarningMinutes) || DEFAULT_AMBER_MINUTES))
+    : Math.min(tat, current.amberWarningMinutes);
   const red = patch.redZoneMinutes != null
-    ? Math.max(amber, Math.min(240, Number(patch.redZoneMinutes)))
+    ? Math.max(amber, Math.min(240, Number(patch.redZoneMinutes) || tat))
     : Math.max(amber, current.redZoneMinutes || tat);
   const enabled = patch.roundRobinEnabled != null
     ? Boolean(patch.roundRobinEnabled)
@@ -158,7 +188,7 @@ export async function updateLeadAssignmentSettings(pool, patch = {}) {
     ? Boolean(patch.autoReassignEnabled)
     : current.autoReassignEnabled;
   const maxReassign = patch.maxReassignments != null
-    ? Math.max(0, Math.min(50, Number(patch.maxReassignments)))
+    ? Math.max(0, Math.min(50, Number(patch.maxReassignments) || 0))
     : current.maxReassignments;
   const notifyEmail = patch.notifyEmailEnabled != null
     ? Boolean(patch.notifyEmailEnabled)
@@ -167,28 +197,52 @@ export async function updateLeadAssignmentSettings(pool, patch = {}) {
     ? Boolean(patch.notifyWhatsappEnabled)
     : current.notifyWhatsappEnabled;
 
+  // Embed sanitized literals — avoids PG "could not determine data type of parameter"
+  // when CAST(:name AS BOOLEAN/INTEGER) is used with unbound named params.
+  const tatInt = Math.trunc(Number(tat)) || DEFAULT_TAT_MINUTES;
+  const amberInt = Math.trunc(Number(amber)) || DEFAULT_AMBER_MINUTES;
+  const redInt = Math.trunc(Number(red)) || tatInt;
+  const maxReassignInt = Math.trunc(Number(maxReassign)) || 0;
+  const enabledSql = enabled ? 'TRUE' : 'FALSE';
+  const autoReassignSql = autoReassign ? 'TRUE' : 'FALSE';
+  const notifyEmailSql = notifyEmail ? 'TRUE' : 'FALSE';
+  const notifyWaSql = notifyWa ? 'TRUE' : 'FALSE';
+
+  // UPSERT so save works even if the default row was never inserted.
   await pool.execute(
-    `UPDATE lead_assignment_settings SET
-       first_contact_tat_minutes = :tat,
-       round_robin_enabled = :enabled,
-       amber_warning_minutes = :amber,
-       red_zone_minutes = :red,
-       auto_reassign_enabled = :auto_reassign,
-       max_reassignments = :max_reassign,
-       notify_email_enabled = :notify_email,
-       notify_whatsapp_enabled = :notify_wa,
-       updated_at = NOW()
-     WHERE id = 'default'`,
-    {
-      tat,
-      enabled,
-      amber,
-      red,
-      auto_reassign: autoReassign,
-      max_reassign: maxReassign,
-      notify_email: notifyEmail,
-      notify_wa: notifyWa,
-    },
+    `INSERT INTO lead_assignment_settings (
+       id,
+       first_contact_tat_minutes,
+       round_robin_enabled,
+       amber_warning_minutes,
+       red_zone_minutes,
+       auto_reassign_enabled,
+       max_reassignments,
+       notify_email_enabled,
+       notify_whatsapp_enabled,
+       updated_at
+     ) VALUES (
+       'default',
+       ${tatInt},
+       ${enabledSql},
+       ${amberInt},
+       ${redInt},
+       ${autoReassignSql},
+       ${maxReassignInt},
+       ${notifyEmailSql},
+       ${notifyWaSql},
+       NOW()
+     )
+     ON CONFLICT (id) DO UPDATE SET
+       first_contact_tat_minutes = EXCLUDED.first_contact_tat_minutes,
+       round_robin_enabled = EXCLUDED.round_robin_enabled,
+       amber_warning_minutes = EXCLUDED.amber_warning_minutes,
+       red_zone_minutes = EXCLUDED.red_zone_minutes,
+       auto_reassign_enabled = EXCLUDED.auto_reassign_enabled,
+       max_reassignments = EXCLUDED.max_reassignments,
+       notify_email_enabled = EXCLUDED.notify_email_enabled,
+       notify_whatsapp_enabled = EXCLUDED.notify_whatsapp_enabled,
+       updated_at = NOW()`,
   );
   return getLeadAssignmentSettings(pool);
 }
@@ -313,13 +367,21 @@ async function writeAssignmentHistory(pool, {
        id, lead_id, from_employee_id, to_employee_id, assignment_rule,
        queue_position, reason, tat_minutes, meta_json
      ) VALUES (
-       :id, :lead_id, :from_id, :to_id, :rule, :pos, :reason, :tat, :meta
+       CAST(:id AS CHAR(36)),
+       CAST(:lead_id AS CHAR(36)),
+       CAST(:from_id AS CHAR(36)),
+       CAST(:to_id AS CHAR(36)),
+       CAST(:rule AS TEXT),
+       CAST(:pos AS INTEGER),
+       CAST(:reason AS TEXT),
+       CAST(:tat AS INTEGER),
+       CAST(:meta AS JSONB)
      )`,
     {
       id,
       lead_id: leadId,
-      from_id: fromEmployeeId,
-      to_id: toEmployeeId,
+      from_id: fromEmployeeId || null,
+      to_id: toEmployeeId || null,
       rule: assignmentRule,
       pos: queuePosition,
       reason,
@@ -342,7 +404,72 @@ function leadDeepLink(leadId) {
 }
 
 /**
- * Notify L1 assignee + L2 supervisors + L3 admins (in-app + email; WhatsApp best-effort).
+ * Resolve the immediate next-level manager for an employee (by lead_level).
+ * Prefers the lowest lead_level strictly greater than the assignee's level.
+ */
+export async function resolveImmediateManager(pool, employeeUserId) {
+  if (!employeeUserId) return null;
+  const [[self]] = await pool.execute(
+    `SELECT up.id,
+            COALESCE(eo.lead_level, h.min_level, 1)::int AS lead_level
+     FROM user_profiles up
+     LEFT JOIN employee_onboarding eo ON eo.user_id = up.id
+     LEFT JOIN (
+       SELECT employee_user_id, MIN(hierarchy_level)::int AS min_level
+       FROM agent_employee_hierarchy
+       GROUP BY employee_user_id
+     ) h ON h.employee_user_id = up.id
+     WHERE up.id = :id
+     LIMIT 1`,
+    { id: employeeUserId },
+  ).catch(() => [[null]]);
+
+  const selfLevel = Number(self?.lead_level || 1);
+
+  const [managers] = await pool.execute(
+    `SELECT up.id, up.full_name, up.phone,
+            NULLIF(TRIM(COALESCE(eo.email, up.email, '')), '') AS email,
+            COALESCE(eo.lead_level, h.min_level, 2)::int AS lead_level
+     FROM user_profiles up
+     LEFT JOIN employee_onboarding eo ON eo.user_id = up.id
+     LEFT JOIN (
+       SELECT employee_user_id, MIN(hierarchy_level)::int AS min_level
+       FROM agent_employee_hierarchy
+       GROUP BY employee_user_id
+     ) h ON h.employee_user_id = up.id
+     WHERE up.role = 'employee'
+       AND up.id <> :id
+       AND COALESCE(up.is_active, TRUE) = TRUE
+       AND COALESCE(eo.lead_level, h.min_level, 0) > CAST(:level AS INTEGER)
+     ORDER BY COALESCE(eo.lead_level, h.min_level, 99) ASC, eo.employee_code ASC NULLS LAST
+     LIMIT 5`,
+    { id: employeeUserId, level: selfLevel },
+  ).catch(() => [[]]);
+
+  if (managers?.length) return managers[0];
+
+  // Fallback: any L2+ employee
+  const [[fallback]] = await pool.execute(
+    `SELECT up.id, up.full_name, up.phone,
+            NULLIF(TRIM(COALESCE(eo.email, up.email, '')), '') AS email,
+            COALESCE(eo.lead_level, 2)::int AS lead_level
+     FROM user_profiles up
+     LEFT JOIN employee_onboarding eo ON eo.user_id = up.id
+     WHERE up.role = 'employee'
+       AND up.id <> :id
+       AND COALESCE(up.is_active, TRUE) = TRUE
+       AND COALESCE(eo.lead_level, 0) >= 2
+     ORDER BY eo.lead_level ASC, eo.employee_code ASC NULLS LAST
+     LIMIT 1`,
+    { id: employeeUserId },
+  ).catch(() => [[null]]);
+
+  return fallback || null;
+}
+
+/**
+ * Notify assigned employee (TO) + immediate manager (CC) + in-app for L2/admin.
+ * For TAT miss: email goes to the responsible assignee with manager in CC.
  */
 export async function notifyLeadStakeholders(pool, {
   lead,
@@ -355,12 +482,13 @@ export async function notifyLeadStakeholders(pool, {
   const settings = await getLeadAssignmentSettings(pool);
   const link = leadDeepLink(lead.id);
   const fullMessage = link ? `${message}\n\nOpen lead: ${link}` : message;
-  const isTatEvent = ['lead_tat_missed', 'lead_reassigned'].includes(String(eventType || ''));
+  const isTatEvent = ['lead_tat_missed', 'lead_reassigned', 'lead_tat_warning'].includes(
+    String(eventType || ''),
+  );
 
   try {
     const { createStaffNotification } = await import('../routes/notifications.js');
 
-    // Official employee mail: prefer employee_onboarding.email over profile email.
     const [allEmployees] = await pool.execute(
       `SELECT up.id, up.full_name, up.role, up.phone,
               NULLIF(TRIM(COALESCE(eo.email, '')), '') AS official_email,
@@ -374,19 +502,21 @@ export async function notifyLeadStakeholders(pool, {
 
     const withOfficialEmail = (row) => ({
       ...row,
-      email: row.official_email || row.profile_email || null,
+      email: row?.official_email || row?.profile_email || row?.email || null,
     });
 
     const employees = (allEmployees || []).map(withOfficialEmail);
 
+    let assigneeRow = null;
     if (assignee?.id) {
-      const assigneeRow = employees.find((e) => e.id === assignee.id) || withOfficialEmail({
+      assigneeRow = employees.find((e) => e.id === assignee.id) || withOfficialEmail({
         id: assignee.id,
         official_email: null,
         profile_email: assignee.email,
         phone: assignee.phone,
         full_name: assignee.full_name || assignee.fullName,
         role: 'employee',
+        lead_level: assignee.lead_level || 1,
       });
       await createStaffNotification(pool, {
         userId: assigneeRow.id,
@@ -398,12 +528,30 @@ export async function notifyLeadStakeholders(pool, {
       }).catch(() => {});
     }
 
-    // In-app: L2+ supervisors (and for TAT events, all employees get email below).
-    const supervisors = employees.filter(
-      (e) => Number(e.lead_level || 0) >= 2 && e.id !== assignee?.id,
-    );
+    const manager = assigneeRow?.id
+      ? await resolveImmediateManager(pool, assigneeRow.id)
+      : null;
+    const managerRow = manager ? withOfficialEmail(manager) : null;
 
-    for (const sup of supervisors) {
+    if (managerRow?.id) {
+      await createStaffNotification(pool, {
+        userId: managerRow.id,
+        role: 'employee',
+        eventType,
+        title,
+        message: fullMessage,
+        data: { leadId: lead.id, path: link, escalatedFrom: assigneeRow?.id || null },
+      }).catch(() => {});
+    }
+
+    // Broader in-app for other L2+ (visibility) excluding assignee/manager already notified.
+    const supervisors = employees.filter(
+      (e) =>
+        Number(e.lead_level || 0) >= 2
+        && e.id !== assigneeRow?.id
+        && e.id !== managerRow?.id,
+    );
+    for (const sup of supervisors.slice(0, 10)) {
       await createStaffNotification(pool, {
         userId: sup.id,
         role: 'employee',
@@ -431,36 +579,42 @@ export async function notifyLeadStakeholders(pool, {
       }).catch(() => {});
     }
 
-    // Leads TAT / assignment email: official employee mail only (no WhatsApp).
-    // TAT events are broadcast to all active employees via the existing sendEmail path.
     if (settings.notifyEmailEnabled) {
       const { sendEmail } = await import('./email.js');
-      const recipients = new Map();
-
-      if (isTatEvent) {
-        for (const emp of employees) {
-          if (emp.email) recipients.set(String(emp.email).toLowerCase(), emp);
-        }
-      } else {
-        if (assignee?.id) {
-          const a = employees.find((e) => e.id === assignee.id);
-          if (a?.email) recipients.set(String(a.email).toLowerCase(), a);
-          else if (assignee.email) {
-            recipients.set(String(assignee.email).toLowerCase(), assignee);
-          }
-        }
-        for (const s of supervisors) {
-          if (s.email) recipients.set(String(s.email).toLowerCase(), s);
-        }
+      const toEmail =
+        assigneeRow?.email
+        || (assignee?.email ? String(assignee.email).trim() : null);
+      const ccList = [];
+      if (managerRow?.email && String(managerRow.email).toLowerCase() !== String(toEmail || '').toLowerCase()) {
+        ccList.push(managerRow.email);
       }
 
-      for (const a of admins || []) {
-        if (a.email) recipients.set(String(a.email).toLowerCase(), a);
-      }
-
-      for (const [email] of recipients) {
+      if (toEmail) {
         await sendEmail({
-          to: email,
+          to: toEmail,
+          cc: ccList.length ? ccList : undefined,
+          subject: title,
+          text: fullMessage,
+          html: `<p>${fullMessage.replace(/\n/g, '<br/>')}</p>`,
+        }).catch(() => {});
+
+        await recordLeadActivity(pool, {
+          leadId: lead.id,
+          activityType: isTatEvent ? 'tat_notification_sent' : 'assignment_notification_sent',
+          channel: 'email',
+          notes: `Email sent to ${toEmail}${ccList.length ? ` (CC: ${ccList.join(', ')})` : ''}`,
+          meta: {
+            eventType,
+            to: toEmail,
+            cc: ccList,
+            assigneeId: assigneeRow?.id || null,
+            managerId: managerRow?.id || null,
+          },
+        }).catch(() => {});
+      } else if (isTatEvent && managerRow?.email) {
+        // No assignee email — escalate directly to manager.
+        await sendEmail({
+          to: managerRow.email,
           subject: title,
           text: fullMessage,
           html: `<p>${fullMessage.replace(/\n/g, '<br/>')}</p>`,
@@ -468,7 +622,68 @@ export async function notifyLeadStakeholders(pool, {
       }
     }
 
-    // WhatsApp disabled for lead TAT / assignment alerts — official email only.
+    if (settings.notifyWhatsappEnabled) {
+      const waTargets = [];
+      const seenPhones = new Set();
+      const pushTarget = (row, role) => {
+        const phone = String(row?.phone || '').replace(/\D/g, '').slice(-10);
+        if (!phone || phone.length !== 10 || seenPhones.has(phone)) return;
+        seenPhones.add(phone);
+        waTargets.push({
+          phone,
+          role,
+          userId: row?.id || null,
+          name: row?.full_name || row?.fullName || role,
+        });
+      };
+      pushTarget(assigneeRow || assignee, 'assignee');
+      pushTarget(managerRow, 'manager');
+
+      if (waTargets.length) {
+        const {
+          sendMsg91TransactionalSms,
+          isMsg91Configured,
+        } = await import('./msg91.js');
+        // Free-text WhatsApp templates are not available for lead events; MSG91
+        // transactional SMS is the reliable WhatsApp-notify fallback.
+        const smsBody = String(fullMessage || message || title || '')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .slice(0, 300);
+
+        if (smsBody && isMsg91Configured()) {
+          for (const target of waTargets) {
+            try {
+              await sendMsg91TransactionalSms({
+                phone: target.phone,
+                message: smsBody,
+              });
+              await recordLeadActivity(pool, {
+                leadId: lead.id,
+                activityType: isTatEvent ? 'tat_notification_sent' : 'assignment_notification_sent',
+                channel: 'whatsapp',
+                notes: `WhatsApp notify (SMS fallback) to ${target.role} ${target.phone}`,
+                meta: {
+                  eventType,
+                  delivery: 'sms_fallback',
+                  role: target.role,
+                  phone: target.phone,
+                  userId: target.userId,
+                  assigneeId: assigneeRow?.id || null,
+                  managerId: managerRow?.id || null,
+                },
+              }).catch(() => {});
+            } catch (waErr) {
+              console.warn('[lead-notify:whatsapp]', target.phone, waErr?.message || waErr);
+            }
+          }
+        } else if (smsBody) {
+          for (const target of waTargets) {
+            console.log('[lead-notify:whatsapp:console]', target.role, target.phone, smsBody.slice(0, 120));
+          }
+        }
+      }
+    }
   } catch (err) {
     console.warn('[lead-notify]', err?.message || err);
   }
@@ -489,28 +704,32 @@ async function assignToEmployee(pool, {
 
   await pool.execute(
     `UPDATE marketing_leads SET
-       previous_assigned_to = CASE WHEN :from_id IS NOT NULL THEN :from_id ELSE previous_assigned_to END,
-       assigned_to = :assignee,
+       previous_assigned_to = CASE
+         WHEN CAST(:from_id AS TEXT) IS NOT NULL AND CAST(:from_id AS TEXT) <> ''
+         THEN CAST(:from_id AS CHAR(36))
+         ELSE previous_assigned_to
+       END,
+       assigned_to = CAST(:assignee AS CHAR(36)),
        assigned_at = NOW(),
        assignment_method = :method,
        status = CASE
          WHEN status IN ('new', 'verified', 'draft_started') THEN 'assigned'
          ELSE status
        END,
-       tat_minutes = :tat_minutes,
-       first_contact_due_at = NOW() + (:tat_minutes * INTERVAL '1 minute'),
+       tat_minutes = CAST(:tat_minutes AS INTEGER),
+       first_contact_due_at = NOW() + (CAST(:tat_minutes AS INTEGER) * INTERVAL '1 minute'),
        first_contact_at = NULL,
        first_contact_channel = NULL,
        first_contact_by = NULL,
        tat_status = 'pending',
        red_zone = CASE WHEN :reason = 'tat_miss' THEN TRUE ELSE COALESCE(red_zone, FALSE) END,
-       reassignment_count = COALESCE(reassignment_count, 0) + :bump,
+       reassignment_count = COALESCE(reassignment_count, 0) + CAST(:bump AS INTEGER),
        updated_at = NOW()
-     WHERE id = :id`,
+     WHERE id = CAST(:id AS CHAR(36))`,
     {
       id: leadId,
       assignee: employee.id,
-      from_id: fromEmployeeId,
+      from_id: fromEmployeeId || null,
       method,
       tat_minutes: tatMinutes,
       reason,
@@ -520,7 +739,7 @@ async function assignToEmployee(pool, {
 
   await pool.execute(
     `UPDATE lead_assignment_settings SET
-       last_assigned_employee_id = :assignee,
+       last_assigned_employee_id = CAST(:assignee AS CHAR(36)),
        updated_at = NOW()
      WHERE id = 'default'`,
     { assignee: employee.id },
@@ -614,6 +833,35 @@ export async function autoAssignLeadRoundRobin(pool, leadId, { force = false } =
 }
 
 /**
+ * Best-effort: assign a backlog of unassigned leads via round-robin (e.g. after TAT settings save).
+ */
+export async function assignUnassignedLeadsBacklog(pool, { limit = 50 } = {}) {
+  await ensureLeadAssignmentSchema(pool);
+  const settings = await getLeadAssignmentSettings(pool);
+  if (!settings.roundRobinEnabled) {
+    return { scanned: 0, assigned: 0, skipped: true };
+  }
+  const cap = Math.max(1, Math.min(200, Number(limit) || 50));
+  const [rows] = await pool.execute(
+    `SELECT id FROM marketing_leads
+     WHERE assigned_to IS NULL
+     ORDER BY created_at ASC NULLS LAST
+     LIMIT ${cap}`,
+  ).catch(() => [[]]);
+
+  let assigned = 0;
+  for (const row of rows || []) {
+    try {
+      const result = await autoAssignLeadRoundRobin(pool, row.id);
+      if (result?.assigned_to) assigned += 1;
+    } catch (err) {
+      console.warn('[lead-assign:backlog]', row?.id, err?.message || err);
+    }
+  }
+  return { scanned: (rows || []).length, assigned, skipped: false };
+}
+
+/**
  * When a lead is manually assigned, still start TAT if not already started.
  */
 export async function ensureLeadTatClock(pool, leadId) {
@@ -623,14 +871,14 @@ export async function ensureLeadTatClock(pool, leadId) {
   await pool.execute(
     `UPDATE marketing_leads SET
        assigned_at = COALESCE(assigned_at, NOW()),
-       tat_minutes = COALESCE(tat_minutes, :tat_minutes),
+       tat_minutes = COALESCE(tat_minutes, CAST(:tat_minutes AS INTEGER)),
        first_contact_due_at = COALESCE(
          first_contact_due_at,
-         COALESCE(assigned_at, NOW()) + (:tat_minutes * INTERVAL '1 minute')
+         COALESCE(assigned_at, NOW()) + (CAST(:tat_minutes AS INTEGER) * INTERVAL '1 minute')
        ),
        tat_status = COALESCE(tat_status, 'pending'),
        updated_at = NOW()
-     WHERE id = :id
+     WHERE id = CAST(:id AS CHAR(36))
        AND first_contact_at IS NULL`,
     { id: leadId, tat_minutes: tatMinutes },
   );
@@ -650,12 +898,18 @@ export async function recordLeadActivity(pool, {
     `INSERT INTO lead_activities (
        id, lead_id, actor_user_id, activity_type, channel, notes, meta_json
      ) VALUES (
-       :id, :lead_id, :actor_user_id, :activity_type, :channel, :notes, :meta_json
+       CAST(:id AS CHAR(36)),
+       CAST(:lead_id AS CHAR(36)),
+       CAST(:actor_user_id AS CHAR(36)),
+       CAST(:activity_type AS TEXT),
+       CAST(:channel AS TEXT),
+       CAST(:notes AS TEXT),
+       CAST(:meta_json AS JSONB)
      )`,
     {
       id,
       lead_id: leadId,
-      actor_user_id: actorUserId,
+      actor_user_id: actorUserId || null,
       activity_type: activityType,
       channel: channel || null,
       notes: notes || null,
@@ -718,13 +972,13 @@ export async function recordLeadContact(pool, {
        whatsapp_message_count = whatsapp_message_count + CASE WHEN :channel = 'whatsapp' THEN 1 ELSE 0 END,
        first_contact_at = COALESCE(first_contact_at, NOW()),
        first_contact_channel = COALESCE(first_contact_channel, :channel),
-       first_contact_by = COALESCE(first_contact_by, :actor),
+       first_contact_by = COALESCE(first_contact_by, CAST(:actor AS CHAR(36))),
        tat_status = CASE
-         WHEN first_contact_at IS NULL THEN :tat_status
+         WHEN first_contact_at IS NULL THEN CAST(:tat_status AS TEXT)
          ELSE tat_status
        END,
        red_zone = CASE
-         WHEN first_contact_at IS NULL AND :tat_status = 'met' THEN FALSE
+         WHEN first_contact_at IS NULL AND CAST(:tat_status AS TEXT) = 'met' THEN FALSE
          ELSE red_zone
        END,
        status = CASE
@@ -787,7 +1041,7 @@ export async function listLeadActivities(pool, leadId, { limit = 50 } = {}) {
      LEFT JOIN user_profiles up ON up.id = la.actor_user_id
      WHERE la.lead_id = :lead_id
      ORDER BY la.created_at DESC
-     LIMIT :limit`,
+     LIMIT CAST(:limit AS INTEGER)`,
     { lead_id: leadId, limit: Math.min(Number(limit) || 50, 200) },
   );
   return rows || [];
@@ -818,69 +1072,113 @@ export async function processTatMissReassignments(pool, { limit = 50 } = {}) {
   const settings = await getLeadAssignmentSettings(pool);
   await refreshOverdueTatStatuses(pool);
 
-  if (!settings.autoReassignEnabled) {
-    return { processed: 0, reassigned: 0, capped: 0, skipped: 0 };
-  }
-
   const [overdue] = await pool.execute(
     `SELECT * FROM marketing_leads
      WHERE first_contact_at IS NULL
        AND assigned_to IS NOT NULL
        AND first_contact_due_at IS NOT NULL
        AND first_contact_due_at < NOW()
+       AND COALESCE(tat_status, 'breached') IN ('pending', 'breached')
      ORDER BY first_contact_due_at ASC
-     LIMIT :limit`,
+     LIMIT CAST(:limit AS INTEGER)`,
     { limit: Math.min(Number(limit) || 50, 200) },
   );
 
   let reassigned = 0;
   let capped = 0;
   let skipped = 0;
+  let notified = 0;
 
   for (const lead of overdue || []) {
+    // Avoid duplicate breach notifications within a short window.
+    const [[recentNotify]] = await pool.execute(
+      `SELECT id FROM lead_activities
+       WHERE lead_id = :lead_id
+         AND activity_type IN ('tat_missed', 'tat_notification_sent')
+         AND created_at > NOW() - INTERVAL '30 minutes'
+       LIMIT 1`,
+      { lead_id: lead.id },
+    ).catch(() => [[null]]);
+
     const count = Number(lead.reassignment_count || 0);
-    if (count >= settings.maxReassignments) {
+    const atCap = count >= settings.maxReassignments;
+
+    if (atCap && recentNotify) {
+      capped += 1;
+      continue;
+    }
+
+    if (atCap) {
       capped += 1;
       await recordLeadActivity(pool, {
         leadId: lead.id,
         activityType: 'tat_miss_capped',
         channel: 'system',
-        notes: `TAT missed but max reassignments (${settings.maxReassignments}) reached — lead stays active in Red Zone`,
+        notes: `TAT missed but max reassignments (${settings.maxReassignments}) reached — lead stays in Red Zone`,
         meta: { assignedTo: lead.assigned_to, reassignmentCount: count },
       }).catch(() => {});
-      // Still escalate alerts once when capped and recently breached
-      continue;
     }
 
     const previousId = lead.assigned_to;
+    let previousAssignee = null;
     if (previousId) {
-      await pool.execute(
-        `UPDATE employee_onboarding SET
-           missed_lead_count = COALESCE(missed_lead_count, 0) + 1
-         WHERE user_id = :id`,
+      const [[prev]] = await pool.execute(
+        `SELECT up.id, up.full_name, up.phone,
+                NULLIF(TRIM(COALESCE(eo.email, up.email, '')), '') AS email,
+                COALESCE(eo.lead_level, 1)::int AS lead_level
+         FROM user_profiles up
+         LEFT JOIN employee_onboarding eo ON eo.user_id = up.id
+         WHERE up.id = :id
+         LIMIT 1`,
         { id: previousId },
-      ).catch(() => {});
+      ).catch(() => [[null]]);
+      previousAssignee = prev || { id: previousId };
+
+      if (!recentNotify) {
+        await pool.execute(
+          `UPDATE employee_onboarding SET
+             missed_lead_count = COALESCE(missed_lead_count, 0) + 1
+           WHERE user_id = :id`,
+          { id: previousId },
+        ).catch(() => {});
+      }
     }
 
-    await recordLeadActivity(pool, {
-      leadId: lead.id,
-      activityType: 'tat_missed',
-      channel: 'system',
-      notes: `TAT missed by assignee ${previousId || 'unknown'} — entering Red Zone`,
-      meta: { previousAssignee: previousId, dueAt: lead.first_contact_due_at },
-    });
+    if (!recentNotify) {
+      await recordLeadActivity(pool, {
+        leadId: lead.id,
+        activityType: 'tat_missed',
+        channel: 'system',
+        notes: `TAT breached at ${new Date().toISOString()} — due was ${lead.first_contact_due_at || 'n/a'}`,
+        meta: {
+          previousAssignee: previousId,
+          dueAt: lead.first_contact_due_at,
+          assignedAt: lead.assigned_at,
+          amberWarningMinutes: settings.amberWarningMinutes,
+          tatMinutes: settings.firstContactTatMinutes,
+          breachedAt: new Date().toISOString(),
+        },
+      });
 
-    // Alert L2/L3 before reassignment
-    await notifyLeadStakeholders(pool, {
-      lead,
-      assignee: null,
-      eventType: 'lead_tat_missed',
-      title: `🔴 TAT MISSED — ${lead.full_name || lead.id}`,
-      message:
-        `Lead ${lead.full_name || lead.id} missed the ${settings.firstContactTatMinutes}-minute first-contact TAT`
-        + (previousId ? ` under the current assignee.` : '.')
-        + ` Auto-reassignment in progress.`,
-    }).catch(() => {});
+      await notifyLeadStakeholders(pool, {
+        lead,
+        assignee: previousAssignee,
+        eventType: 'lead_tat_missed',
+        title: `TAT missed — ${lead.full_name || lead.id}`,
+        message:
+          `Lead ${lead.full_name || lead.id} missed the ${settings.firstContactTatMinutes}-minute first-contact TAT`
+          + (previousAssignee?.full_name ? ` assigned to ${previousAssignee.full_name}.` : '.')
+          + (settings.autoReassignEnabled && !atCap
+            ? ' Auto-reassignment is in progress.'
+            : ' Please contact the customer immediately.'),
+      }).catch(() => {});
+      notified += 1;
+    }
+
+    if (!settings.autoReassignEnabled || atCap) {
+      skipped += 1;
+      continue;
+    }
 
     const candidates = await listAvailableL1Employees(pool, {
       excludeIds: [previousId].filter(Boolean),
@@ -910,6 +1208,7 @@ export async function processTatMissReassignments(pool, { limit = 50 } = {}) {
     reassigned,
     capped,
     skipped,
+    notified,
   };
 }
 
@@ -1005,7 +1304,7 @@ export async function listRedZoneLeads(pool, { limit = 100 } = {}) {
           AND ml.first_contact_due_at < NOW()
         )
      ORDER BY ml.first_contact_due_at ASC NULLS LAST
-     LIMIT :limit`,
+     LIMIT CAST(:limit AS INTEGER)`,
     { limit: Math.min(Number(limit) || 100, 500) },
   );
   const settings = await getLeadAssignmentSettings(pool);

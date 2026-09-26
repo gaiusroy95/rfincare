@@ -61,10 +61,16 @@ async function fetchAgentDetail(userId) {
 async function fetchEmployeeDetail(userId) {
   await ensureOnboardingSchema();
   const pool = getPool();
+  try {
+    await pool.execute(
+      `ALTER TABLE employee_onboarding ADD COLUMN IF NOT EXISTS lead_level INTEGER NULL`
+    );
+  } catch {
+  }
   const [[row]] = await pool.execute(
     `SELECT up.*, eo.username, eo.employee_name, eo.employee_code, eo.email AS eo_email,
             eo.mobile_number, eo.account_number, eo.bank_name, eo.ifsc_code,
-            eo.onboarding_status AS eo_status
+            eo.onboarding_status AS eo_status, eo.lead_level
      FROM user_profiles up
      LEFT JOIN employee_onboarding eo ON eo.user_id = up.id
      WHERE up.id = :id AND ${sqlLiteralEquals("up.role", "employee")} LIMIT 1`,
@@ -75,6 +81,7 @@ async function fetchEmployeeDetail(userId) {
     e.status = 404;
     throw e;
   }
+  const joiningLevel = row.lead_level != null ? Number(row.lead_level) : null;
   return {
     id: row.id,
     email: row.email,
@@ -90,7 +97,11 @@ async function fetchEmployeeDetail(userId) {
     accountStatus: row.account_status,
     onboardingStatus: row.eo_status || row.onboarding_status,
     isActive: Boolean(row.is_active),
-    createdAt: row.created_at
+    createdAt: row.created_at,
+    joiningLevel,
+    leadLevel: joiningLevel,
+    joining_level: joiningLevel,
+    lead_level: joiningLevel
   };
 }
 async function updateAgentDetails(userId, body) {
@@ -170,6 +181,12 @@ async function updateAgentDetails(userId, body) {
 async function updateEmployeeDetails(userId, body) {
   await ensureOnboardingSchema();
   const pool = getPool();
+  try {
+    await pool.execute(
+      `ALTER TABLE employee_onboarding ADD COLUMN IF NOT EXISTS lead_level INTEGER NULL`
+    );
+  } catch {
+  }
   const fullName = pick(body, "employeeName", "employee_name", "fullName", "full_name");
   const email = pick(body, "email");
   const phone = pick(body, "mobileNumber", "mobile_number", "phone");
@@ -181,6 +198,29 @@ async function updateEmployeeDetails(userId, body) {
   const accountStatus = pick(body, "accountStatus", "account_status");
   const onboardingStatus = pick(body, "onboardingStatus", "onboarding_status");
   const isActive = resolveActiveFlag(accountStatus);
+  const rawJoining = pick(
+    body,
+    "joiningLevel",
+    "joining_level",
+    "leadLevel",
+    "lead_level",
+    "hierarchyLevel"
+  );
+  let joiningLevel = void 0;
+  if (rawJoining !== void 0) {
+    const n = Number(rawJoining);
+    if (!Number.isInteger(n) || n < 1 || n > 4) {
+      const e = new Error("Joining level must be an integer from 1 to 4 (L1–L4).");
+      e.status = 400;
+      throw e;
+    }
+    joiningLevel = n;
+  }
+  const [[currentEo]] = await pool.execute(
+    `SELECT lead_level FROM employee_onboarding WHERE user_id = :id LIMIT 1`,
+    { id: userId }
+  ).catch(() => [[null]]);
+  const previousLevel = currentEo?.lead_level != null ? Number(currentEo.lead_level) : null;
   if (email) {
     const normalizedEmail = String(email).trim().toLowerCase();
     const [[dup]] = await pool.execute(
@@ -228,6 +268,7 @@ async function updateEmployeeDetails(userId, body) {
        ${sqlCoalescePatch("bank_name", "bank_name")},
        ${sqlCoalescePatch("ifsc_code", "ifsc_code")},
        ${sqlCoalescePatch("onboarding_status", "onboarding_status")}
+       ${joiningLevel != null ? ", lead_level = :lead_level" : ""}
      WHERE user_id = :id`,
     {
       id: userId,
@@ -239,10 +280,70 @@ async function updateEmployeeDetails(userId, body) {
       account_number: accountNumber || null,
       bank_name: bankName || null,
       ifsc_code: ifscCode ? String(ifscCode).toUpperCase() : null,
-      onboarding_status: onboardingStatus || null
+      onboarding_status: onboardingStatus || null,
+      ...joiningLevel != null ? { lead_level: joiningLevel } : {}
     }
   );
-  return fetchEmployeeDetail(userId);
+  const hierarchyImpact = [];
+  if (joiningLevel != null && previousLevel !== joiningLevel) {
+    const [mapped] = await pool.execute(
+      `SELECT h.id, h.agent_user_id, h.hierarchy_level, up.full_name AS agent_name, ao.agent_code
+       FROM agent_employee_hierarchy h
+       LEFT JOIN user_profiles up ON up.id = h.agent_user_id
+       LEFT JOIN agent_onboarding ao ON ao.user_id = h.agent_user_id
+       WHERE h.employee_user_id = :id`,
+      { id: userId }
+    ).catch(() => [[]]);
+    for (const row of mapped || []) {
+      const oldLevel = Number(row.hierarchy_level);
+      if (oldLevel === joiningLevel) continue;
+      const [[conflict]] = await pool.execute(
+        `SELECT id FROM agent_employee_hierarchy
+         WHERE agent_user_id = :agent
+           AND hierarchy_level = :level
+           AND employee_user_id <> :emp
+         LIMIT 1`,
+        { agent: row.agent_user_id, level: joiningLevel, emp: userId }
+      ).catch(() => [[null]]);
+      const agentLabel = row.agent_code || row.agent_name || row.agent_user_id;
+      if (conflict?.id) {
+        await pool.execute(`DELETE FROM agent_employee_hierarchy WHERE id = :id`, {
+          id: row.id
+        });
+        hierarchyImpact.push({
+          action: "cleared",
+          agentUserId: row.agent_user_id,
+          agentLabel,
+          fromLevel: oldLevel,
+          toLevel: joiningLevel,
+          reason: `Agent already has another employee at L${joiningLevel}. Mapping removed — please reassign.`
+        });
+      } else {
+        await pool.execute(
+          `UPDATE agent_employee_hierarchy SET
+             hierarchy_level = :level,
+             updated_at = NOW()
+           WHERE id = :id`,
+          { id: row.id, level: joiningLevel }
+        );
+        hierarchyImpact.push({
+          action: "updated",
+          agentUserId: row.agent_user_id,
+          agentLabel,
+          fromLevel: oldLevel,
+          toLevel: joiningLevel,
+          reason: `Hierarchy level updated from L${oldLevel} to L${joiningLevel}.`
+        });
+      }
+    }
+  }
+  const detail = await fetchEmployeeDetail(userId);
+  return {
+    ...detail,
+    hierarchyImpact,
+    levelChanged: joiningLevel != null && previousLevel !== joiningLevel,
+    previousJoiningLevel: previousLevel
+  };
 }
 async function terminateEmployee(userId, { reason, remarks, terminatedBy } = {}) {
   if (!reason || String(reason).trim().length < 2) {

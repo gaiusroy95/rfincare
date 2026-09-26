@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import {
   buildSurepassCibilBody,
   extractCreditScore,
+  getSurepassConfig,
   surepassConfigured,
 } from '../src/lib/surepassCibil.js';
 
@@ -25,10 +26,20 @@ test('buildSurepassCibilBody normalizes PAN, mobile, DOB, gender', () => {
 test('extractCreditScore reads nested Surepass-style payload', () => {
   assert.equal(extractCreditScore({ data: { credit_score: 742 } }), 742);
   assert.equal(extractCreditScore({ data: { cibil_score: '801' } }), 801);
+  assert.equal(extractCreditScore({ data: { experian_score: 765 } }), 765);
   assert.equal(extractCreditScore({ score: 12 }), null);
 });
 
 test('surepassConfigured is false without env or vendor key', () => {
   assert.equal(surepassConfigured({}), false);
   assert.equal(surepassConfigured({ api_key: 'tok_test' }), true);
+});
+
+test('getSurepassConfig uses Experian path when vendor_key=experian', () => {
+  const prev = process.env.SUREPASS_EXPERIAN_PATH;
+  delete process.env.SUREPASS_EXPERIAN_PATH;
+  const cfg = getSurepassConfig({ vendor_key: 'experian' });
+  assert.equal(cfg.isExperian, true);
+  assert.equal(cfg.path, '/api/v1/credit-experian-pdf-report');
+  if (prev != null) process.env.SUREPASS_EXPERIAN_PATH = prev;
 });

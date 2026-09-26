@@ -76,6 +76,83 @@ function normalizeRecipients(value) {
   const list = Array.isArray(value) ? value : String(value).split(/[,;]+/);
   return [...new Set(list.map((v) => String(v || "").trim()).filter(Boolean))];
 }
+async function resolveMsg91EmailOverrides() {
+  try {
+    const { getOtpProviderSettings } = await import("./otpProviderSettings.js");
+    const settings = await getOtpProviderSettings();
+    return settings?.providerConfig || {};
+  } catch (err) {
+    console.warn("[email:msg91-settings]", err?.message || err);
+    return {};
+  }
+}
+async function trySendViaMsg91({
+  recipients,
+  subject,
+  text,
+  html,
+  recipientName,
+  attachments,
+  smtpFallback = false
+}) {
+  const { sendMsg91TransactionalEmail } = await import("./msg91.js");
+  const overrides = await resolveMsg91EmailOverrides();
+  const authKey = Boolean(String(process.env.MSG91_AUTH_KEY || "").trim());
+  const domain = Boolean(
+    String(overrides.msg91EmailDomain || process.env.MSG91_EMAIL_DOMAIN || "").trim()
+  );
+  const from = Boolean(
+    String(
+      overrides.msg91EmailFromEmail || process.env.MSG91_EMAIL_FROM_EMAIL || process.env.MSG91_EMAIL_FROM || ""
+    ).trim()
+  );
+  if (!authKey || !domain || !from) {
+    return {
+      sent: false,
+      channel: "msg91",
+      reason: "msg91_email_not_configured",
+      warningInternal: "MSG91 email not configured (need AUTH_KEY + EMAIL_DOMAIN + FROM). Set env vars or Admin → OTP settings."
+    };
+  }
+  let anySent = false;
+  let lastResult = null;
+  let attachmentCount = 0;
+  for (const recipient of recipients) {
+    const msg91 = await sendMsg91TransactionalEmail({
+      to: recipient,
+      subject,
+      text,
+      html,
+      recipientName,
+      attachments,
+      config: overrides
+    });
+    lastResult = msg91;
+    if (msg91?.sent) {
+      anySent = true;
+      attachmentCount = Math.max(attachmentCount, Number(msg91.attachmentCount || 0));
+    } else if (msg91?.warningInternal) {
+      console.error("[email:msg91]", msg91.warningInternal, { to: recipient });
+    }
+  }
+  if (anySent) {
+    return {
+      sent: true,
+      channel: "msg91",
+      attachmentCount,
+      smtpFallback: smtpFallback || void 0,
+      to: recipients,
+      attempt: lastResult?.attempt || null
+    };
+  }
+  return {
+    sent: false,
+    channel: "msg91",
+    reason: lastResult?.reason || "msg91_email_failed",
+    warningInternal: lastResult?.warningInternal || "MSG91 email failed for all recipients",
+    attachmentCount: 0
+  };
+}
 async function sendEmail({
   to,
   subject,
@@ -114,100 +191,73 @@ async function sendEmail({
       };
     } catch (err) {
       console.error("[email:smtp]", err?.message || err);
-      const smtpFailure = {
+      if (mailAttachments.length) {
+        try {
+          await sendViaSmtp({
+            to: toAddress,
+            subject,
+            text,
+            html,
+            attachments: [],
+            cc: ccAddress,
+            bcc: bccAddress,
+            replyTo
+          });
+          console.warn("[email:smtp] resent without attachments after failure");
+          return {
+            sent: true,
+            channel: "smtp",
+            attachmentCount: 0,
+            attachmentsDropped: true,
+            ccSupported: true,
+            to: recipients,
+            warningInternal: humanizeSmtpError(err)
+          };
+        } catch (retryErr) {
+          console.error("[email:smtp:retry-no-attach]", retryErr?.message || retryErr);
+        }
+      }
+      const msg912 = await trySendViaMsg91({
+        recipients,
+        subject,
+        text,
+        html,
+        recipientName,
+        attachments: mailAttachments,
+        smtpFallback: true
+      });
+      if (msg912.sent) return msg912;
+      return {
         sent: false,
         channel: "smtp",
         reason: err?.code || "smtp_error",
-        warningInternal: humanizeSmtpError(err),
+        warningInternal: [humanizeSmtpError(err), msg912.warningInternal].filter(Boolean).join(" | "),
         attachmentCount: mailAttachments.length
       };
-      try {
-        const { sendMsg91TransactionalEmail, isMsg91EmailConfigured } = await import("./msg91.js");
-        const authKey = Boolean(String(process.env.MSG91_AUTH_KEY || "").trim());
-        const domain = Boolean(String(process.env.MSG91_EMAIL_DOMAIN || "").trim());
-        const from = Boolean(
-          String(process.env.MSG91_EMAIL_FROM_EMAIL || process.env.MSG91_EMAIL_FROM || "").trim()
-        );
-        if (authKey && domain && from) {
-          let anySent = false;
-          for (const recipient of recipients) {
-            const msg91 = await sendMsg91TransactionalEmail({
-              to: recipient,
-              subject,
-              text,
-              html,
-              recipientName
-            });
-            if (msg91?.sent) anySent = true;
-          }
-          if (anySent) {
-            return {
-              sent: true,
-              channel: "msg91",
-              attachmentCount: 0,
-              smtpFallback: true,
-              to: recipients
-            };
-          }
-          console.error("[email:msg91-fallback] no recipients accepted");
-        } else if (isMsg91EmailConfigured()) {
-          let anySent = false;
-          for (const recipient of recipients) {
-            const msg91 = await sendMsg91TransactionalEmail({
-              to: recipient,
-              subject,
-              text,
-              html,
-              recipientName
-            });
-            if (msg91?.sent) anySent = true;
-          }
-          if (anySent) {
-            return { sent: true, channel: "msg91", attachmentCount: 0, smtpFallback: true, to: recipients };
-          }
-        }
-      } catch (fallbackErr) {
-        console.error("[email:fallback]", fallbackErr?.message || fallbackErr);
-      }
-      return {
-        ...smtpFailure,
-        // Public APIs must use publicEmailDeliveryMessage — do not put ops hints in `warning`.
-        warning: void 0
-      };
     }
   }
-  try {
-    const { sendMsg91TransactionalEmail } = await import("./msg91.js");
-    const authKey = Boolean(String(process.env.MSG91_AUTH_KEY || "").trim());
-    const domain = Boolean(String(process.env.MSG91_EMAIL_DOMAIN || "").trim());
-    const from = Boolean(
-      String(process.env.MSG91_EMAIL_FROM_EMAIL || process.env.MSG91_EMAIL_FROM || "").trim()
-    );
-    if (authKey && domain && from) {
-      let anySent = false;
-      for (const recipient of recipients) {
-        const msg91 = await sendMsg91TransactionalEmail({
-          to: recipient,
-          subject,
-          text,
-          html,
-          recipientName
-        });
-        if (msg91?.sent) anySent = true;
-      }
-      if (anySent) {
-        return { sent: true, channel: "msg91", attachmentCount: 0, to: recipients };
-      }
-    }
-  } catch (err) {
-    console.error("[email:msg91]", err?.message || err);
+  const msg91 = await trySendViaMsg91({
+    recipients,
+    subject,
+    text,
+    html,
+    recipientName,
+    attachments: mailAttachments
+  });
+  if (msg91.sent) return msg91;
+  if (msg91.warningInternal) {
+    console.error("[email:msg91]", msg91.warningInternal);
   }
-  console.log("[email]", { to: toAddress, cc: ccAddress, bcc: bccAddress, subject }, process.env.LOG_OTP === "true" ? text : "(body hidden)");
+  console.log(
+    "[email]",
+    { to: toAddress, cc: ccAddress, bcc: bccAddress, subject },
+    process.env.LOG_OTP === "true" ? text : "(body hidden)"
+  );
   return {
     sent: false,
     channel: "log",
-    reason: "smtp_not_configured",
-    warningInternal: "Email was not delivered — configure SMTP_HOST and SMTP_FROM (or MSG91 email domain) on the server.",
+    reason: msg91.reason || "smtp_not_configured",
+    warningInternal: msg91.warningInternal || "Email was not delivered — configure SMTP_HOST and SMTP_FROM (or MSG91 email domain) on the server.",
     attachmentCount: mailAttachments.length
   };
 }

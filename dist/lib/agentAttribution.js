@@ -23,7 +23,55 @@ function normalizeAgentCode(value) {
   const code = String(value).trim().toUpperCase();
   return code || null;
 }
+function resolvePublicWebsiteAttribution(input = {}) {
+  const referralCode = String(input.referralCode || input.referral_code || "").trim().toUpperCase() || null;
+  const program = String(input.referralProgram || input.referral_program || "").trim().toLowerCase();
+  const referralId = input.referralId || input.referral_id || null;
+  const sourced = normalizeAgentCode(
+    input.sourcedAgentCode || input.sourced_agent_code || input.agentCode
+  );
+  const looksLikeAgentCode = (code) => Boolean(code) && (/^RFA([-\s]|$)/i.test(code) || /^RFN-A-/i.test(code));
+  const isAgentReferral = program === "agent" || looksLikeAgentCode(referralCode) || Boolean(referralId) && (program === "agent" || looksLikeAgentCode(sourced)) || Boolean(referralCode) && sourced && normalizeAgentCode(referralCode) === sourced;
+  if (!isAgentReferral) {
+    return {
+      agentCode: null,
+      source: "direct",
+      referralCode: program === "customer" ? referralCode : null,
+      referralProgram: program === "customer" ? "customer" : null
+    };
+  }
+  return {
+    agentCode: sourced || (looksLikeAgentCode(referralCode) ? normalizeAgentCode(referralCode) : null),
+    source: "website_agent_referral",
+    referralCode,
+    referralProgram: program === "agent" || looksLikeAgentCode(referralCode) ? "agent" : program || "agent"
+  };
+}
+function sanitizeGuestLeadAttribution(body = {}) {
+  const resolved = resolvePublicWebsiteAttribution(body);
+  const next = { ...body };
+  if (!resolved.agentCode) {
+    next.sourcedAgentCode = null;
+    next.sourced_agent_code = null;
+    next.agentCode = null;
+    const src = String(body.source || "").toLowerCase();
+    if (!src || src === "website" || src === "website_agent_referral" || src === "eligibility" || src === "direct") {
+      next.source = "direct";
+    }
+  } else {
+    next.sourcedAgentCode = resolved.agentCode;
+    next.agentCode = resolved.agentCode;
+    if (!next.source || next.source === "website" || next.source === "eligibility" || next.source === "direct") {
+      next.source = "website_agent_referral";
+    }
+  }
+  if (resolved.referralCode) next.referralCode = resolved.referralCode;
+  if (resolved.referralProgram) next.referralProgram = resolved.referralProgram;
+  return next;
+}
 export {
   normalizeAgentCode,
-  resolveAgentByCode
+  resolveAgentByCode,
+  resolvePublicWebsiteAttribution,
+  sanitizeGuestLeadAttribution
 };
