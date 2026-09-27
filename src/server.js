@@ -31,6 +31,14 @@ const port = Number(process.env.PORT || process.env.API_PORT || 8080);
 
 mkdirSync(getUploadDir(), { recursive: true });
 
+function envFlagTrue(name) {
+  return ['true', '1', 'yes', 'on'].includes(String(process.env[name] || '').trim().toLowerCase());
+}
+
+function envFlagFalse(name) {
+  return ['false', '0', 'no', 'off'].includes(String(process.env[name] || '').trim().toLowerCase());
+}
+
 if (isCloudStorage()) {
   assertS3Config();
 } else if (
@@ -38,20 +46,39 @@ if (isCloudStorage()) {
   || process.env.CLOUD_RUN_JOB
   || process.env.RENDER
   || process.env.RAILWAY_ENVIRONMENT
+  || process.env.FLY_APP_NAME
 ) {
   // eslint-disable-next-line no-console
   console.error(
     '[storage] CRITICAL: STORAGE_PROVIDER=local on an ephemeral host (Cloud Run/Render). '
       + 'Customer documents will disappear after restart or across instances. '
       + 'Set STORAGE_PROVIDER=s3 with S3_BUCKET / S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY '
-      + '(GCS HMAC or Supabase S3 endpoint also work). Set ALLOW_EPHEMERAL_UPLOADS=true only for emergency testing.',
+      + '(GCS HMAC or Supabase S3 endpoint also work).',
   );
-  if (process.env.ALLOW_EPHEMERAL_UPLOADS !== 'true' && process.env.NODE_ENV === 'production') {
+
+  const allowEphemeral = envFlagTrue('ALLOW_EPHEMERAL_UPLOADS');
+  const requireDurable = envFlagTrue('REQUIRE_DURABLE_STORAGE');
+  const explicitlyDenied = envFlagFalse('ALLOW_EPHEMERAL_UPLOADS');
+
+  // Hard-fail only when ops explicitly requires durable storage, or explicitly
+  // forbids ephemeral uploads. Otherwise warn and continue so deploys are not bricked
+  // while S3 is being configured.
+  if (requireDurable || (explicitlyDenied && process.env.NODE_ENV === 'production')) {
     // eslint-disable-next-line no-console
     console.error(
-      '[storage] Refusing to start without durable storage. Configure S3 or set ALLOW_EPHEMERAL_UPLOADS=true.',
+      '[storage] Refusing to start without durable storage. '
+        + 'Configure S3, or set ALLOW_EPHEMERAL_UPLOADS=true (and unset REQUIRE_DURABLE_STORAGE).',
     );
     process.exit(1);
+  }
+
+  if (!allowEphemeral) {
+    // eslint-disable-next-line no-console
+    console.error(
+      '[storage] Starting anyway with ephemeral local disk. '
+        + 'Set ALLOW_EPHEMERAL_UPLOADS=true to acknowledge, or configure STORAGE_PROVIDER=s3. '
+        + 'Set REQUIRE_DURABLE_STORAGE=true to make missing S3 a hard startup failure.',
+    );
   }
 }
 

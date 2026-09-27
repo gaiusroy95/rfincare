@@ -11,6 +11,8 @@ ENV NODE_ENV=production
 ENV PORT=8080
 ENV SERVE_STATIC=false
 ENV UPLOAD_DIR=/app/uploads
+# Temporary: allow boot on ephemeral disk until S3 is configured in the service env.
+ENV ALLOW_EPHEMERAL_UPLOADS=true
 
 # Install production dependencies first (better layer cache)
 COPY package.json package-lock.json ./
