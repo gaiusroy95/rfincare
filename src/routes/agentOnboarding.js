@@ -9,7 +9,22 @@ import { ensureAgentOnboardingSchema } from '../db/ensureAgentOnboardingSchema.j
 import { newId } from '../lib/ids.js';
 import { getUploadDir } from '../lib/uploadPaths.js';
 import { createUploadMiddleware, spreadUpload } from '../lib/multerUpload.js';
-import { generateOtp, hashOtp, sendOtpNotification, toPublicOtpMessage } from '../lib/otp.js';
+import {
+  generateOtp,
+  hashOtp,
+  isWhatsappOtpAvailable,
+  sendOtpNotification,
+  sendPublicOtpFailure,
+} from '../lib/otp.js';
+import { getOtpProviderSettings } from '../lib/otpProviderSettings.js';
+import {
+  assertOtpVerifyAllowed,
+  canExposeDevOtp,
+  clearOtpVerifyFailures,
+  invalidOtpError,
+  otpSecurityLimits,
+  otpTargetKeys,
+} from '../lib/otpSecurity.js';
 import { verifyAccessToken } from '../lib/jwt.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { toStoredPath, normalizeStorageKey } from '../lib/storage/keys.js';
@@ -253,6 +268,18 @@ agentOnboardingRouter.post('/signup/request-otp', async (req, res, next) => {
     if (phone && !/^[6-9]\d{9}$/.test(phone)) {
       return res.status(400).json({ error: 'Enter a valid 10-digit mobile number' });
     }
+    if ((channel === 'sms' || channel === 'whatsapp') && !phone) {
+      return res.status(400).json({ error: 'Mobile number is required for SMS/WhatsApp OTP' });
+    }
+    if (channel === 'email' && !email) {
+      return res.status(400).json({ error: 'Email is required for email OTP' });
+    }
+
+    const settings = await getOtpProviderSettings();
+    const whatsappAvailable = isWhatsappOtpAvailable(settings);
+    if (channel === 'whatsapp' && !whatsappAvailable) {
+      return res.status(400).json({ error: 'WhatsApp OTP is not available right now. Please use SMS.' });
+    }
 
     const otp = generateOtp();
     const id = newId();
@@ -280,26 +307,38 @@ agentOnboardingRouter.post('/signup/request-otp', async (req, res, next) => {
         email,
         otp,
         channel,
+        settings,
+        rateLimit: true,
       });
     } catch (otpErr) {
       console.warn('[agent-onboarding-otp]', otpErr?.message || otpErr);
-      const e = new Error(toPublicOtpMessage(otpErr?.message));
+      await pool.execute(`DELETE FROM lead_otps WHERE id = :id`, { id }).catch(() => {});
       // Provider auth failures (e.g. MSG91 401) must not look like an expired user session.
-      e.status = otpErr?.status === 400 ? 400 : 502;
-      throw e;
+      return sendPublicOtpFailure(res, otpErr);
     }
+
+    // Only the newest code for this mobile/email stays valid.
+    await pool.execute(
+      `UPDATE lead_otps SET expires_at = NOW()
+       WHERE purpose = :purpose AND verified_at IS NULL AND id <> :id
+         AND ${phone ? 'phone = :target' : 'email = :target'}`,
+      { purpose: OTP_PURPOSE, id, target: phone || email },
+    ).catch(() => {});
 
     res.json({
       success: true,
       otpId: id,
       expiresInSeconds: 600,
-      channels: delivery?.channels || [channel],
-      ...(process.env.LOG_OTP === 'true' ? { devOtp: otp } : {}),
+      channels: delivery?.channels?.length ? delivery.channels : [channel],
+      whatsappAvailable,
+      resendAfterSeconds: otpSecurityLimits().resendCooldownSeconds,
+      ...(canExposeDevOtp() ? { devOtp: otp } : {}),
     });
   } catch (err) {
     if (err?.name === 'ZodError') {
-      err.status = 400;
-      err.message = err.issues?.[0]?.message || 'Invalid request';
+      const e = new Error(err.issues?.[0]?.message || 'Invalid request');
+      e.status = 400;
+      return next(e);
     }
     next(err);
   }
@@ -313,8 +352,10 @@ agentOnboardingRouter.post('/signup/verify-otp', async (req, res, next) => {
     const email = input.email ? normalizeEmail(input.email) : null;
     const channel = input.channel || (phone ? 'sms' : 'email');
     const code = String(input.otp || '').trim();
-    const allowDevBypass = process.env.LOG_OTP === 'true' && code === '123456';
+    const allowDevBypass = canExposeDevOtp() && code === '123456';
     const pool = getPool();
+    const attemptKeys = otpTargetKeys({ phone, email }).map((k) => `agent_signup:${k}`);
+    assertOtpVerifyAllowed(attemptKeys);
 
     const targetConds = [];
     const params = { purpose: OTP_PURPOSE };
@@ -342,8 +383,9 @@ agentOnboardingRouter.post('/signup/verify-otp', async (req, res, next) => {
     );
 
     if (!otpRow) {
-      return res.status(401).json({ error: 'Invalid or expired OTP' });
+      throw invalidOtpError(attemptKeys);
     }
+    clearOtpVerifyFailures(attemptKeys);
 
     await pool.execute(
       `UPDATE lead_otps SET verified_at = NOW(), purpose = :purpose WHERE id = :id`,
@@ -369,8 +411,9 @@ agentOnboardingRouter.post('/signup/verify-otp', async (req, res, next) => {
     });
   } catch (err) {
     if (err?.name === 'ZodError') {
-      err.status = 400;
-      err.message = err.issues?.[0]?.message || 'Invalid request';
+      const e = new Error(err.issues?.[0]?.message || 'Invalid request');
+      e.status = 400;
+      return next(e);
     }
     next(err);
   }
@@ -444,8 +487,9 @@ agentOnboardingRouter.post('/signup', async (req, res, next) => {
     });
   } catch (err) {
     if (err?.name === 'ZodError') {
-      err.status = 400;
-      err.message = err.issues?.[0]?.message || 'Invalid signup data';
+      const e = new Error(err.issues?.[0]?.message || 'Invalid signup data');
+      e.status = 400;
+      return next(e);
     }
     next(err);
   }
@@ -468,8 +512,9 @@ agentOnboardingRouter.post('/login', async (req, res, next) => {
     });
   } catch (err) {
     if (err?.name === 'ZodError') {
-      err.status = 400;
-      err.message = err.issues?.[0]?.message || 'Invalid login data';
+      const e = new Error(err.issues?.[0]?.message || 'Invalid login data');
+      e.status = 400;
+      return next(e);
     }
     next(err);
   }

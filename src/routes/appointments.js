@@ -6,7 +6,14 @@ import { sendEmail, publicEmailDeliveryMessage } from '../lib/email.js';
 import { getSiteContactSettings } from '../lib/siteContactSettings.js';
 import { buildIcsInvite } from '../lib/ics.js';
 import { createGoogleCalendarEvent, googleCalendarConfigured } from '../lib/googleCalendar.js';
-import { hashOtp, sendDualChannelOtp, toPublicOtpMessage } from '../lib/otp.js';
+import { hashOtp, sendDualChannelOtp, sendPublicOtpFailure } from '../lib/otp.js';
+import {
+  assertOtpVerifyAllowed,
+  canExposeDevOtp,
+  clearOtpVerifyFailures,
+  failedOtpMessage,
+  otpTargetKeys,
+} from '../lib/otpSecurity.js';
 import { getOtpProviderSettings } from '../lib/otpProviderSettings.js';
 import { sendMsg91TransactionalSms, isMsg91Configured } from '../lib/msg91.js';
 
@@ -341,6 +348,9 @@ async function verifyOtpAndCreateVerification(pool, { email, phone, mobileOtp, e
     return { ok: false, error: 'Email OTP is required.' };
   }
 
+  const attemptKeys = otpTargetKeys({ phone, email }).map((k) => `appointment:${k}`);
+  assertOtpVerifyAllowed(attemptKeys);
+
   if (requireMobileOtp) {
     const [[smsRow]] = await pool.execute(
       `SELECT id FROM appointment_otps
@@ -349,7 +359,9 @@ async function verifyOtpAndCreateVerification(pool, { email, phone, mobileOtp, e
        ORDER BY created_at DESC LIMIT 1`,
       { email, phone, hash: hashOtp(mobileOtp) },
     );
-    if (!smsRow?.id) return { ok: false, error: 'Invalid or expired mobile OTP.' };
+    if (!smsRow?.id) {
+      return { ok: false, error: failedOtpMessage(attemptKeys, 'Invalid or expired mobile OTP.') };
+    }
     await pool.execute(`UPDATE appointment_otps SET verified_at = NOW() WHERE id = :id`, { id: smsRow.id });
   }
 
@@ -361,11 +373,14 @@ async function verifyOtpAndCreateVerification(pool, { email, phone, mobileOtp, e
        ORDER BY created_at DESC LIMIT 1`,
       { email, phone, hash: hashOtp(emailOtp) },
     );
-    if (!emailRow?.id) return { ok: false, error: 'Invalid or expired email OTP.' };
+    if (!emailRow?.id) {
+      return { ok: false, error: failedOtpMessage(attemptKeys, 'Invalid or expired email OTP.') };
+    }
     await pool.execute(`UPDATE appointment_otps SET verified_at = NOW() WHERE id = :id`, {
       id: emailRow.id,
     });
   }
+  clearOtpVerifyFailures(attemptKeys);
 
   const verificationId = newId();
   const verificationExpiresAt = new Date(Date.now() + 15 * 60 * 1000);
@@ -433,9 +448,7 @@ appointmentsRouter.post('/otp/request', async (req, res, next) => {
       });
     } catch (otpErr) {
       console.error('[appointments:otp]', otpErr?.message || otpErr);
-      return res.status(502).json({
-        error: toPublicOtpMessage(otpErr?.message),
-      });
+      return sendPublicOtpFailure(res, otpErr);
     }
 
     const pool = getPool();
@@ -474,7 +487,7 @@ appointmentsRouter.post('/otp/request', async (req, res, next) => {
       expiresInSeconds: 600,
       requireMobileOtp: otpResult.requireMobileOtp,
       requireEmailOtp: otpResult.requireEmailOtp,
-      ...(process.env.LOG_OTP === 'true'
+      ...(canExposeDevOtp()
         ? {
             devMobileOtp: otpResult.mobileOtp || undefined,
             devEmailOtp: otpResult.emailOtp || undefined,

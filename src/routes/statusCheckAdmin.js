@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { getPool } from '../db/pool.js';
 import { newId } from '../lib/ids.js';
 import { generateOtp, hashOtp, sendOtpNotification } from '../lib/otp.js';
+import { canExposeDevOtp } from '../lib/otpSecurity.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { authorize } from '../middleware/authorize.js';
 
@@ -149,7 +150,7 @@ statusCheckAdminRouter.post(
         message: 'OTP sent',
         expiresInSeconds: 600,
         otpId: id,
-        ...(process.env.LOG_OTP === 'true' ? { devOtp: otp } : {}),
+        ...(canExposeDevOtp() ? { devOtp: otp } : {}),
       });
     } catch (err) {
       next(err);

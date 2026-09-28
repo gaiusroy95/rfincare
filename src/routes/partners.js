@@ -225,8 +225,9 @@ partnersRouter.post(
       });
     } catch (err) {
       if (err?.name === 'ZodError') {
-        err.status = 400;
-        err.message = err.issues?.[0]?.message || err.errors?.[0]?.message || 'Invalid registration data';
+        const e = new Error(err.issues?.[0]?.message || err.errors?.[0]?.message || 'Invalid registration data');
+        e.status = 400;
+        return next(e);
       }
       next(err);
     }

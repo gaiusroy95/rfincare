@@ -465,6 +465,7 @@ cmsRouter.post('/otp-settings/test', async (req, res, next) => {
         otp,
         channel: 'email',
         settings,
+        rawErrors: true,
       });
       return res.json({
         success: true,
@@ -488,6 +489,7 @@ cmsRouter.post('/otp-settings/test', async (req, res, next) => {
       otp,
       channel,
       settings,
+      rawErrors: true,
     });
     const channelResult = result?.[channel] || result?.sms || result?.whatsapp;
     res.json({

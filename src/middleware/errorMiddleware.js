@@ -44,5 +44,9 @@ export function errorMiddleware(err, req, res, _next) {
     }
   }
 
+  if (err?.retryAfterSeconds) {
+    res.set('Retry-After', String(err.retryAfterSeconds));
+    return res.status(status).json({ error: message, retryAfterSeconds: err.retryAfterSeconds });
+  }
   res.status(status).json({ error: message });
 }

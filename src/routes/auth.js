@@ -11,6 +11,14 @@ import { authenticate } from '../middleware/authenticate.js';
 import { authorize } from '../middleware/authorize.js';
 import { getSessionCookieOptions } from '../lib/cookieOptions.js';
 import { generateOtp, hashOtp, sendOtpNotification } from '../lib/otp.js';
+import {
+  assertOtpVerifyAllowed,
+  canExposeDevOtp,
+  clearOtpVerifyFailures,
+  invalidOtpError,
+  otpSecurityLimits,
+  otpTargetKeys,
+} from '../lib/otpSecurity.js';
 import { assignUniqueCustomerCode } from '../lib/customerCode.js';
 import { ensureMilestone3Schema } from '../db/ensureMilestone3Schema.js';
 import { writeAuditLog } from '../lib/audit.js';
@@ -829,6 +837,7 @@ authRouter.post('/password-reset/request-otp', authenticate, async (req, res, ne
       phone,
       otp,
       channel: input.channel,
+      rateLimit: true,
     });
 
     res.json({
@@ -840,7 +849,7 @@ authRouter.post('/password-reset/request-otp', authenticate, async (req, res, ne
             ? 'OTP sent to your registered WhatsApp number'
             : 'OTP sent to your registered mobile number',
       expiresInSeconds: 600,
-      ...(process.env.LOG_OTP === 'true' ? { devOtp: otp } : {}),
+      ...(canExposeDevOtp() ? { devOtp: otp } : {}),
     });
   } catch (err) {
     next(err);
@@ -870,6 +879,8 @@ authRouter.post('/password-reset/confirm', authenticate, async (req, res, next) 
     }
 
     const email = String(user.email || '').toLowerCase();
+    const attemptKeys = [`password_reset:user:${req.auth.userId}`];
+    assertOtpVerifyAllowed(attemptKeys);
     const [[otpRow]] = await pool.execute(
       `SELECT id FROM lead_otps
        WHERE email = :email AND otp_hash = :hash
@@ -879,8 +890,9 @@ authRouter.post('/password-reset/confirm', authenticate, async (req, res, next) 
     );
 
     if (!otpRow) {
-      return res.status(401).json({ error: 'Invalid or expired OTP' });
+      throw invalidOtpError(attemptKeys);
     }
+    clearOtpVerifyFailures(attemptKeys);
 
     const hashed = await bcrypt.hash(input.newPassword, 12);
     await pool.execute(`UPDATE auth_users SET password_hash = :ph WHERE id = :id`, {
@@ -985,8 +997,9 @@ authRouter.post('/forgot-password/lookup', async (req, res, next) => {
     });
   } catch (err) {
     if (err?.name === 'ZodError') {
-      err.status = 400;
-      err.message = err.issues?.[0]?.message || 'Invalid request';
+      const e = new Error(err.issues?.[0]?.message || 'Invalid request');
+      e.status = 400;
+      return next(e);
     }
     next(err);
   }
@@ -1076,6 +1089,7 @@ authRouter.post('/forgot-password/request-otp', async (req, res, next) => {
       phone: phone || undefined,
       otp,
       channel,
+      rateLimit: true,
     });
 
     const destination =
@@ -1085,14 +1099,13 @@ authRouter.post('/forgot-password/request-otp', async (req, res, next) => {
       ...generic,
       channel,
       destination,
-      ...(process.env.LOG_OTP === 'true' && process.env.NODE_ENV !== 'production'
-        ? { devOtp: otp }
-        : {}),
+      ...(canExposeDevOtp() ? { devOtp: otp } : {}),
     });
   } catch (err) {
     if (err?.name === 'ZodError') {
-      err.status = 400;
-      err.message = err.issues?.[0]?.message || 'Invalid request';
+      const e = new Error(err.issues?.[0]?.message || 'Invalid request');
+      e.status = 400;
+      return next(e);
     } else if (err?.message && /msg91|smtp|sender|subscription|auth[_ ]?key|twilio/i.test(String(err.message))) {
       console.error('[forgot-password:otp]', err.message);
       err.status = err.status || 502;
@@ -1178,8 +1191,9 @@ authRouter.post('/forgot-password/confirm', async (req, res, next) => {
     });
   } catch (err) {
     if (err?.name === 'ZodError') {
-      err.status = 400;
-      err.message = err.issues?.[0]?.message || 'Invalid request';
+      const e = new Error(err.issues?.[0]?.message || 'Invalid request');
+      e.status = 400;
+      return next(e);
     }
     next(err);
   }
@@ -1270,8 +1284,10 @@ authRouter.post('/application/request-otp', async (req, res, next) => {
         email,
         otp,
         channel: 'both',
+        rateLimit: true,
       });
     } catch (otpErr) {
+      if (otpErr?.status === 429) throw otpErr;
       // OTP row already stored — allow verify from SMS/email if one channel worked
       // via a soft retry of SMS-only (avoids WhatsApp template blocking submit).
       try {
@@ -1280,6 +1296,7 @@ authRouter.post('/application/request-otp', async (req, res, next) => {
           email,
           otp,
           channel: 'sms',
+          rateLimit: true,
         });
       } catch (smsErr) {
         console.error('[application:request-otp]', otpErr?.message || otpErr, smsErr?.message || smsErr);
@@ -1294,8 +1311,9 @@ authRouter.post('/application/request-otp', async (req, res, next) => {
     res.json({
       success: true,
       expiresInSeconds: 600,
-      ...(process.env.LOG_OTP === 'true' ? { devOtp: otp } : {}),
-      channels: delivery?.channels || ['sms'],
+      ...(canExposeDevOtp() ? { devOtp: otp } : {}),
+      channels: delivery?.channels?.length ? delivery.channels : ['sms'],
+      resendAfterSeconds: otpSecurityLimits().resendCooldownSeconds,
     });
   } catch (err) {
     next(err);
@@ -1310,7 +1328,9 @@ authRouter.post('/application/verify-otp', async (req, res, next) => {
     const pool = getPool();
 
     const code = String(input.otp || '').trim();
-    const allowDevBypass = process.env.LOG_OTP === 'true' && code === '123456';
+    const allowDevBypass = canExposeDevOtp() && code === '123456';
+    const attemptKeys = otpTargetKeys({ phone }).map((k) => `application_submit:${k}`);
+    assertOtpVerifyAllowed(attemptKeys);
 
     const [[otpRow]] = await pool.execute(
       allowDevBypass
@@ -1326,8 +1346,9 @@ authRouter.post('/application/verify-otp', async (req, res, next) => {
     );
 
     if (!otpRow) {
-      return res.status(401).json({ error: 'Invalid or expired OTP' });
+      throw invalidOtpError(attemptKeys);
     }
+    clearOtpVerifyFailures(attemptKeys);
 
     await pool.execute(`UPDATE lead_otps SET verified_at = NOW() WHERE id = :id`, { id: otpRow.id });
 

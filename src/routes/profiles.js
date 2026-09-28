@@ -8,6 +8,7 @@ import { ensurePushNotificationSchema } from '../db/ensurePushNotificationSchema
 import { saveUserNotificationPreferences } from '../lib/expoPushService.js';
 import { newId } from '../lib/ids.js';
 import { generateOtp, hashOtp, sendOtpNotification } from '../lib/otp.js';
+import { canExposeDevOtp } from '../lib/otpSecurity.js';
 import { createUploadMiddleware, spreadUpload } from '../lib/multerUpload.js';
 import { toStoredPath } from '../lib/storage/keys.js';
 
@@ -179,7 +180,7 @@ profilesRouter.post(
       res.json({
         ok: true,
         message: 'OTP sent to the new email address',
-        ...(process.env.LOG_OTP === 'true' ? { devOtp: otp } : {}),
+        ...(canExposeDevOtp() ? { devOtp: otp } : {}),
       });
     } catch (err) {
       next(err);

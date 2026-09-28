@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 
-import { withPromiseTimeout } from './fetchWithTimeout.js';
+import { fetchWithTimeout, withPromiseTimeout } from './fetchWithTimeout.js';
 import { sendEmail, smtpConfigured } from './email.js';
 import {
   getMsg91Config,
@@ -9,9 +9,25 @@ import {
   isMsg91WhatsappConfigured,
   sendMsg91EmailOtp,
   sendMsg91Otp,
+  sendMsg91TransactionalSms,
   sendMsg91Whatsapp,
 } from './msg91.js';
 import { getOtpProviderSettings } from './otpProviderSettings.js';
+import {
+  assertOtpSendAllowed,
+  isProductionRuntime,
+  otpTargetKeys,
+  recordOtpSent,
+} from './otpSecurity.js';
+
+export { getOtpProviderSettings };
+
+const TWILIO_TIMEOUT_MS = 15000;
+
+/** Real OTP codes are short numeric strings; anything else is a free-text notification. */
+function isOtpCode(value) {
+  return /^\d{4,8}$/.test(String(value ?? '').trim());
+}
 
 /** Placeholder / synthetic emails must never require an email OTP channel. */
 export function isSyntheticLeadEmail(email) {
@@ -63,6 +79,17 @@ export function toPublicOtpMessage(raw, fallback = 'Could not send OTP right now
   return text;
 }
 
+/** Reply to a failed public OTP send: keeps 400 (validation) and 429 (rate limit), else 502. */
+export function sendPublicOtpFailure(res, err) {
+  const status = [400, 429].includes(Number(err?.status)) ? Number(err.status) : 502;
+  const body = { error: toPublicOtpMessage(err?.message) };
+  if (err?.retryAfterSeconds) {
+    body.retryAfterSeconds = err.retryAfterSeconds;
+    res.set('Retry-After', String(err.retryAfterSeconds));
+  }
+  return res.status(status).json(body);
+}
+
 function logOtpDeliveryWarnings(warnings = []) {
   if (!Array.isArray(warnings) || !warnings.length) return;
   console.warn('[otp:delivery]', warnings.join(' | '));
@@ -104,6 +131,20 @@ export function getOtpInfrastructureStatus(providerConfig = {}) {
   };
 }
 
+/** True when a WhatsApp OTP can actually be delivered with the saved settings. */
+export function isWhatsappOtpAvailable(settings) {
+  const provider = settings?.whatsappProvider || 'console';
+  if (provider === 'msg91') return isMsg91WhatsappConfigured(settings?.providerConfig);
+  if (provider === 'twilio') {
+    return Boolean(
+      process.env.TWILIO_ACCOUNT_SID
+        && process.env.TWILIO_AUTH_TOKEN
+        && (process.env.TWILIO_WHATSAPP_NUMBER || process.env.TWILIO_PHONE_NUMBER),
+    );
+  }
+  return false;
+}
+
 async function sendViaTwilio({ phone, message }) {
   const sid = process.env.TWILIO_ACCOUNT_SID;
   const token = process.env.TWILIO_AUTH_TOKEN;
@@ -121,14 +162,19 @@ async function sendViaTwilio({ phone, message }) {
     Body: message,
   });
 
-  const res = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Basic ${auth}`,
-      'Content-Type': 'application/x-www-form-urlencoded',
+  const res = await fetchWithTimeout(
+    `https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Basic ${auth}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body,
+      timeoutMessage: 'Twilio SMS request timed out.',
     },
-    body,
-  });
+    TWILIO_TIMEOUT_MS,
+  );
 
   if (!res.ok) {
     const errText = await res.text();
@@ -157,14 +203,19 @@ async function sendViaTwilioWhatsapp({ phone, message }) {
     Body: message,
   });
 
-  const res = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Basic ${auth}`,
-      'Content-Type': 'application/x-www-form-urlencoded',
+  const res = await fetchWithTimeout(
+    `https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Basic ${auth}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body,
+      timeoutMessage: 'Twilio WhatsApp request timed out.',
     },
-    body,
-  });
+    TWILIO_TIMEOUT_MS,
+  );
 
   if (!res.ok) {
     const errText = await res.text();
@@ -211,7 +262,10 @@ async function sendViaMsg91Email({ email, otp, recipientName, config }) {
 
 async function sendSmsOtp({ phone, otp, settings }) {
   const provider = settings?.smsProvider || 'console';
-  const message = formatOtpMessage(settings?.providerConfig?.otpMessageTemplate, otp);
+  const isCode = isOtpCode(otp);
+  const message = isCode
+    ? formatOtpMessage(settings?.providerConfig?.otpMessageTemplate, otp)
+    : String(otp ?? '');
 
   if (provider === 'console') {
     console.log(
@@ -239,6 +293,14 @@ async function sendSmsOtp({ phone, otp, settings }) {
       );
       err.status = 503;
       throw err;
+    }
+    if (!isCode) {
+      // The MSG91 OTP API only accepts numeric codes; send notifications as plain SMS.
+      return sendMsg91TransactionalSms({
+        phone,
+        message,
+        config: settings?.providerConfig,
+      });
     }
     return sendViaMsg91({ phone, otp, config: settings?.providerConfig });
   }
@@ -342,6 +404,13 @@ async function sendWhatsappOtp({ phone, otp, settings }) {
     return sendViaTwilioWhatsapp({ phone, message });
   }
   if (provider === 'msg91') {
+    if (!isOtpCode(otp)) {
+      const err = new Error(
+        'MSG91 WhatsApp uses the authentication (OTP) template, which only accepts a numeric code.',
+      );
+      err.status = 400;
+      throw err;
+    }
     if (!isMsg91Configured()) {
       const err = new Error(
         'WhatsApp operator is MSG91 but MSG91_AUTH_KEY is not set on the server.',
@@ -381,6 +450,7 @@ function aggregateChannelErrors(results) {
 
 /**
  * Send OTP via configured operators. `channel` may be sms | email | whatsapp | both.
+ * `rateLimit: true` applies the per-target resend cooldown / hourly cap (public OTP flows).
  */
 export async function sendOtpNotification({
   email,
@@ -388,10 +458,13 @@ export async function sendOtpNotification({
   otp,
   channel,
   settings: settingsOverride,
+  rateLimit = false,
+  rawErrors = false,
 }) {
   const settings = settingsOverride || (await getOtpProviderSettings());
   const tasks = [];
   const labels = [];
+  const isCode = isOtpCode(otp);
 
   const wantSms =
     channel === 'sms' ||
@@ -403,11 +476,21 @@ export async function sendOtpNotification({
     (!channel && settings.requireEmailOtp);
   // When Require WhatsApp OTP is on, also fan out WhatsApp for SMS/mobile OTP flows
   // (application submit, agent/employee profile, etc.) — not only channel=whatsapp.
-  const wantWhatsapp =
+  // Free-text notifications never go to WhatsApp: the template is OTP-only.
+  const wantWhatsapp = isCode && (
     channel === 'whatsapp' ||
     channel === 'both' ||
     (!channel && settings.requireWhatsappOtp) ||
-    (Boolean(settings.requireWhatsappOtp) && Boolean(phone) && channel !== 'email');
+    (Boolean(settings.requireWhatsappOtp) && Boolean(phone) && channel !== 'email')
+  );
+
+  const rateKeys = rateLimit
+    ? otpTargetKeys({
+      phone: (wantSms || wantWhatsapp) ? phone : null,
+      email: wantEmail ? email : null,
+    })
+    : [];
+  if (rateKeys.length) assertOtpSendAllowed(rateKeys);
 
   if (wantSms && phone) {
     tasks.push(channelTimeout(sendSmsOtp({ phone, otp, settings }), 'SMS OTP'));
@@ -460,7 +543,7 @@ export async function sendOtpNotification({
     // Console SMS returns sent:false — treat as soft success only when LOG_OTP is on
     // so local/dev flows can still verify from logs / Admin test OTP.
     if (value?.sent === false && value?.provider === 'console') {
-      return process.env.LOG_OTP === 'true' || process.env.NODE_ENV !== 'production';
+      return !isProductionRuntime();
     }
     return value?.sent !== false;
   });
@@ -477,15 +560,24 @@ export async function sendOtpNotification({
     const errMsg = aggregateChannelErrors(results);
     if (errMsg) {
       logOtpDeliveryWarnings([errMsg]);
-      const err = new Error(toPublicOtpMessage(errMsg));
+      const err = new Error(rawErrors ? errMsg : toPublicOtpMessage(errMsg));
       err.status = results.find((r) => r.reason?.status)?.reason?.status || 502;
       throw err;
     }
   }
 
-  const out = { sent: true, channels: labels };
+  if (rateKeys.length) recordOtpSent(rateKeys);
+
+  const out = { sent: true, channels: [] };
   results.forEach((r, i) => {
-    if (r.status === 'fulfilled') out[labels[i]] = r.value;
+    if (r.status !== 'fulfilled') {
+      if (rawErrors) {
+        out.failures = { ...(out.failures || {}), [labels[i]]: r.reason?.message || 'Send failed' };
+      }
+      return;
+    }
+    out[labels[i]] = r.value;
+    if (r.value?.sent !== false) out.channels.push(labels[i]);
   });
   return out;
 }
@@ -499,8 +591,13 @@ export async function sendDualChannelOtp({
   phone,
   settings: settingsOverride,
   publicFacing = false,
+  rateLimit = true,
 } = {}) {
   const settings = settingsOverride || (await getOtpProviderSettings());
+  const rateKeys = rateLimit
+    ? otpTargetKeys({ phone, email: isSyntheticLeadEmail(email) ? null : email })
+    : [];
+  if (rateKeys.length) assertOtpSendAllowed(rateKeys);
   const mobileOtp = generateOtp();
   const emailOtp = generateOtp();
   const warnings = [];
@@ -627,6 +724,8 @@ export async function sendDualChannelOtp({
     err.status = 502;
     throw err;
   }
+
+  if (rateKeys.length) recordOtpSent(rateKeys);
 
   // Public flows (appointment, etc.): still issue OTPs that were accepted server-side even if
   // a provider returned soft warnings — never leak provider text to the client.

@@ -6,6 +6,12 @@ import { z } from 'zod';
 import { getPool } from '../db/pool.js';
 import { newId } from '../lib/ids.js';
 import { generateOtp, hashOtp, sendOtpNotification } from '../lib/otp.js';
+import {
+  assertOtpVerifyAllowed,
+  clearOtpVerifyFailures,
+  invalidOtpError,
+  otpTargetKeys,
+} from '../lib/otpSecurity.js';
 import { getSiteContactSettings } from '../lib/siteContactSettings.js';
 import { getHomepageTrustContent } from '../lib/homepageTrustContent.js';
 import { getAboutPageContent } from '../lib/aboutPageContent.js';
@@ -666,13 +672,18 @@ publicContentRouter.post('/status-check/request-otp', async (req, res, next) => 
     const input = OtpRequestSchema.parse(req.body);
     const pool = getPool();
     const [[app]] = await pool.query(
-      `SELECT la.id FROM loan_applications la
+      `SELECT la.id, up.phone FROM loan_applications la
        JOIN user_profiles up ON up.id = la.customer_id
        WHERE up.email = :email LIMIT 1`,
       { email: input.email },
     );
     if (!app) {
       return res.status(404).json({ error: 'No application found for this email' });
+    }
+    // Mobile OTPs only ever go to the number on file, never a caller-supplied one.
+    const registeredPhone = String(app.phone || '').replace(/\D/g, '').slice(-10) || null;
+    if (input.channel !== 'email' && !registeredPhone) {
+      return res.status(400).json({ error: 'No registered mobile number on file. Use email OTP.' });
     }
 
     const otp = generateOtp();
@@ -684,13 +695,19 @@ publicContentRouter.post('/status-check/request-otp', async (req, res, next) => 
       {
         id,
         email: input.email,
-        phone: input.phone ?? null,
+        phone: registeredPhone,
         hash: hashOtp(otp),
         channel: input.channel,
         exp: expiresAt,
       },
     );
-    await sendOtpNotification({ ...input, otp });
+    await sendOtpNotification({
+      email: input.email,
+      phone: registeredPhone,
+      otp,
+      channel: input.channel,
+      rateLimit: true,
+    });
     res.json({ success: true, message: 'OTP sent', expiresInSeconds: 600 });
   } catch (err) {
     next(err);
@@ -707,13 +724,16 @@ publicContentRouter.post('/status-check/verify', async (req, res, next) => {
   try {
     const input = VerifySchema.parse(req.body);
     const pool = getPool();
+    const attemptKeys = otpTargetKeys({ email: input.email }).map((k) => `status_check:${k}`);
+    assertOtpVerifyAllowed(attemptKeys);
     const [[otpRow]] = await pool.query(
       `SELECT id FROM status_check_otps
        WHERE email = :email AND otp_hash = :hash AND verified_at IS NULL AND expires_at > NOW()
        ORDER BY created_at DESC LIMIT 1`,
       { email: input.email, hash: hashOtp(input.otp) },
     );
-    if (!otpRow) return res.status(401).json({ error: 'Invalid or expired OTP' });
+    if (!otpRow) throw invalidOtpError(attemptKeys);
+    clearOtpVerifyFailures(attemptKeys);
 
     await pool.execute(`UPDATE status_check_otps SET verified_at = NOW() WHERE id = :id`, { id: otpRow.id });
 
@@ -784,6 +804,7 @@ publicContentRouter.post('/draft-recovery/request-otp', async (req, res, next) =
       phone,
       otp,
       channel: input.channel,
+      rateLimit: true,
     });
 
     res.json({ success: true, message: 'OTP sent', expiresInSeconds: 600 });
@@ -804,6 +825,8 @@ publicContentRouter.post('/draft-recovery/verify', async (req, res, next) => {
     const input = DraftRecoveryVerifySchema.parse(req.body);
     const phone = input.phone.replace(/\D/g, '').slice(-10);
     const pool = getPool();
+    const attemptKeys = otpTargetKeys({ phone }).map((k) => `draft_resume:${k}`);
+    assertOtpVerifyAllowed(attemptKeys);
 
     const [[otpRow]] = await pool.execute(
       `SELECT id, lead_id FROM lead_otps
@@ -814,8 +837,9 @@ publicContentRouter.post('/draft-recovery/verify', async (req, res, next) => {
     );
 
     if (!otpRow) {
-      return res.status(401).json({ error: 'Invalid or expired OTP' });
+      throw invalidOtpError(attemptKeys);
     }
+    clearOtpVerifyFailures(attemptKeys);
 
     await pool.execute(`UPDATE lead_otps SET verified_at = NOW() WHERE id = :id`, { id: otpRow.id });
 

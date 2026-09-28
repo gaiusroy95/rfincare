@@ -9,6 +9,7 @@ import { getPool } from '../db/pool.js';
 import { newId } from '../lib/ids.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { generateOtp, hashOtp, sendOtpNotification } from '../lib/otp.js';
+import { canExposeDevOtp } from '../lib/otpSecurity.js';
 import { ensureAgentProfileSchema } from '../db/ensureAgentProfileSchema.js';
 import { backfillMissingAgentCodes, ensureAgentCodeForUser } from '../lib/agentCode.js';
 import { verifyCurrentPassword } from '../lib/verifyCurrentPassword.js';
@@ -256,7 +257,7 @@ portalAgentProfileRouter.post('/bank/request-otp', async (req, res, next) => {
       success: true,
       message: 'OTP sent to your registered mobile number',
       expiresInSeconds: 600,
-      ...(process.env.LOG_OTP === 'true' ? { devOtp: otp } : {}),
+      ...(canExposeDevOtp() ? { devOtp: otp } : {}),
     });
   } catch (err) {
     next(err);
@@ -358,7 +359,7 @@ portalAgentProfileRouter.post('/email/request-otp', async (req, res, next) => {
       success: true,
       message: 'OTP sent to your registered mobile number',
       expiresInSeconds: 600,
-      ...(process.env.LOG_OTP === 'true' ? { devOtp: otp } : {}),
+      ...(canExposeDevOtp() ? { devOtp: otp } : {}),
     });
   } catch (err) {
     next(err);
@@ -430,7 +431,7 @@ portalAgentProfileRouter.post('/password-reset/request-otp', async (req, res, ne
       success: true,
       message: 'OTP sent to your registered email',
       expiresInSeconds: 600,
-      ...(process.env.LOG_OTP === 'true' ? { devOtp: otp } : {}),
+      ...(canExposeDevOtp() ? { devOtp: otp } : {}),
     });
   } catch (err) {
     next(err);
@@ -492,7 +493,7 @@ portalAgentProfileRouter.post('/deactivate/request-otp', async (req, res, next) 
       success: true,
       message: 'OTP sent to confirm deactivation',
       expiresInSeconds: 600,
-      ...(process.env.LOG_OTP === 'true' ? { devOtp: otp } : {}),
+      ...(canExposeDevOtp() ? { devOtp: otp } : {}),
     });
   } catch (err) {
     next(err);

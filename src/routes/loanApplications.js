@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { getPool, isNoSuchTableError } from '../db/pool.js';
 import { newId } from '../lib/ids.js';
 import { generateOtp, hashOtp, sendOtpNotification } from '../lib/otp.js';
+import { canExposeDevOtp } from '../lib/otpSecurity.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { authorize } from '../middleware/authorize.js';
 import { hasPermission } from '../auth/permissions.js';
@@ -537,7 +538,7 @@ loanApplicationsRouter.post(
       const emailResult = delivery?.email;
       const emailDelivered =
         !deliveryError && emailResult?.sent !== false && emailResult?.delivered !== false;
-      const logOtp = process.env.LOG_OTP === 'true';
+      const logOtp = canExposeDevOtp();
 
       if (!emailDelivered) {
         const reason =

@@ -4,7 +4,14 @@ import { z } from 'zod';
 import { getPool } from '../db/pool.js';
 import { ensureOnboardingSchema } from '../db/ensureOnboardingSchema.js';
 import { newId } from '../lib/ids.js';
-import { hashOtp, isSyntheticLeadEmail, sendDualChannelOtp, sendOtpNotification, toPublicOtpMessage } from '../lib/otp.js';
+import { hashOtp, isSyntheticLeadEmail, sendDualChannelOtp, sendOtpNotification, sendPublicOtpFailure } from '../lib/otp.js';
+import {
+  assertOtpVerifyAllowed,
+  canExposeDevOtp,
+  clearOtpVerifyFailures,
+  invalidOtpError,
+  otpTargetKeys,
+} from '../lib/otpSecurity.js';
 import { getOtpProviderSettings } from '../lib/otpProviderSettings.js';
 import {
   createResumeToken,
@@ -720,7 +727,7 @@ function formatOtpSendResponse({
           emailProvider: settings.emailProvider,
           warnings: warnings.length ? warnings : undefined,
         }),
-    ...(process.env.LOG_OTP === 'true'
+    ...(canExposeDevOtp()
       ? { devMobileOtp: mobileOtp, devEmailOtp: emailOtp }
       : {}),
   };
@@ -817,7 +824,7 @@ leadsRouter.post('/start-verification', async (req, res, next) => {
       otpResult = await sendDualChannelOtp({ phone, email, settings, publicFacing: true });
     } catch (otpErr) {
       console.error('[leads:start-verification:otp]', otpErr?.message || otpErr);
-      return res.status(502).json({ error: toPublicOtpMessage(otpErr?.message) });
+      return sendPublicOtpFailure(res, otpErr);
     }
     const deliverySettings = effectiveOtpSettings(settings, otpResult);
     const otpIds = await persistLeadOtps(pool, {
@@ -927,7 +934,7 @@ leadsRouter.post('/request-otp', async (req, res, next) => {
       });
     } catch (otpErr) {
       console.error('[leads:request-otp]', otpErr?.message || otpErr);
-      return res.status(502).json({ error: toPublicOtpMessage(otpErr?.message) });
+      return sendPublicOtpFailure(res, otpErr);
     }
 
     const deliverySettings = effectiveOtpSettings(settings, otpResult);
@@ -1083,9 +1090,12 @@ leadsRouter.post('/verify-otp', async (req, res, next) => {
     }
 
     const devTestOtp =
-      process.env.LOG_OTP === 'true'
+      canExposeDevOtp()
       && (!needMobile || mobileCode === '123456')
       && (!needEmail || emailCode === '123456');
+    const attemptKeys = otpTargetKeys({ phone, email: skipEmail ? null : email })
+      .map((k) => `lead_verify:${k}`);
+    assertOtpVerifyAllowed(attemptKeys);
 
     let smsRow = null;
     let emailRow = null;
@@ -1125,7 +1135,7 @@ leadsRouter.post('/verify-otp', async (req, res, next) => {
         smsRow = pendingSms;
       } else {
         await bumpFail();
-        return res.status(401).json({ error: 'Invalid OTP. Please enter the correct OTP.' });
+        throw invalidOtpError(attemptKeys, 'Invalid OTP. Please enter the correct OTP');
       }
     }
 
@@ -1134,9 +1144,10 @@ leadsRouter.post('/verify-otp', async (req, res, next) => {
         emailRow = pendingEmail;
       } else {
         await bumpFail();
-        return res.status(401).json({ error: 'Invalid OTP. Please enter the correct OTP.' });
+        throw invalidOtpError(attemptKeys, 'Invalid OTP. Please enter the correct OTP');
       }
     }
+    clearOtpVerifyFailures(attemptKeys);
 
     const idsToMark = [smsRow?.id, emailRow?.id].filter(Boolean);
     for (const id of idsToMark) {
@@ -1377,7 +1388,7 @@ leadsRouter.post('/drafts/resume-link', async (req, res, next) => {
     res.json({
       url: link.url,
       expiresAt: link.expiresAt,
-      ...(process.env.LOG_OTP === 'true' ? { devToken: link.token } : {}),
+      ...(canExposeDevOtp() ? { devToken: link.token } : {}),
     });
   } catch (err) {
     if (isNoSuchTableError(err)) {

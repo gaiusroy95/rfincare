@@ -9,6 +9,7 @@ import { authenticate } from '../middleware/authenticate.js';
 import { getPool } from '../db/pool.js';
 import { newId } from '../lib/ids.js';
 import { generateOtp, hashOtp, sendOtpNotification } from '../lib/otp.js';
+import { canExposeDevOtp } from '../lib/otpSecurity.js';
 import { ensureAdminProfileSchema } from '../db/ensureAdminProfileSchema.js';
 import {
   collectOtpRecipientEmails,
@@ -220,7 +221,7 @@ portalAdminProfileRouter.post('/password-reset/request-otp', async (req, res, ne
       maskedRecipients: recipients.map(maskEmail),
       verifierCount: verifiers.length,
       expiresInSeconds: 600,
-      ...(process.env.LOG_OTP === 'true' ? { devOtp: otp } : {}),
+      ...(canExposeDevOtp() ? { devOtp: otp } : {}),
     });
   } catch (err) {
     next(err);

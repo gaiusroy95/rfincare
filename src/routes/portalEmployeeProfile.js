@@ -9,6 +9,7 @@ import { getPool } from '../db/pool.js';
 import { newId } from '../lib/ids.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { generateOtp, hashOtp, sendOtpNotification } from '../lib/otp.js';
+import { canExposeDevOtp } from '../lib/otpSecurity.js';
 import { ensureEmployeeProfileSchema } from '../db/ensureEmployeeProfileSchema.js';
 import { verifyCurrentPassword } from '../lib/verifyCurrentPassword.js';
 
@@ -192,7 +193,7 @@ portalEmployeeProfileRouter.post('/password-reset/request-otp', async (req, res,
       success: true,
       message: 'OTP sent to your registered mobile number',
       expiresInSeconds: 600,
-      ...(process.env.LOG_OTP === 'true' ? { devOtp: otp } : {}),
+      ...(canExposeDevOtp() ? { devOtp: otp } : {}),
     });
   } catch (err) {
     next(err);

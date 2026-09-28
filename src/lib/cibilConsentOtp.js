@@ -9,6 +9,7 @@ import {
   sendOtpNotification,
   toPublicOtpMessage,
 } from './otp.js';
+import { canExposeDevOtp } from './otpSecurity.js';
 import { sendMsg91Flow, sendMsg91TransactionalSms, getMsg91Config } from './msg91.js';
 
 const PURPOSE = 'cibil_consent';
@@ -492,7 +493,7 @@ export async function verifyHomepageCibilContactOtp({
   }
 
   const devBypass =
-    process.env.LOG_OTP === 'true'
+    canExposeDevOtp()
     && (!needMobile || mobileCode === '123456')
     && (!needEmail || emailCode === '123456');
 
