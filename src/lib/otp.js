@@ -283,19 +283,38 @@ async function sendEmailOtp({ email, otp, settings }) {
   }
 
   if (provider === 'msg91') {
-    if (!isMsg91EmailConfigured(settings?.providerConfig)) {
-      const err = new Error(
+    let msg91Error = null;
+    if (isMsg91EmailConfigured(settings?.providerConfig)) {
+      try {
+        const result = await sendViaMsg91Email({
+          email,
+          otp,
+          config: settings?.providerConfig,
+        });
+        return { ...result, delivered: true };
+      } catch (err) {
+        msg91Error = err;
+        console.warn('[otp:email] MSG91 email OTP failed, trying SMTP fallback:', err?.message || err);
+      }
+    } else {
+      msg91Error = new Error(
         'Email operator is MSG91 but MSG91 email is not configured. Set MSG91_AUTH_KEY, MSG91_EMAIL_DOMAIN, MSG91_EMAIL_FROM_EMAIL, and MSG91_EMAIL_OTP_TEMPLATE_ID on the server.',
       );
-      err.status = 503;
+      msg91Error.status = 503;
+    }
+
+    if (smtpConfigured()) {
+      const fallback = await sendEmail({ to: email, subject, text, html });
+      if (fallback.sent) {
+        return { ...fallback, provider: fallback.channel || 'smtp', delivered: true, fallbackFrom: 'msg91' };
+      }
+      const err = new Error(
+        [`MSG91 email: ${msg91Error?.message || 'failed'}`, `SMTP fallback: ${fallback.warningInternal || fallback.reason || 'failed'}`].join(' | '),
+      );
+      err.status = 502;
       throw err;
     }
-    const result = await sendViaMsg91Email({
-      email,
-      otp,
-      config: settings?.providerConfig,
-    });
-    return { ...result, delivered: true };
+    throw msg91Error;
   }
 
   throw new Error(`Unknown email provider: ${provider}`);
