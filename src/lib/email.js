@@ -449,7 +449,7 @@ export async function sendPartnerRejectionEmail({ email, fullName, reason }) {
     `Hello ${fullName || email},`,
     '',
     'Thank you for applying to become an Rfincare partner.',
-    ' your application, we are unable to approve it at this time.',
+    'After reviewing your application, we are unable to approve it at this time.',
     reason ? `\nReason: ${reason}` : '',
     '',
     'You may contact support if you have questions.',

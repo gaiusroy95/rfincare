@@ -227,6 +227,8 @@ const SignupSchema = z.object({
   consentToken: z.string().min(16),
   otpId: z.string().min(8),
   channel: z.enum(['sms', 'email', 'whatsapp', 'both']).optional(),
+  emailConsentToken: z.string().min(16).optional().nullable(),
+  emailOtpId: z.string().min(8).optional().nullable(),
 });
 
 const LoginSchema = z.object({
@@ -280,8 +282,10 @@ agentOnboardingRouter.post('/signup/request-otp', async (req, res, next) => {
         channel,
       });
     } catch (otpErr) {
+      console.warn('[agent-onboarding-otp]', otpErr?.message || otpErr);
       const e = new Error(toPublicOtpMessage(otpErr?.message));
-      e.status = otpErr?.status || 502;
+      // Provider auth failures (e.g. MSG91 401) must not look like an expired user session.
+      e.status = otpErr?.status === 400 ? 400 : 502;
       throw e;
     }
 
@@ -312,27 +316,29 @@ agentOnboardingRouter.post('/signup/verify-otp', async (req, res, next) => {
     const allowDevBypass = process.env.LOG_OTP === 'true' && code === '123456';
     const pool = getPool();
 
+    const targetConds = [];
+    const params = { purpose: OTP_PURPOSE };
+    if (phone) {
+      targetConds.push('phone = :phone');
+      params.phone = phone;
+    }
+    if (email) {
+      targetConds.push('email = :email');
+      params.email = email;
+    }
+    if (!targetConds.length) {
+      return res.status(400).json({ error: 'phone or email is required' });
+    }
+    if (!allowDevBypass) params.hash = hashOtp(code);
+
     const [[otpRow]] = await pool.execute(
-      allowDevBypass
-        ? `SELECT id, phone, email FROM lead_otps
-           WHERE purpose = :purpose
-             AND verified_at IS NULL AND expires_at > NOW()
-             AND (
-               (:phone IS NOT NULL AND phone = :phone)
-               OR (:email IS NOT NULL AND email = :email)
-             )
-           ORDER BY created_at DESC LIMIT 1`
-        : `SELECT id, phone, email FROM lead_otps
-           WHERE purpose = :purpose AND otp_hash = :hash
-             AND verified_at IS NULL AND expires_at > NOW()
-             AND (
-               (:phone IS NOT NULL AND phone = :phone)
-               OR (:email IS NOT NULL AND email = :email)
-             )
-           ORDER BY created_at DESC LIMIT 1`,
-      allowDevBypass
-        ? { purpose: OTP_PURPOSE, phone, email }
-        : { purpose: OTP_PURPOSE, hash: hashOtp(code), phone, email },
+      `SELECT id, phone, email FROM lead_otps
+       WHERE purpose = :purpose
+         ${allowDevBypass ? '' : 'AND otp_hash = :hash'}
+         AND verified_at IS NULL AND expires_at > NOW()
+         AND (${targetConds.join(' OR ')})
+       ORDER BY created_at DESC LIMIT 1`,
+      params,
     );
 
     if (!otpRow) {
@@ -386,6 +392,8 @@ agentOnboardingRouter.post('/signup', async (req, res, next) => {
       consentToken: body.consentToken || body.consent_token,
       otpId: body.otpId || body.otp_id,
       channel: body.channel,
+      emailConsentToken: body.emailConsentToken || body.email_consent_token || null,
+      emailOtpId: body.emailOtpId || body.email_otp_id || null,
     });
 
     const phone = normalizePhone(input.phone);
@@ -400,7 +408,21 @@ agentOnboardingRouter.post('/signup', async (req, res, next) => {
       channel,
     });
 
+    let emailOtpId = channel === 'email' ? input.otpId : null;
+    if (input.emailConsentToken && input.emailOtpId) {
+      await assertSignupConsent({
+        phone,
+        email,
+        consentToken: input.emailConsentToken,
+        otpId: input.emailOtpId,
+        channel: 'email',
+      });
+      emailOtpId = input.emailOtpId;
+    }
+
     const application = await createDraftApplication({
+      phoneOtpId: channel === 'sms' ? input.otpId : null,
+      emailOtpId,
       email,
       phone,
       password: input.password,
@@ -634,6 +656,8 @@ agentOnboardingRouter.post('/:id/action', authenticate, requireCanManage, async 
       action: body.action,
       remarks: body.remarks || null,
       documentId: body.documentId || body.document_id || null,
+      field: body.field || null,
+      result: body.result || null,
       actorUserId: req.auth.userId,
       actorLabel: req.auth.role,
       ip: getClientIp(req),

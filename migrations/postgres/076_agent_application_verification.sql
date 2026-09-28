@@ -1,0 +1,10 @@
+-- Direct Agent Onboarding: signup OTP evidence + admin field-level verification.
+ALTER TABLE agent_applications ADD COLUMN IF NOT EXISTS phone_verified_at TIMESTAMPTZ NULL;
+ALTER TABLE agent_applications ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ NULL;
+ALTER TABLE agent_applications ADD COLUMN IF NOT EXISTS phone_otp_id CHAR(36) NULL;
+ALTER TABLE agent_applications ADD COLUMN IF NOT EXISTS email_otp_id CHAR(36) NULL;
+ALTER TABLE agent_applications ADD COLUMN IF NOT EXISTS signup_ip VARCHAR(64) NULL;
+ALTER TABLE agent_applications ADD COLUMN IF NOT EXISTS signup_user_agent VARCHAR(512) NULL;
+ALTER TABLE agent_applications ADD COLUMN IF NOT EXISTS bank_verified_at TIMESTAMPTZ NULL;
+ALTER TABLE agent_applications ADD COLUMN IF NOT EXISTS bank_verified_by CHAR(36) NULL;
+ALTER TABLE agent_applications ADD COLUMN IF NOT EXISTS field_checks_json JSONB NULL;

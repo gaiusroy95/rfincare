@@ -13,6 +13,7 @@ import {
   reserveUniqueAgentCodeForFy,
 } from './agentCode.js';
 import {
+  sendEmail,
   sendPartnerApplicationAdminEmail,
   sendPartnerRejectionEmail,
   sendPartnerWelcomeEmail,
@@ -187,6 +188,212 @@ export function computeApplicationRisk(app) {
   return { level, score, reasons };
 }
 
+const PAN_RE = /^[A-Z]{5}[0-9]{4}[A-Z]$/;
+
+/** Required applicant fields per entity type (mirrors the /become-partner wizard). */
+export const ENTITY_FIELD_DEFS = {
+  individual: [
+    { key: 'pan', label: 'PAN', required: true, verify: true },
+    { key: 'aadhaar', label: 'Aadhaar (masked)', required: false, verify: true },
+    { key: 'dob', label: 'Date of birth', required: false, verify: true },
+    { key: 'address', label: 'Address', required: true, verify: true },
+  ],
+  proprietorship: [
+    { key: 'firmName', label: 'Firm name', required: true, verify: true },
+    { key: 'tradeName', label: 'Trade name', required: false, verify: false },
+    { key: 'proprietorName', label: 'Proprietor name', required: true, verify: true },
+    { key: 'pan', label: 'PAN', required: true, verify: true },
+    { key: 'gstin', label: 'GSTIN', required: false, verify: true },
+    { key: 'businessAddress', label: 'Business address', required: false, verify: true },
+  ],
+  partnership: [
+    { key: 'firmName', label: 'Firm name', required: true, verify: true },
+    { key: 'pan', label: 'Firm PAN', required: true, verify: true },
+    { key: 'gstin', label: 'GSTIN', required: false, verify: true },
+    { key: 'registeredAddress', label: 'Registered address', required: false, verify: true },
+  ],
+  private_limited: [
+    { key: 'companyName', label: 'Company name', required: true, verify: true },
+    { key: 'cin', label: 'CIN', required: false, verify: true },
+    { key: 'pan', label: 'Company PAN', required: true, verify: true },
+    { key: 'gstin', label: 'GSTIN', required: false, verify: true },
+    { key: 'registeredAddress', label: 'Registered office address', required: false, verify: true },
+  ],
+};
+
+const AGREEMENT_KEYS = ['termsOfService', 'privacyPolicy', 'codeOfConduct', 'fairPractices', 'kycAml'];
+
+function isBankVerified(status) {
+  return ['verified', 'manual_verified'].includes(String(status || '').toLowerCase());
+}
+
+/**
+ * Admin verification summary: per-section completeness, checklist vs uploads,
+ * and the blockers that prevent approval / activation.
+ */
+export function buildReviewSummary(app, checklist = []) {
+  const entityType = String(app?.entityType || '').toLowerCase();
+  const payload = app?.entityPayload || {};
+  const checks = app?.fieldChecks || {};
+  const docs = Array.isArray(app?.documents) ? app.documents : [];
+  const parties = Array.isArray(app?.parties) ? app.parties : [];
+  const blockers = [];
+
+  const signup = {
+    phoneVerified: Boolean(app?.phoneVerifiedAt),
+    phoneVerifiedAt: app?.phoneVerifiedAt || null,
+    emailVerified: Boolean(app?.emailVerifiedAt),
+    emailVerifiedAt: app?.emailVerifiedAt || null,
+    signupIp: app?.signupIp || null,
+  };
+  // Pre-migration applications have no OTP evidence columns; the signup API always required mobile OTP.
+  const legacySignup = !app?.phoneVerifiedAt && !app?.emailVerifiedAt;
+  if (!legacySignup && !signup.phoneVerified) blockers.push('Mobile number not OTP-verified');
+
+  const fieldDefs = ENTITY_FIELD_DEFS[entityType] || [];
+  const fields = fieldDefs.map((def) => {
+    const raw = payload?.[def.key];
+    const value = raw == null ? '' : String(raw).trim();
+    let formatOk = true;
+    if (def.key === 'pan' && value) formatOk = PAN_RE.test(value.toUpperCase());
+    const check = checks[`entity.${def.key}`] || null;
+    const digits = value.replace(/\D/g, '');
+    const display = def.key === 'aadhaar' && digits.length >= 4
+      ? `XXXX XXXX ${digits.slice(-4)}`
+      : value;
+    return {
+      key: `entity.${def.key}`,
+      field: def.key,
+      label: def.label,
+      value: display || null,
+      required: def.required,
+      verifiable: def.verify,
+      present: Boolean(value),
+      formatOk,
+      check,
+    };
+  });
+  if (!entityType) blockers.push('Entity type not selected');
+  fields.forEach((f) => {
+    if (f.required && !f.present) blockers.push(`${f.label} missing`);
+    else if (f.present && !f.formatOk) blockers.push(`${f.label} format invalid`);
+    if (f.check?.result === 'mismatch') blockers.push(`${f.label} marked as mismatch`);
+  });
+  const panField = fields.find((f) => f.field === 'pan');
+  if (panField?.present && panField.check?.result !== 'verified') {
+    blockers.push(`${panField.label} not verified against document`);
+  }
+
+  const partyRows = parties.map((p) => {
+    const check = checks[`party.${p.id}`] || null;
+    if (check?.result === 'mismatch') blockers.push(`${p.fullName || 'Party'} KYC marked as mismatch`);
+    return { ...p, check };
+  });
+  let partiesRequirement = null;
+  if (entityType === 'partnership') {
+    partiesRequirement = 'At least 2 partners, one authorised';
+    if (parties.length < 2) blockers.push('At least two partners required');
+  }
+  if (entityType === 'private_limited') {
+    partiesRequirement = 'At least 1 director, one authorised';
+    if (parties.length < 1) blockers.push('At least one director required');
+  }
+  if (partiesRequirement && parties.length && !parties.some((p) => p.isAuthorised)) {
+    blockers.push('No authorised signatory marked');
+  }
+
+  const byType = new Map();
+  docs.forEach((d) => {
+    const key = String(d.documentType || '').toLowerCase();
+    if (!byType.has(key)) byType.set(key, d);
+  });
+  const checklistRows = (checklist || []).map((tpl) => {
+    const doc = byType.get(String(tpl.documentType || '').toLowerCase()) || null;
+    const hasFile = Boolean(doc?.fileUrl || doc?.filePath);
+    const status = !doc || !hasFile ? 'missing' : String(doc.status || 'uploaded');
+    return {
+      documentType: tpl.documentType,
+      label: tpl.label,
+      isMandatory: Boolean(tpl.isMandatory),
+      maxSizeMb: tpl.maxSizeMb,
+      status,
+      document: doc,
+    };
+  });
+  const templateTypes = new Set(checklistRows.map((r) => String(r.documentType).toLowerCase()));
+  docs
+    .filter((d) => !templateTypes.has(String(d.documentType || '').toLowerCase()))
+    .forEach((d) => {
+      checklistRows.push({
+        documentType: d.documentType,
+        label: String(d.documentType || 'Document').replace(/_/g, ' '),
+        isMandatory: false,
+        maxSizeMb: null,
+        status: d.fileUrl || d.filePath ? String(d.status || 'uploaded') : 'missing',
+        document: d,
+      });
+    });
+
+  const mandatoryRows = checklistRows.filter((r) => r.isMandatory);
+  const documentsSummary = {
+    mandatoryTotal: mandatoryRows.length,
+    mandatoryMissing: mandatoryRows.filter((r) => r.status === 'missing').length,
+    mandatoryVerified: mandatoryRows.filter((r) => r.status === 'verified').length,
+    pendingReview: checklistRows.filter((r) => ['uploaded', 'pending', 'pending_review'].includes(r.status)).length,
+    rejected: checklistRows.filter((r) => ['rejected', 'reupload_required'].includes(r.status)).length,
+    uploaded: checklistRows.filter((r) => r.status !== 'missing').length,
+  };
+  mandatoryRows.forEach((r) => {
+    if (r.status === 'missing') blockers.push(`${r.label} not uploaded`);
+    else if (r.status === 'rejected' || r.status === 'reupload_required') blockers.push(`${r.label} rejected — awaiting re-upload`);
+    else if (r.status !== 'verified') blockers.push(`${r.label} not verified`);
+  });
+
+  const bank = app?.bank || {};
+  const bankSection = {
+    present: Boolean(bank.accountNumber && bank.ifsc),
+    verified: isBankVerified(bank.verifyStatus),
+    verifyStatus: bank.verifyStatus || null,
+    verifiedAt: bank.verifiedAt || null,
+    ifscFormatOk: bank.ifsc ? /^[A-Z]{4}0[A-Z0-9]{6}$/.test(String(bank.ifsc).toUpperCase()) : false,
+    holderMatchesName: (() => {
+      const holder = String(bank.holderName || '').trim().toLowerCase();
+      const names = [app?.fullName, payload.proprietorName, payload.firmName, payload.companyName]
+        .filter(Boolean)
+        .map((n) => String(n).trim().toLowerCase());
+      if (!holder || !names.length) return null;
+      return names.some((n) => n === holder || n.includes(holder) || holder.includes(n));
+    })(),
+  };
+  if (!bankSection.present) blockers.push('Bank details missing');
+  else if (!bankSection.verified) blockers.push('Bank account not verified');
+
+  const agreements = app?.agreements || {};
+  const agreementsSection = {
+    acceptedAt: app?.agreementsAcceptedAt || null,
+    ip: app?.agreementsIp || null,
+    userAgent: app?.agreementsUserAgent || null,
+    items: AGREEMENT_KEYS.map((key) => ({ key, accepted: Boolean(agreements?.[key]) })),
+  };
+  agreementsSection.allAccepted = Boolean(agreementsSection.acceptedAt)
+    && agreementsSection.items.every((i) => i.accepted);
+  if (!agreementsSection.allAccepted) blockers.push('Agreements not fully accepted');
+
+  if (!app?.submittedAt) blockers.push('Application not submitted by applicant');
+
+  return {
+    signup,
+    entity: { entityType: entityType || null, fields },
+    parties: { requirement: partiesRequirement, rows: partyRows },
+    checklist: checklistRows,
+    documents: documentsSummary,
+    bank: bankSection,
+    agreements: agreementsSection,
+    blockers: [...new Set(blockers)],
+    readyForApproval: blockers.length === 0,
+  };
+}
+
 export function mapApplication(row, { parties = [], documents = [], actions = [], documentSummary = null } = {}) {
   if (!row) return null;
   const mapped = {
@@ -209,9 +416,18 @@ export function mapApplication(row, { parties = [], documents = [], actions = []
       ifsc: row.bank_ifsc,
       accountType: row.bank_account_type,
       verifyStatus: row.bank_verify_status,
+      verifiedAt: row.bank_verified_at || null,
+      verifiedBy: row.bank_verified_by || null,
     },
+    phoneVerifiedAt: row.phone_verified_at || null,
+    emailVerifiedAt: row.email_verified_at || null,
+    signupIp: row.signup_ip || null,
+    signupUserAgent: row.signup_user_agent || null,
+    fieldChecks: parseJson(row.field_checks_json, {}) || {},
     agreements: parseJson(row.agreements_json, null),
     agreementsAcceptedAt: row.agreements_accepted_at,
+    agreementsIp: row.agreements_ip || null,
+    agreementsUserAgent: row.agreements_user_agent || null,
     submittedAt: row.submitted_at,
     activatedUserId: row.activated_user_id,
     assignedAgentCode: row.assigned_agent_code,
@@ -311,6 +527,8 @@ export async function createDraftApplication({
   fullName = null,
   ip = null,
   userAgent = null,
+  phoneOtpId = null,
+  emailOtpId = null,
 }) {
   await ensureSchema();
   const pool = getPool();
@@ -345,10 +563,15 @@ export async function createDraftApplication({
     await pool.execute(
       `INSERT INTO agent_applications (
          id, application_id, workflow_status, email, phone, password_hash,
-         full_name, state, city, pin_code, referral_code
+         full_name, state, city, pin_code, referral_code,
+         phone_otp_id, phone_verified_at, email_otp_id, email_verified_at,
+         signup_ip, signup_user_agent
        ) VALUES (
          :id, :application_id, 'draft', :email, :phone, :password_hash,
-         :full_name, :state, :city, :pin_code, :referral_code
+         :full_name, :state, :city, :pin_code, :referral_code,
+         :phone_otp_id, ${phoneOtpId ? 'NOW()' : 'NULL'},
+         :email_otp_id, ${emailOtpId ? 'NOW()' : 'NULL'},
+         :signup_ip, :signup_user_agent
        )`,
       {
         id,
@@ -361,6 +584,10 @@ export async function createDraftApplication({
         city: city ? String(city).trim() : null,
         pin_code: pinCode ? String(pinCode).trim() : null,
         referral_code: referralCode ? String(referralCode).trim() : null,
+        phone_otp_id: phoneOtpId || null,
+        email_otp_id: emailOtpId || null,
+        signup_ip: ip ? String(ip).slice(0, 64) : null,
+        signup_user_agent: userAgent ? String(userAgent).slice(0, 512) : null,
       },
     );
   } catch (err) {
@@ -374,7 +601,11 @@ export async function createDraftApplication({
     applicationId: id,
     actorLabel: 'applicant',
     action: 'signup',
-    remarks: 'Draft application created',
+    remarks: [
+      'Draft application created',
+      phoneOtpId ? 'mobile OTP verified' : 'mobile OTP not verified',
+      emailOtpId ? 'email OTP verified' : 'email OTP not verified',
+    ].join('; '),
     ip,
     userAgent,
   });
@@ -969,12 +1200,24 @@ export async function adminListApplications({
             COUNT(*)::int AS total,
             COUNT(*) FILTER (WHERE file_path IS NOT NULL AND TRIM(file_path) <> '')::int AS uploaded,
             COUNT(*) FILTER (WHERE status = 'verified')::int AS verified,
-            COUNT(*) FILTER (WHERE status IN ('rejected', 'reupload_required'))::int AS rejected
+            COUNT(*) FILTER (WHERE status IN ('rejected', 'reupload_required'))::int AS rejected,
+            STRING_AGG(document_type, ',') FILTER (
+              WHERE file_path IS NOT NULL AND TRIM(file_path) <> ''
+                AND status NOT IN ('rejected', 'reupload_required')
+            ) AS present_types
      FROM agent_application_documents
      WHERE application_id IN (${placeholders})
      GROUP BY application_id`,
     idParams,
   ).catch(() => [[]]);
+
+  const allTemplates = await listChecklistForEntity('').catch(() => []);
+  const mandatoryByEntity = new Map();
+  allTemplates.filter((t) => t.isMandatory).forEach((t) => {
+    const list = mandatoryByEntity.get(t.entityType) || [];
+    list.push(String(t.documentType).toLowerCase());
+    mandatoryByEntity.set(t.entityType, list);
+  });
 
   const docByApp = new Map(
     (docRows || []).map((d) => [
@@ -984,26 +1227,67 @@ export async function adminListApplications({
         uploaded: Number(d.uploaded || 0),
         verified: Number(d.verified || 0),
         rejected: Number(d.rejected || 0),
-        mandatoryMissing: 0,
+        presentTypes: new Set(
+          String(d.present_types || '')
+            .split(',')
+            .map((s) => s.trim().toLowerCase())
+            .filter(Boolean),
+        ),
       },
     ]),
   );
 
   return rows.map((r) => {
-    const summary = docByApp.get(r.id) || {
-      total: 0,
-      uploaded: 0,
-      verified: 0,
-      rejected: 0,
-      mandatoryMissing: 0,
+    const stats = docByApp.get(r.id);
+    const mandatory = mandatoryByEntity.get(String(r.entity_type || '').toLowerCase()) || [];
+    const present = stats?.presentTypes || new Set();
+    const summary = {
+      total: stats?.total || 0,
+      uploaded: stats?.uploaded || 0,
+      verified: stats?.verified || 0,
+      rejected: stats?.rejected || 0,
+      mandatoryTotal: mandatory.length,
+      mandatoryMissing: r.entity_type ? mandatory.filter((t) => !present.has(t)).length : 0,
     };
     return mapApplication(r, { documentSummary: summary });
+  });
+}
+
+async function attachActorNames(pool, actions = []) {
+  const ids = [...new Set(actions.map((a) => a.actorUserId).filter(Boolean))];
+  if (!ids.length) return actions;
+  const placeholders = ids.map((_, i) => `:u${i}`).join(', ');
+  const params = Object.fromEntries(ids.map((id, i) => [`u${i}`, id]));
+  const [rows] = await pool.execute(
+    `SELECT id, full_name, email FROM user_profiles WHERE id IN (${placeholders})`,
+    params,
+  ).catch(() => [[]]);
+  const byId = new Map((rows || []).map((r) => [r.id, r]));
+  return actions.map((a) => {
+    const u = a.actorUserId ? byId.get(a.actorUserId) : null;
+    return {
+      ...a,
+      actorName: u?.full_name || u?.email || null,
+      actorEmail: u?.email || null,
+    };
   });
 }
 
 export async function adminGetApplication(idOrPublicId) {
   const app = await loadApplicationBundle(idOrPublicId);
   if (!app) throw httpError('Application not found', 404);
+  const pool = getPool();
+  const checklist = app.entityType ? await listChecklistForEntity(app.entityType) : [];
+  app.actions = await attachActorNames(pool, app.actions || []);
+  app.review = buildReviewSummary(app, checklist);
+  app.documentSummary = {
+    total: app.documents.length,
+    uploaded: app.review.documents.uploaded,
+    verified: app.documents.filter((d) => d.status === 'verified').length,
+    rejected: app.review.documents.rejected,
+    mandatoryMissing: app.review.documents.mandatoryMissing,
+  };
+  app.risk = computeApplicationRisk(app);
   return app;
 }
 
@@ -1051,7 +1335,10 @@ export async function activateAgent(applicationId, reviewerUserId) {
       alreadyActivated: true,
     };
   }
-  if (!['approved', 'submitted', 'under_review', 'bank_verified', 'on_hold'].includes(status)) {
+  if (![
+    'approved', 'submitted', 'under_review', 'bank_verified', 'on_hold',
+    'kyc_verification', 'business_verification', 'compliance_review',
+  ].includes(status)) {
     throw httpError(`Cannot activate from status '${status}'`);
   }
 
@@ -1239,10 +1526,95 @@ export async function activateAgent(applicationId, reviewerUserId) {
   };
 }
 
+async function assertReadyForApproval(applicationId, actionLabel) {
+  const app = await adminGetApplication(applicationId);
+  if (!app.review?.readyForApproval) {
+    const list = (app.review?.blockers || []).slice(0, 8).join('; ');
+    throw httpError(`Cannot ${actionLabel} yet — pending checks: ${list}`, 409);
+  }
+  return app;
+}
+
+async function saveFieldCheck(pool, row, { field, result, remarks, actorUserId }) {
+  const key = String(field || '').trim();
+  if (!/^(entity\.[A-Za-z0-9_]+|party\.[A-Za-z0-9-]+)$/.test(key)) {
+    throw httpError('field must be entity.<name> or party.<id>');
+  }
+  const res = String(result || '').trim().toLowerCase();
+  if (!['verified', 'mismatch', 'clear'].includes(res)) {
+    throw httpError('result must be verified, mismatch or clear');
+  }
+  if (res === 'mismatch' && !String(remarks || '').trim()) {
+    throw httpError('Remarks are required when marking a mismatch');
+  }
+  const checks = parseJson(row.field_checks_json, {}) || {};
+  if (res === 'clear') delete checks[key];
+  else {
+    let actorName = null;
+    if (actorUserId) {
+      const [[u]] = await pool.execute(
+        `SELECT full_name, email FROM user_profiles WHERE id = :id LIMIT 1`,
+        { id: actorUserId },
+      ).catch(() => [[null]]);
+      actorName = u?.full_name || u?.email || null;
+    }
+    checks[key] = {
+      result: res,
+      remarks: remarks ? String(remarks).slice(0, 500) : null,
+      by: actorUserId || null,
+      byName: actorName,
+      at: new Date().toISOString(),
+    };
+  }
+  await pool.execute(
+    `UPDATE agent_applications SET field_checks_json = CAST(:checks AS JSONB), updated_at = NOW()
+     WHERE id = :id`,
+    { id: row.id, checks: JSON.stringify(checks) },
+  );
+  return key;
+}
+
+async function notifyApplicantStatus(row, act, remarks) {
+  const subjects = {
+    send_back: 'Action needed: your Rfincare partner application was sent back',
+    request_document: 'Action needed: please re-upload documents for your Rfincare partner application',
+    reject_document: 'Action needed: a document in your Rfincare partner application was rejected',
+    approve: 'Your Rfincare partner application is approved',
+    hold: 'Your Rfincare partner application is on hold',
+  };
+  const subject = subjects[act];
+  if (!subject || !row?.email) return;
+  const base = (process.env.APP_PUBLIC_URL || process.env.FRONTEND_URL || '').replace(/\/$/, '');
+  const statusUrl = `${base}/agent-application-status`;
+  const needsAction = ['send_back', 'request_document', 'reject_document'].includes(act);
+  const lines = [
+    `Hello ${row.full_name || row.email},`,
+    '',
+    `Application ID: ${row.application_id}`,
+    act === 'approve'
+      ? 'Your application has been approved. Your agent account will be activated shortly.'
+      : act === 'hold'
+        ? 'Your application has been placed on hold by our review team.'
+        : 'Our review team needs you to update your application.',
+    remarks ? `Remarks: ${remarks}` : '',
+    needsAction ? `Log in to update your application: ${statusUrl}` : `Track your status: ${statusUrl}`,
+    '',
+    '— Rfincare Team',
+  ].filter((l) => l !== null);
+  const esc = (s) => String(s || '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const html = lines
+    .filter(Boolean)
+    .map((l) => `<p>${esc(l)}</p>`)
+    .join('');
+  await sendEmail({ to: row.email, subject, text: lines.join('\n'), html });
+}
+
 export async function adminTransition(applicationId, {
   action,
   remarks = null,
   documentId = null,
+  field = null,
+  result = null,
   actorUserId = null,
   actorLabel = 'admin',
   ip = null,
@@ -1256,6 +1628,7 @@ export async function adminTransition(applicationId, {
   const act = String(action || '').trim().toLowerCase();
   let nextStatus = row.workflow_status;
   let extra = null;
+  let auditRemarks = remarks;
 
   const STAGE_ORDER = [
     'kyc_verification',
@@ -1266,6 +1639,7 @@ export async function adminTransition(applicationId, {
 
   switch (act) {
     case 'approve':
+      await assertReadyForApproval(row.id, 'approve');
       nextStatus = 'approved';
       break;
     case 'advance':
@@ -1279,6 +1653,7 @@ export async function adminTransition(applicationId, {
         throw httpError(`Cannot advance from status '${row.workflow_status}'`);
       }
       nextStatus = STAGE_ORDER[idx + 1];
+      if (nextStatus === 'approved') await assertReadyForApproval(row.id, 'approve');
       break;
     }
     case 'reject':
@@ -1288,6 +1663,13 @@ export async function adminTransition(applicationId, {
       nextStatus = 'sent_back';
       break;
     case 'request_document':
+      if (documentId) {
+        await setDocumentReview(pool, documentId, row.id, {
+          status: 'reupload_required',
+          rejectionReason: remarks || 'Please re-upload this document',
+          reviewerUserId: actorUserId,
+        });
+      }
       nextStatus = 'reupload_required';
       break;
     case 'hold':
@@ -1296,10 +1678,23 @@ export async function adminTransition(applicationId, {
     case 'suspend':
       nextStatus = 'suspended';
       break;
+    case 'verify_field': {
+      const key = await saveFieldCheck(pool, row, { field, result, remarks, actorUserId });
+      auditRemarks = `${key}: ${String(result || '').toLowerCase()}${remarks ? ` — ${remarks}` : ''}`;
+      break;
+    }
     case 'mark_bank_verified':
+      if (!row.bank_account_number || !row.bank_ifsc) {
+        throw httpError('Applicant has not submitted bank details yet');
+      }
       await pool.execute(
-        `UPDATE agent_applications SET bank_verify_status = 'verified', updated_at = NOW() WHERE id = :id`,
-        { id: row.id },
+        `UPDATE agent_applications SET
+           bank_verify_status = 'verified',
+           bank_verified_at = NOW(),
+           bank_verified_by = :by,
+           updated_at = NOW()
+         WHERE id = :id`,
+        { id: row.id, by: actorUserId || null },
       );
       nextStatus = ['submitted', 'under_review', 'kyc_verification'].includes(row.workflow_status)
         ? 'business_verification'
@@ -1323,6 +1718,9 @@ export async function adminTransition(applicationId, {
       nextStatus = 'reupload_required';
       break;
     case 'activate':
+      if (!(row.workflow_status === 'activated' && row.activated_user_id)) {
+        await assertReadyForApproval(row.id, 'activate');
+      }
       extra = await activateAgent(row.id, actorUserId);
       nextStatus = 'activated';
       break;
@@ -1330,22 +1728,17 @@ export async function adminTransition(applicationId, {
       throw httpError(`Unsupported action: ${act}`);
   }
 
-  if (act !== 'activate') {
+  if (act !== 'activate' && act !== 'verify_field') {
+    const setsReason = ['rejected', 'sent_back', 'reupload_required'].includes(nextStatus);
     await pool.execute(
       `UPDATE agent_applications SET
          workflow_status = :status,
-         rejection_reason = CASE
-           WHEN :status = 'rejected' THEN CAST(:remarks AS TEXT)
-           WHEN :status IN ('sent_back', 'reupload_required') THEN CAST(:remarks AS TEXT)
-           ELSE rejection_reason
-         END,
+         ${setsReason ? 'rejection_reason = :remarks,' : ''}
          updated_at = NOW()
        WHERE id = :id`,
-      {
-        id: row.id,
-        status: nextStatus,
-        remarks: remarks || null,
-      },
+      setsReason
+        ? { id: row.id, status: nextStatus, remarks: remarks || null }
+        : { id: row.id, status: nextStatus },
     );
   }
 
@@ -1354,7 +1747,7 @@ export async function adminTransition(applicationId, {
     actorUserId,
     actorLabel,
     action: act,
-    remarks,
+    remarks: auditRemarks,
     ip,
     userAgent,
   });
@@ -1365,9 +1758,12 @@ export async function adminTransition(applicationId, {
       fullName: row.full_name,
       reason: remarks,
     }).catch((err) => console.warn('[agent-onboarding-reject]', err?.message));
+  } else {
+    await notifyApplicantStatus(row, act, remarks)
+      .catch((err) => console.warn('[agent-onboarding-notify]', err?.message));
   }
 
-  const application = await loadApplicationBundle(row.id);
+  const application = await adminGetApplication(row.id);
   return { application, result: extra };
 }
 

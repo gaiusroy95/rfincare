@@ -154,6 +154,15 @@ const CREATE_STATEMENTS = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_agent_doc_checklist_entity
     ON agent_document_checklist_templates (entity_type, sort_order)`,
+  `ALTER TABLE agent_applications ADD COLUMN IF NOT EXISTS phone_verified_at TIMESTAMPTZ NULL`,
+  `ALTER TABLE agent_applications ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ NULL`,
+  `ALTER TABLE agent_applications ADD COLUMN IF NOT EXISTS phone_otp_id CHAR(36) NULL`,
+  `ALTER TABLE agent_applications ADD COLUMN IF NOT EXISTS email_otp_id CHAR(36) NULL`,
+  `ALTER TABLE agent_applications ADD COLUMN IF NOT EXISTS signup_ip VARCHAR(64) NULL`,
+  `ALTER TABLE agent_applications ADD COLUMN IF NOT EXISTS signup_user_agent VARCHAR(512) NULL`,
+  `ALTER TABLE agent_applications ADD COLUMN IF NOT EXISTS bank_verified_at TIMESTAMPTZ NULL`,
+  `ALTER TABLE agent_applications ADD COLUMN IF NOT EXISTS bank_verified_by CHAR(36) NULL`,
+  `ALTER TABLE agent_applications ADD COLUMN IF NOT EXISTS field_checks_json JSONB NULL`,
 ];
 
 async function seedChecklistTemplates(pool) {
