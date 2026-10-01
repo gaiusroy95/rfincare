@@ -96,12 +96,12 @@ export async function upsertMarketingLead(
          full_name = CASE WHEN :use_name THEN ${sqlCastParam('full_name')} ELSE full_name END,
          email = ${sqlCastParam('email')},
          phone = ${sqlCastParam('phone')},
-         loan_type = ${sqlCoalescePatch('loan_type', 'loan_type')},
-         source = ${sqlCoalescePatch('source', 'source')},
+         ${sqlCoalescePatch('loan_type', 'loan_type')},
+         ${sqlCoalescePatch('source', 'source')},
          ${sqlCoalescePatch('status', 'status')},
          consent_accepted = consent_accepted OR :consent,
-         session_key = ${sqlCoalescePatch('session_key', 'session_key')},
-         application_id = ${sqlCoalescePatch('application_id', 'application_id')},
+         ${sqlCoalescePatch('session_key', 'session_key')},
+         ${sqlCoalescePatch('application_id', 'application_id')},
          updated_at = NOW()
        WHERE id = :id`,
       {

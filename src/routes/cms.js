@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import multer from 'multer';
 import { z } from 'zod';
 
 import { getPool } from '../db/pool.js';
@@ -40,6 +41,7 @@ import {
   mapSuccessStoryRow,
 } from '../lib/cmsContentMap.js';
 import { normalizeYoutubeWatchUrl } from '../lib/youtube.js';
+import { CMS_MEDIA_MAX_BYTES, saveCmsImage } from '../lib/cmsMedia.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { requireRoles } from '../middleware/requireRoles.js';
 
@@ -323,6 +325,27 @@ cmsRouter.get('/flash-tiles', async (req, res, next) => {
     const category = req.query.category || null;
     const tiles = await listFlashTiles({ category, activeOnly: false });
     res.json({ categories: FLASH_TILE_CATEGORIES, tiles });
+  } catch (err) {
+    next(err);
+  }
+});
+
+const bannerImageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: CMS_MEDIA_MAX_BYTES, files: 1 },
+});
+
+cmsRouter.post('/flash-tiles/upload-image', bannerImageUpload.single('image'), async (req, res, next) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'Choose an image to upload' });
+    const saved = await saveCmsImage({
+      buffer: req.file.buffer,
+      mimeType: req.file.mimetype,
+      fileName: req.file.originalname,
+      purpose: 'flash_tile',
+      userId: req.auth.userId,
+    });
+    res.status(201).json(saved);
   } catch (err) {
     next(err);
   }

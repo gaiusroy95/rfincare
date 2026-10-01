@@ -163,6 +163,10 @@ const CREATE_STATEMENTS = [
   `ALTER TABLE agent_applications ADD COLUMN IF NOT EXISTS bank_verified_at TIMESTAMPTZ NULL`,
   `ALTER TABLE agent_applications ADD COLUMN IF NOT EXISTS bank_verified_by CHAR(36) NULL`,
   `ALTER TABLE agent_applications ADD COLUMN IF NOT EXISTS field_checks_json JSONB NULL`,
+  `ALTER TABLE agent_applications ADD COLUMN IF NOT EXISTS assigned_employee_id CHAR(36) NULL`,
+  `ALTER TABLE agent_applications ADD COLUMN IF NOT EXISTS assigned_at TIMESTAMPTZ NULL`,
+  `CREATE INDEX IF NOT EXISTS idx_agent_applications_assigned_employee
+    ON agent_applications (assigned_employee_id)`,
 ];
 
 async function seedChecklistTemplates(pool) {

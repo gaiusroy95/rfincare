@@ -60,11 +60,8 @@ export async function resolveLiveCibilForCustomerEligibility(customerId, input =
     if (input.panNumber) {
       demographics.panNumber = String(input.panNumber).trim().toUpperCase();
     }
-    // Eligibility page: use Experian / Equifax / CRIF (not TransUnion). Report download stays on dashboard.
-    const pull = await pullCibilForCustomer(customerId, {
-      demographics,
-      preferredVendorKeys: ['experian', 'equifax', 'crif_high_mark'],
-    });
+    // Experian pull; within the 30-day cooldown the 429 branch below reuses the cached score.
+    const pull = await pullCibilForCustomer(customerId, { demographics });
     if (pull?.creditScore) {
       return {
         creditScore: pull.creditScore,

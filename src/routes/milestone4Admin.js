@@ -1,8 +1,5 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { existsSync, readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
-
 import { authenticate } from '../middleware/authenticate.js';
 import {
   getFileNotificationSettings,
@@ -16,7 +13,7 @@ import {
   getLatestCibilCheck,
   getCibilCheckById,
 } from '../lib/cibilService.js';
-import { getUploadDir } from '../lib/uploadPaths.js';
+import { sendCibilReportPdf } from '../lib/cibilReportStore.js';
 
 export const milestone4AdminRouter = Router();
 
@@ -102,14 +99,7 @@ milestone4AdminRouter.get('/cibil/report/:checkId', async (req, res, next) => {
     if (!check?.reportPath) {
       return res.status(404).json({ error: 'CIBIL report not found' });
     }
-    const fileName = check.reportPath.split('/').pop();
-    const fullPath = resolve(getUploadDir(), 'cibil-reports', fileName);
-    if (!existsSync(fullPath)) {
-      return res.status(404).json({ error: 'CIBIL report file missing on server' });
-    }
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `inline; filename="cibil-report-${fileName}"`);
-    res.send(readFileSync(fullPath));
+    await sendCibilReportPdf(res, check.reportPath, { disposition: 'inline' });
   } catch (err) {
     next(err);
   }
@@ -171,11 +161,7 @@ milestone4AdminRouter.get('/applications/:applicationId/cibil/report', async (re
     }
     const check = await getLatestCibilCheck(req.params.applicationId);
     if (!check?.reportPath) return res.status(404).json({ error: 'Report not found' });
-    const fileName = check.reportPath.split('/').pop();
-    const fullPath = resolve(getUploadDir(), 'cibil-reports', fileName);
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="cibil-${fileName}"`);
-    res.send(readFileSync(fullPath));
+    await sendCibilReportPdf(res, check.reportPath, { prefix: 'credit-report' });
   } catch (err) {
     next(err);
   }

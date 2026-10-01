@@ -48,6 +48,52 @@ export function portalAllowsRole(portal, role) {
   return allowed.has(String(role || '').toLowerCase());
 }
 
+const INACTIVE_STATUSES = new Set(['suspended', 'inactive', 'terminated', 'locked', 'disabled']);
+
+/**
+ * True when the profile is blocked from login / password reset.
+ * Handles boolean, 0/1, and string forms from Postgres/MySQL drivers.
+ */
+export function isAccountInactive(user) {
+  if (!user) return false;
+  const active = user.is_active;
+  if (active === false || active === 0 || active === '0' || active === 'false') return true;
+  const status = String(user.account_status || '').trim().toLowerCase();
+  return INACTIVE_STATUSES.has(status);
+}
+
+/**
+ * Validate that an email may start / complete forgot-password for this portal.
+ * Throws with status 404 (not found / wrong portal) or 403 (inactive).
+ */
+export function assertForgotPasswordAccount(user, portal) {
+  if (!user) {
+    const err = new Error(
+      'No account found with this email for this portal. Please check the email or contact the administrator.',
+    );
+    err.status = 404;
+    err.code = 'ACCOUNT_NOT_FOUND';
+    throw err;
+  }
+  if (!portalAllowsRole(portal, user.role)) {
+    const err = new Error(
+      'No account found with this email for this portal. Please check the email or contact the administrator.',
+    );
+    err.status = 404;
+    err.code = 'ACCOUNT_NOT_FOUND';
+    throw err;
+  }
+  if (isAccountInactive(user)) {
+    const err = new Error(
+      'Account is inactive. Password reset is not allowed. Please contact the administrator.',
+    );
+    err.status = 403;
+    err.code = 'ACCOUNT_INACTIVE';
+    throw err;
+  }
+  return true;
+}
+
 export function assertPasswordStrength(password) {
   const value = String(password || '');
   if (value.length < 8) {

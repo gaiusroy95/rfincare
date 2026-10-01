@@ -168,6 +168,86 @@ portalAgentApplicationsRouter.post('/eligibility/calculate', async (req, res, ne
   }
 });
 
+const AgentCibilPullSchema = z.object({
+  fullName: z.string().min(2, 'Name is required'),
+  fatherName: z.string().min(2, "Father's name is required"),
+  panNumber: z.string().regex(/^[A-Z]{5}[0-9]{4}[A-Z]$/i, 'Enter a valid PAN number'),
+  mobile: z.string().min(10, 'Mobile number is required'),
+  pincode: z.string().regex(/^\d{6}$/, 'Enter a valid 6-digit pincode'),
+  gender: z.enum(['male', 'female', 'other'], { errorMap: () => ({ message: 'Gender is required' }) }),
+  consentAccepted: z.literal(true, { errorMap: () => ({ message: 'Consent is required' }) }),
+  consentToken: z.string().min(16, 'OTP consent is required'),
+  otpId: z.string().min(8, 'OTP consent is required'),
+});
+
+portalAgentApplicationsRouter.post('/cibil/consent/request-otp', async (req, res, next) => {
+  try {
+    requireAgent(req);
+    const phone = String(req.body?.mobile || req.body?.phone || '').replace(/\D/g, '').slice(-10);
+    const { requestCibilConsentOtp } = await import('../lib/cibilConsentOtp.js');
+    res.json(await requestCibilConsentOtp({ phone, initiatedByUserId: req.auth.userId }));
+  } catch (err) {
+    next(err);
+  }
+});
+
+portalAgentApplicationsRouter.post('/cibil/consent/verify-otp', async (req, res, next) => {
+  try {
+    requireAgent(req);
+    const phone = String(req.body?.mobile || req.body?.phone || '').replace(/\D/g, '').slice(-10);
+    const otp = String(req.body?.otp || '').trim();
+    const { verifyCibilConsentOtp } = await import('../lib/cibilConsentOtp.js');
+    res.json(await verifyCibilConsentOtp({ phone, otp }));
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** Agent credit check — Experian score + PDF. */
+portalAgentApplicationsRouter.post('/cibil/pull', async (req, res, next) => {
+  try {
+    requireAgent(req);
+    const input = AgentCibilPullSchema.parse(req.body);
+    const phone = String(input.mobile).replace(/\D/g, '').slice(-10);
+    const { assertCibilConsentToken } = await import('../lib/cibilConsentOtp.js');
+    await assertCibilConsentToken({ phone, consentToken: input.consentToken, otpId: input.otpId });
+    const { pullCibilForEmployee } = await import('../lib/cibilService.js');
+    const result = await pullCibilForEmployee(
+      {
+        fullName: input.fullName.trim(),
+        fatherName: input.fatherName.trim(),
+        panNumber: input.panNumber.toUpperCase(),
+        mobile: phone,
+        pincode: input.pincode,
+        gender: input.gender,
+        consentAccepted: true,
+      },
+      req.auth.userId,
+      { source: 'agent_portal' },
+    );
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+portalAgentApplicationsRouter.get('/cibil/report/:checkId', async (req, res, next) => {
+  try {
+    requireAgent(req);
+    const { getCibilCheckById, getCibilCheckInitiator } = await import('../lib/cibilService.js');
+    const { sendCibilReportPdf } = await import('../lib/cibilReportStore.js');
+    const check = await getCibilCheckById(req.params.checkId);
+    const initiator = check ? await getCibilCheckInitiator(check.id) : null;
+    const isAdmin = ['admin', 'super_admin'].includes(req.auth.role);
+    if (!check?.reportPath || (!isAdmin && String(initiator?.userId || '') !== String(req.auth.userId))) {
+      return res.status(404).json({ error: 'Credit report not found' });
+    }
+    await sendCibilReportPdf(res, check.reportPath, { prefix: 'experian-report' });
+  } catch (err) {
+    next(err);
+  }
+});
+
 portalAgentApplicationsRouter.get('/profile', async (req, res, next) => {
   try {
     requireAgent(req);

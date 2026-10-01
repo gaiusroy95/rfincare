@@ -163,6 +163,25 @@ publicContentRouter.get('/marketplace-hero', async (req, res, next) => {
   }
 });
 
+publicContentRouter.get('/media/:id', async (req, res, next) => {
+  try {
+    const id = String(req.params.id || '').trim().toLowerCase();
+    if (!/^[0-9a-f-]{36}$/.test(id)) return res.status(404).json({ error: 'Image not found' });
+    const { getCmsMedia } = await import('../lib/cmsMedia.js');
+    const media = await getCmsMedia(id);
+    if (!media?.data) return res.status(404).json({ error: 'Image not found' });
+    res.setHeader('Content-Type', media.mime_type || 'application/octet-stream');
+    res.setHeader('Content-Length', String(media.data.length));
+    // Each upload gets a new id, so the bytes behind a URL never change.
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.end(media.data);
+  } catch (err) {
+    next(err);
+  }
+});
+
 publicContentRouter.get('/flash-tiles', async (req, res, next) => {
   try {
     const { listPublicFlashSlides, FLASH_TILE_CATEGORIES } = await import('../lib/flashTiles.js');

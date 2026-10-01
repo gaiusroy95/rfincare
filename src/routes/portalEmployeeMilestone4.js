@@ -177,7 +177,7 @@ portalEmployeeMilestone4Router.post('/agent-onboarding/:userId/qc', async (req, 
         `UPDATE agent_onboarding
          SET qc_status = ${sqlCastParam('qc_status')},
              qc_employee_id = :emp,
-             qc_notes = ${sqlCoalescePatch('qc_notes', 'notes')},
+             ${sqlCoalescePatch('qc_notes', 'notes')},
              qc_at = NOW(),
              qc_approved_by = :emp,
              onboarding_status = ${sqlCastParam('onboarding_status')}
@@ -329,21 +329,12 @@ portalEmployeeMilestone4Router.get('/cibil/report/:checkId', async (req, res, ne
       await assertEmployeeAccess(req, 'applications', 'read');
     }
     const { getCibilCheckById } = await import('../lib/cibilService.js');
-    const { getUploadDir } = await import('../lib/uploadPaths.js');
-    const { resolve } = await import('node:path');
-    const { readFileSync, existsSync } = await import('node:fs');
+    const { sendCibilReportPdf } = await import('../lib/cibilReportStore.js');
     const check = await getCibilCheckById(req.params.checkId);
     if (!check?.reportPath) {
       return res.status(404).json({ error: 'CIBIL report not found' });
     }
-    const fileName = check.reportPath.split('/').pop();
-    const fullPath = resolve(getUploadDir(), 'cibil-reports', fileName);
-    if (!existsSync(fullPath)) {
-      return res.status(404).json({ error: 'CIBIL report file missing on server' });
-    }
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="cibil-report-${fileName}"`);
-    res.send(readFileSync(fullPath));
+    await sendCibilReportPdf(res, check.reportPath);
   } catch (err) {
     next(err);
   }

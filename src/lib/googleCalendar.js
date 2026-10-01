@@ -1,13 +1,16 @@
 /**
- * Create events on the company Google Calendar via a service account.
+ * Create events on the company Google Calendar via a service account,
+ * optionally with a Google Meet conference link.
  *
  * Env:
  *   GOOGLE_CALENDAR_CLIENT_EMAIL
  *   GOOGLE_CALENDAR_PRIVATE_KEY   (PEM; use \n for newlines)
  *   GOOGLE_CALENDAR_ID           (calendar id or "primary")
+ *   APPOINTMENT_VIDEO_LINK       (optional static Meet/Jitsi room fallback)
  */
 
 import jwt from 'jsonwebtoken';
+import { randomBytes } from 'node:crypto';
 
 function privateKeyFromEnv() {
   const raw = process.env.GOOGLE_CALENDAR_PRIVATE_KEY || '';
@@ -20,6 +23,29 @@ export function googleCalendarConfigured() {
       && privateKeyFromEnv()
       && (process.env.GOOGLE_CALENDAR_ID || 'primary'),
   );
+}
+
+/** Prefer Google Meet from Calendar; else env static room; else unique Jitsi room. */
+export function resolveAppointmentVideoLink({ appointmentId, hangoutLink = null } = {}) {
+  const meet = String(hangoutLink || '').trim();
+  if (/^https?:\/\//i.test(meet)) return { url: meet, provider: 'google_meet' };
+
+  const configured = String(
+    process.env.APPOINTMENT_VIDEO_LINK
+      || process.env.GOOGLE_MEET_LINK
+      || '',
+  ).trim();
+  if (/^https?:\/\//i.test(configured)) {
+    return { url: configured, provider: 'configured' };
+  }
+
+  const room = String(appointmentId || randomBytes(6).toString('hex'))
+    .replace(/[^a-zA-Z0-9]/g, '')
+    .slice(0, 24) || randomBytes(6).toString('hex');
+  return {
+    url: `https://meet.jit.si/Rfincare-${room}`,
+    provider: 'jitsi',
+  };
 }
 
 async function getAccessToken() {
@@ -63,6 +89,8 @@ async function getAccessToken() {
  *   endIso: string,
  *   attendeeEmails?: string[],
  *   location?: string,
+ *   createMeetLink?: boolean,
+ *   requestId?: string,
  * }} event
  */
 export async function createGoogleCalendarEvent(event) {
@@ -72,6 +100,7 @@ export async function createGoogleCalendarEvent(event) {
 
   const calendarId = encodeURIComponent(process.env.GOOGLE_CALENDAR_ID || 'primary');
   const token = await getAccessToken();
+  const wantMeet = event.createMeetLink !== false;
 
   const attendees = (event.attendeeEmails || [])
     .filter(Boolean)
@@ -80,10 +109,11 @@ export async function createGoogleCalendarEvent(event) {
   const payload = {
     summary: event.summary,
     description: event.description || '',
-    location: event.location || 'Rfincare — Online / Phone consultation',
+    location: event.location || 'Rfincare — Online video consultation',
     start: { dateTime: event.startIso, timeZone: 'Asia/Kolkata' },
     end: { dateTime: event.endIso, timeZone: 'Asia/Kolkata' },
     attendees,
+    guestsCanJoinMeet: true,
     reminders: {
       useDefault: false,
       overrides: [
@@ -93,8 +123,20 @@ export async function createGoogleCalendarEvent(event) {
     },
   };
 
+  if (wantMeet) {
+    payload.conferenceData = {
+      createRequest: {
+        requestId: String(event.requestId || `rf-${Date.now()}-${randomBytes(4).toString('hex')}`),
+        conferenceSolutionKey: { type: 'hangoutsMeet' },
+      },
+    };
+  }
+
+  const query = new URLSearchParams({ sendUpdates: 'all' });
+  if (wantMeet) query.set('conferenceDataVersion', '1');
+
   const res = await fetch(
-    `https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events?sendUpdates=all`,
+    `https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events?${query}`,
     {
       method: 'POST',
       headers: {
@@ -109,10 +151,16 @@ export async function createGoogleCalendarEvent(event) {
     throw new Error(data?.error?.message || 'Google Calendar event create failed');
   }
 
+  const hangoutLink =
+    data.hangoutLink
+    || data.conferenceData?.entryPoints?.find((e) => e.entryPointType === 'video')?.uri
+    || null;
+
   return {
     created: true,
     eventId: data.id,
     htmlLink: data.htmlLink,
-    hangoutLink: data.hangoutLink || null,
+    hangoutLink,
+    meetLink: hangoutLink,
   };
 }

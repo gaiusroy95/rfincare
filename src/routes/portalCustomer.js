@@ -1,6 +1,4 @@
 import { Router } from 'express';
-import { readFileSync, existsSync } from 'node:fs';
-import { resolve } from 'node:path';
 
 import { getPool } from '../db/pool.js';
 import { authenticate } from '../middleware/authenticate.js';
@@ -10,7 +8,7 @@ import { buildCustomer360 } from '../lib/customer360.js';
 import { ensureEngagementNotifications } from '../lib/customerEngagement.js';
 import { getCustomerCreditProfile } from '../lib/customerCreditScore.js';
 import { pullCibilForCustomer } from '../lib/cibilService.js';
-import { getUploadDir } from '../lib/uploadPaths.js';
+import { sendCibilReportPdf } from '../lib/cibilReportStore.js';
 import {
   listCustomerSupportMessages,
   resolveAssignedEmployeeSupportContact,
@@ -74,22 +72,19 @@ portalCustomerRouter.get('/credit-score/report', authenticate, async (req, res, 
     const [[check]] = await pool.execute(
       `SELECT report_path, credit_score, status
        FROM cibil_checks
-       WHERE customer_id = :id AND status = 'success' AND report_path IS NOT NULL
+       WHERE customer_id = :id
+         AND status = 'success'
+         AND report_path IS NOT NULL
+         AND vendor_key = 'experian'
+         AND COALESCE(response_payload->>'localFallback', 'false') <> 'true'
        ORDER BY checked_at DESC
        LIMIT 1`,
       { id: req.auth.userId },
     );
     if (!check?.report_path) {
-      return res.status(404).json({ error: 'Credit report not available yet. Pull your score first.' });
+      return res.status(404).json({ error: 'Experian credit report not available yet. Refresh your score first.' });
     }
-    const fileName = String(check.report_path).split('/').pop();
-    const fullPath = resolve(getUploadDir(), 'cibil-reports', fileName);
-    if (!existsSync(fullPath)) {
-      return res.status(404).json({ error: 'Credit report file not found' });
-    }
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="credit-report-${fileName}"`);
-    res.send(readFileSync(fullPath));
+    await sendCibilReportPdf(res, check.report_path, { prefix: 'experian-report' });
   } catch (err) {
     next(err);
   }

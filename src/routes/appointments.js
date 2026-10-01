@@ -5,7 +5,7 @@ import { newId } from '../lib/ids.js';
 import { sendEmail, publicEmailDeliveryMessage } from '../lib/email.js';
 import { getSiteContactSettings } from '../lib/siteContactSettings.js';
 import { buildIcsInvite } from '../lib/ics.js';
-import { createGoogleCalendarEvent, googleCalendarConfigured } from '../lib/googleCalendar.js';
+import { createGoogleCalendarEvent, googleCalendarConfigured, resolveAppointmentVideoLink } from '../lib/googleCalendar.js';
 import { hashOtp, sendDualChannelOtp, sendPublicOtpFailure } from '../lib/otp.js';
 import {
   assertOtpVerifyAllowed,
@@ -68,6 +68,18 @@ async function ensureAppointmentsSchema() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  // Meet / video join link (added after initial schema).
+  try {
+    const [[col]] = await pool.execute(
+      `SELECT 1 AS ok FROM information_schema.columns
+       WHERE table_name = 'expert_appointments' AND column_name = 'meet_link' LIMIT 1`,
+    );
+    if (!col) {
+      await pool.execute(`ALTER TABLE expert_appointments ADD COLUMN meet_link TEXT NULL`);
+    }
+  } catch (err) {
+    console.warn('[appointments:schema] meet_link column:', err?.message || err);
+  }
   schemaReady = true;
 }
 
@@ -101,14 +113,44 @@ const OtpVerifySchema = z.object({
   emailOtp: z.string().trim().length(6).optional(),
 });
 
+const SUPPORT_EMAIL = 'support@rfincare.com';
+
 function salesTeamEmail(contact) {
   return (
     process.env.SALES_TEAM_EMAIL
     || process.env.APPOINTMENT_SALES_EMAIL
     || contact?.emails?.[0]
     || contact?.email
-    || 'support@rfincare.com'
+    || SUPPORT_EMAIL
   );
+}
+
+function buildAppointmentEmailHtml({ title, lines, meetUrl, whenLabel }) {
+  const rows = lines
+    .filter(Boolean)
+    .map((line) => `<p style="margin:0 0 8px;font-family:Arial,sans-serif;font-size:14px;color:#111">${escapeHtml(line)}</p>`)
+    .join('');
+  const meetBlock = meetUrl
+    ? `<p style="margin:16px 0"><a href="${escapeHtml(meetUrl)}" style="display:inline-block;background:#0b6e4f;color:#fff;text-decoration:none;padding:12px 18px;border-radius:8px;font-family:Arial,sans-serif;font-weight:600">Join video call</a></p>
+       <p style="margin:0 0 12px;font-family:Arial,sans-serif;font-size:13px;color:#444">Or open: <a href="${escapeHtml(meetUrl)}">${escapeHtml(meetUrl)}</a></p>`
+    : '';
+  return `
+    <div style="max-width:560px;margin:0 auto;padding:24px;border:1px solid #e5e7eb;border-radius:12px">
+      <h2 style="font-family:Arial,sans-serif;color:#0b6e4f;margin:0 0 8px">${escapeHtml(title)}</h2>
+      <p style="font-family:Arial,sans-serif;font-size:15px;color:#111;margin:0 0 16px"><strong>When:</strong> ${escapeHtml(whenLabel)} (IST)</p>
+      ${meetBlock}
+      ${rows}
+      <p style="margin:20px 0 0;font-family:Arial,sans-serif;font-size:12px;color:#666">— Team Rfincare</p>
+    </div>
+  `;
+}
+
+function escapeHtml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }
 
 function combineDateTimeIst(dateStr, timeStr) {
@@ -164,6 +206,8 @@ async function notifyAppointmentStaff({
   customerName,
   customerPhone,
   topic,
+  meetLink,
+  skipEmail = false,
 }) {
   const outcome = {
     emailSent: false,
@@ -214,63 +258,62 @@ async function notifyAppointmentStaff({
       })),
     ];
 
-    const emailTargets = new Set();
-    if (salesEmail) emailTargets.add(String(salesEmail).trim().toLowerCase());
-    for (const s of staff) {
-      if (s.email) emailTargets.add(String(s.email).trim().toLowerCase());
-    }
+    if (!skipEmail) {
+      const emailTargets = new Set();
+      if (salesEmail) emailTargets.add(String(salesEmail).trim().toLowerCase());
+      for (const s of staff) {
+        if (s.email) emailTargets.add(String(s.email).trim().toLowerCase());
+      }
 
-    const primaryTo = String(salesEmail || '').trim().toLowerCase() || [...emailTargets][0];
-    const bccList = [...emailTargets].filter((e) => e && e !== primaryTo);
+      const primaryTo = String(salesEmail || '').trim().toLowerCase() || [...emailTargets][0];
+      const bccList = [...emailTargets].filter((e) => e && e !== primaryTo);
 
-    // Primary sales inbox (+ ICS); BCC L2+/admins so everyone gets booking details.
-    const primaryMail = await sendAppointmentEmail({
-      to: primaryTo,
-      bcc: bccList.length ? bccList : undefined,
-      subject: salesSubject,
-      text: salesText,
-      html: `<pre style="font-family:sans-serif;white-space:pre-wrap">${salesText}</pre>`,
-      attachments: icsAttachment ? [icsAttachment] : undefined,
-      recipientName: 'Rfincare Sales',
-    });
-    outcome.emailSent = Boolean(primaryMail?.sent);
-    outcome.recipients = primaryMail?.sent
-      ? [primaryTo, ...(primaryMail?.channel === 'smtp' ? bccList : [])]
-      : [];
-
-    if (!outcome.emailSent && primaryTo) {
-      const solo = await sendAppointmentEmail({
+      const primaryMail = await sendAppointmentEmail({
         to: primaryTo,
+        bcc: bccList.length ? bccList : undefined,
         subject: salesSubject,
         text: salesText,
         html: `<pre style="font-family:sans-serif;white-space:pre-wrap">${salesText}</pre>`,
         attachments: icsAttachment ? [icsAttachment] : undefined,
         recipientName: 'Rfincare Sales',
       });
-      outcome.emailSent = Boolean(solo?.sent);
-      if (solo?.sent) outcome.recipients = [primaryTo];
-    }
+      outcome.emailSent = Boolean(primaryMail?.sent);
+      outcome.recipients = primaryMail?.sent
+        ? [primaryTo, ...(primaryMail?.channel === 'smtp' ? bccList : [])]
+        : [];
 
-    // MSG91 ignores BCC — fan out to L2+/admin emails when primary was not pure SMTP+BCC.
-    const deliveredViaSmtpBcc = Boolean(primaryMail?.sent && primaryMail?.channel === 'smtp');
-    if (outcome.emailSent && bccList.length && !deliveredViaSmtpBcc) {
-      for (const addr of bccList.slice(0, 10)) {
-        try {
-          const r = await sendAppointmentEmail({
-            to: addr,
-            subject: salesSubject,
-            text: salesText,
-            html: `<pre style="font-family:sans-serif;white-space:pre-wrap">${salesText}</pre>`,
-            recipientName: 'Rfincare Team',
-          });
-          if (r?.sent) outcome.recipients.push(addr);
-        } catch {
-          /* soft-fail */
+      if (!outcome.emailSent && primaryTo) {
+        const solo = await sendAppointmentEmail({
+          to: primaryTo,
+          subject: salesSubject,
+          text: salesText,
+          html: `<pre style="font-family:sans-serif;white-space:pre-wrap">${salesText}</pre>`,
+          attachments: icsAttachment ? [icsAttachment] : undefined,
+          recipientName: 'Rfincare Sales',
+        });
+        outcome.emailSent = Boolean(solo?.sent);
+        if (solo?.sent) outcome.recipients = [primaryTo];
+      }
+
+      const deliveredViaSmtpBcc = Boolean(primaryMail?.sent && primaryMail?.channel === 'smtp');
+      if (outcome.emailSent && bccList.length && !deliveredViaSmtpBcc) {
+        for (const addr of bccList.slice(0, 10)) {
+          try {
+            const r = await sendAppointmentEmail({
+              to: addr,
+              subject: salesSubject,
+              text: salesText,
+              html: `<pre style="font-family:sans-serif;white-space:pre-wrap">${salesText}</pre>`,
+              recipientName: 'Rfincare Team',
+            });
+            if (r?.sent) outcome.recipients.push(addr);
+          } catch {
+            /* soft-fail */
+          }
         }
       }
     }
 
-    // In-app for each staff member
     try {
       const { createStaffNotification } = await import('./notifications.js');
       const title = `New expert appointment — ${customerName}`;
@@ -279,8 +322,9 @@ async function notifyAppointmentStaff({
         `When: ${whenLabel} (IST)`,
         `Topic: ${topic}`,
         `Phone: +91-${customerPhone}`,
+        meetLink ? `Join: ${meetLink}` : null,
         `Appointment ID: ${appointmentId}`,
-      ].join('\n');
+      ].filter(Boolean).join('\n');
 
       for (const s of staff) {
         try {
@@ -292,6 +336,7 @@ async function notifyAppointmentStaff({
             message,
             data: {
               appointmentId,
+              meetLink: meetLink || null,
               path: '/employee-dashboard',
             },
           });
@@ -304,15 +349,15 @@ async function notifyAppointmentStaff({
       console.warn('[appointments:in-app:import]', importErr?.message || importErr);
     }
 
-    // SMS / WhatsApp-style notify to staff phones (MSG91 transactional)
     if (isMsg91Configured()) {
       const smsBody = [
         `Rfincare: new appointment`,
         `${customerName}`,
         `When: ${whenLabel}`,
         `Topic: ${topic}`,
-        `+91-${customerPhone}`,
+        meetLink ? `Join: ${meetLink}` : `+91-${customerPhone}`,
       ]
+        .filter(Boolean)
         .join('\n')
         .slice(0, 300);
 
@@ -552,7 +597,7 @@ appointmentsRouter.post('/', async (req, res, next) => {
 
     const topicLabel = input.topic;
     const summary = `Rfincare Expert Call — ${input.fullName}`;
-    const description = [
+    const descriptionBase = [
       `Customer: ${input.fullName}`,
       `Email: ${input.email}`,
       `Phone: +91-${input.phone}`,
@@ -568,26 +613,39 @@ appointmentsRouter.post('/', async (req, res, next) => {
     try {
       google = await createGoogleCalendarEvent({
         summary,
-        description,
+        description: descriptionBase,
         startIso: startsAt.toISOString(),
         endIso: endsAt.toISOString(),
-        attendeeEmails: [input.email, salesEmail],
-        location: 'Rfincare — Phone / Video consultation',
+        attendeeEmails: [input.email, SUPPORT_EMAIL, salesEmail].filter(Boolean),
+        location: 'Rfincare — Online video consultation',
+        createMeetLink: true,
+        requestId: id,
       });
     } catch (err) {
       console.warn('[appointments] Google Calendar sync failed:', err?.message || err);
       google = { created: false, reason: err?.message || 'calendar_error' };
     }
 
+    const video = resolveAppointmentVideoLink({
+      appointmentId: id,
+      hangoutLink: google.hangoutLink || google.meetLink || null,
+    });
+    const meetLink = video.url;
+    const description = [
+      descriptionBase,
+      '',
+      `Video call: ${meetLink}`,
+    ].join('\n');
+
     await pool.execute(
       `INSERT INTO expert_appointments (
          id, full_name, email, phone, topic, preferred_date, preferred_time,
          duration_minutes, notes, status, google_event_id, google_event_link,
-         starts_at, ends_at
+         meet_link, starts_at, ends_at
        ) VALUES (
          :id, :full_name, :email, :phone, :topic, :preferred_date, :preferred_time,
          :duration_minutes, :notes, 'scheduled', :google_event_id, :google_event_link,
-         :starts_at, :ends_at
+         :meet_link, :starts_at, :ends_at
        )`,
       {
         id,
@@ -601,21 +659,36 @@ appointmentsRouter.post('/', async (req, res, next) => {
         notes: input.notes || null,
         google_event_id: google.eventId || null,
         google_event_link: google.htmlLink || null,
+        meet_link: meetLink,
         starts_at: startsAt.toISOString(),
         ends_at: endsAt.toISOString(),
       },
     );
 
     const whenLabel = formatDisplay(startsAt);
+    const dateLabel = startsAt.toLocaleDateString('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      weekday: 'short',
+      day: 'numeric',
+      month: 'short',
+      year: 'numeric',
+    });
+    const timeLabel = startsAt.toLocaleTimeString('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+
     const ics = buildIcsInvite({
       uid: `${id}@rfincare.com`,
       summary,
       description,
-      location: 'Rfincare — Phone / Video consultation',
+      location: meetLink,
       start: startsAt,
       end: endsAt,
-      organizerEmail: salesEmail,
-      attendeeEmails: [input.email, salesEmail],
+      organizerEmail: SUPPORT_EMAIL,
+      attendeeEmails: [input.email, SUPPORT_EMAIL, salesEmail],
+      url: meetLink,
     });
     const icsAttachment = {
       filename: 'rfincare-appointment.ics',
@@ -624,42 +697,65 @@ appointmentsRouter.post('/', async (req, res, next) => {
     };
 
     const customerSubject = `Appointment confirmed — ${whenLabel}`;
-    const customerText = [
+    const customerLines = [
       `Hi ${input.fullName},`,
       '',
       'Your consultation with an Rfincare financial expert is confirmed.',
       '',
-      `When: ${whenLabel} (IST)`,
+      `Date: ${dateLabel}`,
+      `Time: ${timeLabel} (IST)`,
       `Topic: ${topicLabel}`,
       `Duration: ${durationMinutes} minutes`,
-      google.htmlLink ? `Calendar: ${google.htmlLink}` : null,
+      `Join video call: ${meetLink}`,
+      google.htmlLink ? `Calendar event: ${google.htmlLink}` : null,
       '',
-      'Our sales team will call you on +91-' + input.phone + ' at the scheduled time.',
-      '',
-      'Need to reschedule? Reply to this email or contact support@rfincare.com.',
-      '',
-      '— Team Rfincare',
-    ]
-      .filter(Boolean)
-      .join('\n');
+      'Our team will also be on the call. Need to reschedule? Reply to this email or write to support@rfincare.com.',
+    ];
+    const customerText = customerLines.filter(Boolean).join('\n');
+    const customerHtml = buildAppointmentEmailHtml({
+      title: 'Appointment confirmed',
+      whenLabel,
+      meetUrl: meetLink,
+      lines: [
+        `Topic: ${topicLabel}`,
+        `Duration: ${durationMinutes} minutes`,
+        `Date: ${dateLabel}`,
+        `Time: ${timeLabel} (IST)`,
+        'Need to reschedule? Reply to this email or contact support@rfincare.com.',
+      ],
+    });
 
     const salesSubject = `New expert appointment — ${input.fullName} · ${whenLabel}`;
-    const salesText = [
+    const salesLines = [
       'A customer booked a Talk to Expert appointment.',
       '',
       `Name: ${input.fullName}`,
       `Email: ${input.email}`,
       `Phone: +91-${input.phone}`,
-      `When: ${whenLabel} (IST)`,
+      `Date: ${dateLabel}`,
+      `Time: ${timeLabel} (IST)`,
       `Topic: ${topicLabel}`,
       input.notes ? `Notes: ${input.notes}` : null,
+      `Join video call: ${meetLink}`,
       google.htmlLink ? `Google Calendar: ${google.htmlLink}` : null,
-      google.created ? null : 'Note: Google Calendar sync was skipped or failed — use the ICS attachment.',
+      google.created ? null : 'Note: Google Calendar sync was skipped or failed — use the video link and ICS attachment.',
       '',
       `Appointment ID: ${id}`,
-    ]
-      .filter(Boolean)
-      .join('\n');
+    ];
+    const salesText = salesLines.filter(Boolean).join('\n');
+    const salesHtml = buildAppointmentEmailHtml({
+      title: 'New expert appointment',
+      whenLabel,
+      meetUrl: meetLink,
+      lines: [
+        `Customer: ${input.fullName}`,
+        `Email: ${input.email}`,
+        `Phone: +91-${input.phone}`,
+        `Topic: ${topicLabel}`,
+        input.notes ? `Notes: ${input.notes}` : null,
+        `Appointment ID: ${id}`,
+      ],
+    });
 
     // Customer confirmation (ICS attached when provider supports it). Soft-fail only.
     let customerMail = { sent: false, reason: 'not_attempted' };
@@ -668,20 +764,42 @@ appointmentsRouter.post('/', async (req, res, next) => {
         to: input.email,
         subject: customerSubject,
         text: customerText,
-        html: `<pre style="font-family:sans-serif;white-space:pre-wrap">${customerText}</pre>`,
+        html: customerHtml,
         attachments: [icsAttachment],
         recipientName: input.fullName,
-        replyTo: salesEmail,
+        replyTo: SUPPORT_EMAIL,
       });
     } catch (mailErr) {
       console.error('[appointments:email:customer]', mailErr?.message || mailErr);
       customerMail = { sent: false, reason: 'email_error', warningInternal: mailErr?.message };
     }
 
+    // Always notify support@rfincare.com (client requirement) + configured sales inbox.
+    const companyRecipients = [...new Set(
+      [SUPPORT_EMAIL, salesEmail]
+        .map((e) => String(e || '').trim().toLowerCase())
+        .filter(Boolean),
+    )];
+
+    let supportMail = { sent: false };
+    try {
+      supportMail = await sendAppointmentEmail({
+        to: companyRecipients,
+        subject: salesSubject,
+        text: salesText,
+        html: salesHtml,
+        attachments: [icsAttachment],
+        recipientName: 'Rfincare Support',
+      });
+    } catch (mailErr) {
+      console.error('[appointments:email:support]', mailErr?.message || mailErr);
+      supportMail = { sent: false, reason: 'email_error' };
+    }
+
     // Sales / employee / admin notifications (email + in-app + SMS). Soft-fail only.
     const staffNotify = await notifyAppointmentStaff({
       pool,
-      salesEmail,
+      salesEmail: SUPPORT_EMAIL,
       salesSubject,
       salesText,
       icsAttachment,
@@ -690,6 +808,9 @@ appointmentsRouter.post('/', async (req, res, next) => {
       customerName: input.fullName,
       customerPhone: input.phone,
       topic: topicLabel,
+      meetLink,
+      // Company email already sent to support@rfincare.com (+ sales) above.
+      skipEmail: true,
     });
 
     // Best-effort SMS confirmation to customer (never surface MSG91 internals).
@@ -699,13 +820,12 @@ appointmentsRouter.post('/', async (req, res, next) => {
         `Rfincare: appointment confirmed.`,
         `When: ${whenLabel} (IST)`,
         `Topic: ${topicLabel}`,
-        `Duration: ${durationMinutes} min`,
-        `We will call +91-${input.phone}.`,
+        `Join: ${meetLink}`,
       ].join('\n');
 
       sms = await sendMsg91TransactionalSms({
         phone: input.phone,
-        message: smsText,
+        message: smsText.slice(0, 300),
       });
     } catch (smsErr) {
       console.error('[appointments:sms]', smsErr?.message || smsErr);
@@ -716,7 +836,7 @@ appointmentsRouter.post('/', async (req, res, next) => {
     }
 
     const customerEmailSent = customerMail?.sent === true;
-    const salesEmailSent = staffNotify.emailSent === true;
+    const salesEmailSent = supportMail?.sent === true || staffNotify.emailSent === true;
     const icsAttached =
       customerEmailSent
       && Number(customerMail?.attachmentCount || 0) > 0
@@ -734,10 +854,15 @@ appointmentsRouter.post('/', async (req, res, next) => {
       startsAt: startsAt.toISOString(),
       endsAt: endsAt.toISOString(),
       whenLabel,
+      dateLabel,
+      timeLabel,
+      meetLink,
+      videoProvider: video.provider,
       googleCalendar: {
         configured: googleCalendarConfigured(),
         synced: Boolean(google.created),
         eventLink: google.htmlLink || null,
+        meetLink: google.hangoutLink || google.meetLink || null,
       },
       emails: {
         customer: {
@@ -747,11 +872,12 @@ appointmentsRouter.post('/', async (req, res, next) => {
         },
         sales: {
           sent: salesEmailSent,
-          channel: salesEmailSent ? 'email' : null,
+          channel: supportMail?.channel || (salesEmailSent ? 'email' : null),
           inAppNotified: staffNotify.inAppNotified,
           smsSent: staffNotify.smsSent,
         },
-        salesEmail,
+        salesEmail: SUPPORT_EMAIL,
+        companyRecipients,
       },
       sms: { sent: Boolean(sms?.sent) },
       staffNotify: {
@@ -761,7 +887,7 @@ appointmentsRouter.post('/', async (req, res, next) => {
       },
       message: anyEmailFailed
         ? 'Appointment booked. If you do not receive a confirmation email shortly, our team will still contact you at the scheduled time.'
-        : 'Appointment booked. Confirmation emails sent to you and our sales team.',
+        : 'Appointment booked. Confirmation emails sent to you and support@rfincare.com.',
       // Customer-safe notices only (no SMTP/MSG91 credential text).
       notificationWarnings: {
         emailWarnings: [

@@ -28,7 +28,8 @@ function rangeToEstimate(range) {
 }
 
 /**
- * Best available credit score for a customer: bureau pull > application data > self-reported range.
+ * Customer dashboard credit profile.
+ * Score + PDF come from Experian only (local sandbox stubs and other bureaus are ignored).
  */
 export async function getCustomerCreditProfile(customerId, email) {
   await ensureMilestone4Schema();
@@ -46,7 +47,11 @@ export async function getCustomerCreditProfile(customerId, email) {
               cv.display_name AS vendor_name
        FROM cibil_checks cc
        LEFT JOIN cibil_vendors cv ON cv.vendor_key = cc.vendor_key
-       WHERE cc.customer_id = :id AND cc.status = 'success' AND cc.credit_score IS NOT NULL
+       WHERE cc.customer_id = :id
+         AND cc.status = 'success'
+         AND cc.credit_score IS NOT NULL
+         AND cc.vendor_key = 'experian'
+         AND COALESCE(cc.response_payload->>'localFallback', 'false') <> 'true'
        ORDER BY cc.checked_at DESC
        LIMIT 1`,
       { id: customerId },

@@ -2,6 +2,7 @@ import { getPool } from '../db/pool.js';
 import { isIgnorableEnsureError } from '../db/schemaErrors.js';
 import { newId } from './ids.js';
 import { pickField } from './cmsContentMap.js';
+import { cmsMediaIdFromUrl, deleteCmsMediaByUrl, ensureCmsMediaSchema } from './cmsMedia.js';
 
 export const FLASH_TILE_CATEGORIES = [
   { id: 'mutual_fund', label: 'Mutual Fund', icon: 'TrendingUp' },
@@ -57,6 +58,54 @@ const DEFAULT_SEED = {
       bannerImageUrl: '',
     },
   ],
+  fixed_income: [
+    {
+      title: 'Lock in higher FD rates today',
+      subtitle: 'Earn up to 9% p.a. on fixed deposits from top banks & NBFCs',
+      buttonText: 'Compare FDs',
+      displayOrder: 1,
+    },
+  ],
+  post_office: [
+    {
+      title: 'Safe, government-backed savings',
+      subtitle: 'Compare PPF, NSC, KVP, SCSS & MIS in one place',
+      buttonText: 'View Schemes',
+      displayOrder: 1,
+    },
+  ],
+  government_schemes: [
+    {
+      title: 'Find government schemes you qualify for',
+      subtitle: 'Loans, subsidies, pensions & insurance from central and state schemes',
+      buttonText: 'Explore Schemes',
+      displayOrder: 1,
+    },
+  ],
+  investment: [
+    {
+      title: 'Diversify beyond stocks',
+      subtitle: 'Sovereign gold bonds, bonds, REITs & InvITs from trusted providers',
+      buttonText: 'Explore Investments',
+      displayOrder: 1,
+    },
+  ],
+  retirement_planning: [
+    {
+      title: 'Plan a worry-free retirement',
+      subtitle: 'Estimate your corpus and compare NPS, pension & SWP options',
+      buttonText: 'Start Planning',
+      displayOrder: 1,
+    },
+  ],
+  wealth_management: [
+    {
+      title: 'Grow and protect your wealth',
+      subtitle: 'Goal-based plans for education, marriage, retirement & more',
+      buttonText: 'Get Started',
+      displayOrder: 1,
+    },
+  ],
   customer_referral_scheme: [
     {
       title: 'Refer & Earn Rewards',
@@ -95,6 +144,13 @@ export async function ensureFlashTilesSchema(pool = getPool()) {
     await pool.execute(`
       CREATE INDEX IF NOT EXISTS idx_flash_tiles_category_order
       ON homepage_flash_tiles (category, display_order ASC, created_at DESC)
+    `);
+    await pool.execute(`
+      CREATE TABLE IF NOT EXISTS homepage_flash_tile_seeds (
+        category VARCHAR(64) NOT NULL,
+        seeded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (category)
+      )
     `);
   } catch (err) {
     if (!isIgnorableEnsureError(err)) throw err;
@@ -144,7 +200,18 @@ function mapTileRow(row) {
   };
 }
 
+/** Seed a category once; if an admin later deletes every tile it must stay empty. */
 async function seedDefaultsIfEmpty(pool, category) {
+  const [[seededRow]] = await pool.execute(
+    `SELECT COUNT(*)::int AS c FROM homepage_flash_tile_seeds WHERE category = :category`,
+    { category },
+  );
+  if (Number(seededRow?.c || 0) > 0) return;
+  const [claim] = await pool.execute(
+    `INSERT INTO homepage_flash_tile_seeds (category) VALUES (:category) ON CONFLICT (category) DO NOTHING`,
+    { category },
+  );
+  if (!Number(claim?.affectedRows || 0)) return;
   const [[countRow]] = await pool.execute(
     `SELECT COUNT(*)::int AS c FROM homepage_flash_tiles WHERE category = :category`,
     { category },
@@ -211,6 +278,31 @@ export async function getFlashTile(id) {
     { id },
   );
   return mapTileRow(row);
+}
+
+/** Remove an uploaded banner image once no tile uses it any more. */
+async function releaseBannerImage(pool, url) {
+  if (!cmsMediaIdFromUrl(url)) return;
+  const [[row]] = await pool.execute(
+    `SELECT COUNT(*)::int AS c FROM homepage_flash_tiles WHERE banner_image_url = :url`,
+    { url },
+  );
+  if (Number(row?.c || 0) > 0) return;
+  await deleteCmsMediaByUrl(url);
+}
+
+/** Images uploaded in the editor but never saved on a tile (modal cancelled / replaced). */
+async function pruneUnsavedBannerImages(pool) {
+  await ensureCmsMediaSchema(pool);
+  await pool.execute(
+    `DELETE FROM cms_media m
+     WHERE m.purpose = 'flash_tile'
+       AND m.created_at < NOW() - INTERVAL '1 day'
+       AND NOT EXISTS (
+         SELECT 1 FROM homepage_flash_tiles t
+         WHERE t.banner_image_url LIKE '%' || TRIM(m.id) || '%'
+       )`,
+  );
 }
 
 export async function createFlashTile(input, userId) {
@@ -317,7 +409,12 @@ export async function updateFlashTile(id, input, userId) {
       updated_by: userId || null,
     },
   );
-  return getFlashTile(id);
+  const updated = await getFlashTile(id);
+  if (existing.bannerImageUrl && existing.bannerImageUrl !== updated?.bannerImageUrl) {
+    await releaseBannerImage(pool, existing.bannerImageUrl);
+  }
+  await pruneUnsavedBannerImages(pool);
+  return updated;
 }
 
 export async function duplicateFlashTile(id, userId) {
@@ -345,6 +442,7 @@ export async function duplicateFlashTile(id, userId) {
 export async function deleteFlashTile(id) {
   const pool = getPool();
   await ensureFlashTilesSchema(pool);
+  const existing = await getFlashTile(id);
   const [result] = await pool.execute(`DELETE FROM homepage_flash_tiles WHERE id = :id`, { id });
   const deleted = result?.affectedRows ?? result?.rowCount ?? 0;
   if (!deleted) {
@@ -352,6 +450,8 @@ export async function deleteFlashTile(id) {
     err.status = 404;
     throw err;
   }
+  if (existing?.bannerImageUrl) await releaseBannerImage(pool, existing.bannerImageUrl);
+  await pruneUnsavedBannerImages(pool);
   return { ok: true, deleted: true };
 }
 

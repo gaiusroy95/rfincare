@@ -30,6 +30,7 @@ export function buildIcsInvite({
   end,
   organizerEmail,
   attendeeEmails = [],
+  url,
 }) {
   const dtStamp = toIcsUtc(new Date());
   const dtStart = toIcsUtc(start);
@@ -56,6 +57,7 @@ export function buildIcsInvite({
     `SUMMARY:${escapeText(summary)}`,
     `DESCRIPTION:${escapeText(description)}`,
     `LOCATION:${escapeText(location || 'Rfincare consultation')}`,
+    url ? `URL:${escapeText(url)}` : null,
     organizerEmail ? `ORGANIZER;CN=Rfincare Sales:mailto:${organizerEmail}` : null,
     attendees || null,
     'STATUS:CONFIRMED',

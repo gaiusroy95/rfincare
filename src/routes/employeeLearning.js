@@ -10,6 +10,7 @@ import { authenticate } from '../middleware/authenticate.js';
 import { authorize } from '../middleware/authorize.js';
 import { ensureAgentLearningSchema } from '../db/ensureAgentLearningSchema.js';
 import {
+  deleteLearningContent,
   resolveLearningDiskPath,
   resolveLearningOpenTarget,
 } from '../lib/learningFileDelivery.js';
@@ -293,36 +294,14 @@ adminEmployeeLearningRouter.delete(
       await ensureAgentLearningSchema();
       const pool = getPool();
       const [[row]] = await pool.execute(
-        `SELECT id, file_url, file_path, file_name FROM agent_learning_content
+        `SELECT id, file_url, file_path, thumbnail_url FROM agent_learning_content
          WHERE id = :id AND audience IN ('employee', 'all') LIMIT 1`,
         { id: req.params.id },
       );
       if (!row) return res.status(404).json({ error: 'Content not found' });
 
-      await pool.execute(`DELETE FROM employee_learning_progress WHERE content_id = :id`, {
-        id: req.params.id,
-      });
-      await pool.execute(`DELETE FROM agent_learning_progress WHERE content_id = :id`, {
-        id: req.params.id,
-      });
-      await pool.execute(
-        `DELETE FROM agent_learning_content WHERE id = :id AND audience IN ('employee', 'all')`,
-        { id: req.params.id },
-      );
-
-      try {
-        const { unlink } = await import('node:fs/promises');
-        const diskPath = resolveLearningDiskPath({
-          fileUrl: row.file_url,
-          filePath: row.file_path,
-          fileName: row.file_name,
-        });
-        if (diskPath) await unlink(diskPath).catch(() => {});
-      } catch {
-        /* file cleanup best-effort */
-      }
-
-      res.json({ ok: true, deleted: true });
+      const { filesRemoved } = await deleteLearningContent(pool, row);
+      res.json({ ok: true, deleted: true, filesRemoved: filesRemoved.length });
     } catch (err) {
       next(err);
     }

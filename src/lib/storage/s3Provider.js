@@ -3,6 +3,7 @@ import {
   PutObjectCommand,
   GetObjectCommand,
   HeadObjectCommand,
+  DeleteObjectCommand,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { assertS3Config } from './config.js';
@@ -86,6 +87,16 @@ export async function getS3SignedUrl(objectKey) {
     new GetObjectCommand({ Bucket: cfg.bucket, Key: key }),
     { expiresIn: cfg.signedUrlTtlSeconds },
   );
+}
+
+/** Returns true when the object existed and was removed. */
+export async function deleteS3Object(objectKey) {
+  const cfg = assertS3Config();
+  const key = normalizeStorageKey(objectKey);
+  if (!key) return false;
+  if (!(await s3ObjectExists(key))) return false;
+  await getClient().send(new DeleteObjectCommand({ Bucket: cfg.bucket, Key: key }));
+  return true;
 }
 
 export async function s3ObjectExists(objectKey) {

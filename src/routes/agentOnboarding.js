@@ -27,6 +27,7 @@ import {
 } from '../lib/otpSecurity.js';
 import { verifyAccessToken } from '../lib/jwt.js';
 import { authenticate } from '../middleware/authenticate.js';
+import { assertEmployeeAccess } from '../lib/employeeAccessControls.js';
 import { toStoredPath, normalizeStorageKey } from '../lib/storage/keys.js';
 import {
   acceptAgreements,
@@ -35,6 +36,7 @@ import {
   adminTransition,
   applicantLogin,
   createDraftApplication,
+  EMPLOYEE_REVIEW_ACTIONS,
   issueApplicantAccessToken,
   listApplicationActions,
   listChecklistForEntity,
@@ -47,6 +49,9 @@ import {
   updateEntity,
   upsertParties,
 } from '../lib/agentOnboarding.js';
+import { readFileSync, existsSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { streamStoredUpload } from '../lib/uploadPaths.js';
 
 export const agentOnboardingRouter = Router();
 
@@ -191,6 +196,52 @@ function requireCanManage(req, _res, next) {
     return next(e);
   }
   next();
+}
+
+/** Admin always; employee needs agents ACL (and assignment for write actions). */
+async function requireCanReview(req, _res, next) {
+  try {
+    if (!req.auth) {
+      const e = new Error('Authentication required');
+      e.status = 401;
+      throw e;
+    }
+    if (canManage(req.auth.role)) {
+      req.reviewContext = { role: 'admin', allowAdminOnlyActions: true };
+      return next();
+    }
+    if (req.auth.role === 'employee') {
+      await assertEmployeeAccess(req, 'agents', 'read');
+      req.reviewContext = { role: 'employee', allowAdminOnlyActions: false };
+      return next();
+    }
+    const e = new Error('Insufficient permissions');
+    e.status = 403;
+    throw e;
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function assertEmployeeCanAccessApplication(req, application) {
+  if (canManage(req.auth.role)) return;
+  if (req.auth.role !== 'employee') {
+    const e = new Error('Insufficient permissions');
+    e.status = 403;
+    throw e;
+  }
+  const assignedTo = String(application?.assignedEmployeeId || '');
+  if (assignedTo && assignedTo === String(req.auth.userId)) return;
+  // Unassigned queue visible for pick-up/read when employee has agents write? Keep read for assigned only,
+  // but allow listing unassigned so admin assign isn't the only path — employees see only assigned.
+  if (!assignedTo) {
+    const e = new Error('Application is not assigned to you');
+    e.status = 403;
+    throw e;
+  }
+  const e = new Error('Application is assigned to another employee');
+  e.status = 403;
+  throw e;
 }
 
 const uploadDirName = 'agent-onboarding';
@@ -668,45 +719,112 @@ agentOnboardingRouter.get('/me/actions', authenticateApplicant, async (req, res,
   }
 });
 
-/* ---------- Admin list / detail / action ---------- */
+/* ---------- Admin / employee review ---------- */
 
-agentOnboardingRouter.get('/', authenticate, requireCanManage, async (req, res, next) => {
+agentOnboardingRouter.get('/', authenticate, requireCanReview, async (req, res, next) => {
   try {
+    const isAdmin = canManage(req.auth.role);
     const applications = await adminListApplications({
       status: req.query.status || null,
       entityType: req.query.entityType || req.query.entity_type || null,
       q: req.query.q || req.query.search || null,
+      assignedEmployeeId: isAdmin
+        ? (req.query.assignedEmployeeId || req.query.assigned_employee_id || null)
+        : req.auth.userId,
+      unassignedOnly: isAdmin && String(req.query.unassigned || '') === '1',
       limit: req.query.limit,
       offset: req.query.offset,
     });
-    res.json({ applications });
+    // Employees only see non-draft applications assigned to them (filter already applied).
+    res.json({
+      applications: isAdmin
+        ? applications
+        : applications.filter((a) => a.workflowStatus !== 'draft'),
+      viewerRole: isAdmin ? 'admin' : 'employee',
+    });
   } catch (err) {
     next(err);
   }
 });
 
-agentOnboardingRouter.get('/:id', authenticate, requireCanManage, async (req, res, next) => {
+agentOnboardingRouter.get('/:id', authenticate, requireCanReview, async (req, res, next) => {
   try {
     const application = await adminGetApplication(req.params.id);
-    res.json({ application });
+    await assertEmployeeCanAccessApplication(req, application);
+    res.json({
+      application,
+      viewerRole: canManage(req.auth.role) ? 'admin' : 'employee',
+      allowedActions: canManage(req.auth.role)
+        ? null
+        : [...EMPLOYEE_REVIEW_ACTIONS],
+    });
   } catch (err) {
     next(err);
   }
 });
 
-agentOnboardingRouter.post('/:id/action', authenticate, requireCanManage, async (req, res, next) => {
+agentOnboardingRouter.get(
+  '/:id/documents/:documentId/file',
+  authenticate,
+  requireCanReview,
+  async (req, res, next) => {
+    try {
+      const application = await adminGetApplication(req.params.id);
+      await assertEmployeeCanAccessApplication(req, application);
+      const doc = (application.documents || []).find(
+        (d) => String(d.id) === String(req.params.documentId),
+      );
+      if (!doc?.filePath && !doc?.fileUrl) {
+        return res.status(404).json({ error: 'Document file not found' });
+      }
+
+      const stored = doc.filePath || String(doc.fileUrl || '').replace(/^\/uploads\//, '');
+      const opened = await streamStoredUpload(stored).catch(() => null);
+      if (opened?.stream) {
+        res.setHeader('Content-Type', opened.contentType || 'application/octet-stream');
+        res.setHeader(
+          'Content-Disposition',
+          `inline; filename="${basename(String(stored))}"`,
+        );
+        return opened.stream.pipe(res);
+      }
+
+      const localName = basename(String(stored));
+      const fullPath = resolve(getUploadDir(), 'agent-onboarding', localName);
+      const altPath = resolve(getUploadDir(), String(stored).replace(/^\/+/, ''));
+      const path = existsSync(fullPath) ? fullPath : existsSync(altPath) ? altPath : null;
+      if (!path) return res.status(404).json({ error: 'Document file missing on server' });
+      res.setHeader('Content-Type', 'application/octet-stream');
+      res.setHeader('Content-Disposition', `inline; filename="${localName}"`);
+      res.send(readFileSync(path));
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+agentOnboardingRouter.post('/:id/action', authenticate, requireCanReview, async (req, res, next) => {
   try {
     const body = req.body || {};
+    const isAdmin = canManage(req.auth.role);
+    if (!isAdmin) {
+      const application = await adminGetApplication(req.params.id);
+      await assertEmployeeCanAccessApplication(req, application);
+      await assertEmployeeAccess(req, 'agents', 'write');
+    }
+
     const result = await adminTransition(req.params.id, {
       action: body.action,
       remarks: body.remarks || null,
       documentId: body.documentId || body.document_id || null,
       field: body.field || null,
       result: body.result || null,
+      assigneeUserId: body.assigneeUserId || body.assignedEmployeeId || body.assigned_employee_id || null,
       actorUserId: req.auth.userId,
       actorLabel: req.auth.role,
       ip: getClientIp(req),
       userAgent: req.headers['user-agent'],
+      allowAdminOnlyActions: isAdmin,
     });
     res.json({ success: true, ...result });
   } catch (err) {

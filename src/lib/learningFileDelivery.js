@@ -3,6 +3,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { getUploadDir, normalizeStoredUploadName, resolveUploadFilePath } from './uploadPaths.js';
+import { deleteStoredFile } from './storage/index.js';
 
 const backendRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const assetsRoot = resolve(backendRoot, 'assets');
@@ -140,6 +141,36 @@ export function resolveLearningOpenTarget({
 
   if (videoUrl) return { openUrl: videoUrl, downloadPath: null };
   return { openUrl: null, downloadPath: null };
+}
+
+/**
+ * Permanently delete a learning item: its stored file + thumbnail, all progress rows,
+ * then the content row. Files are deleted first so a storage failure leaves the row
+ * in place for a retry instead of orphaning the file.
+ * @returns {Promise<{ filesRemoved: string[] }>}
+ */
+export async function deleteLearningContent(pool, row) {
+  const groups = [[row.file_url, row.file_path]];
+  if (row.thumbnail_url && row.thumbnail_url !== row.file_url) groups.push([row.thumbnail_url]);
+
+  const filesRemoved = [];
+  for (const group of groups) {
+    const url = group.find(Boolean);
+    if (!url) continue;
+    const [[shared]] = await pool.execute(
+      `SELECT COUNT(*) AS n FROM agent_learning_content
+       WHERE id <> :id AND (file_url = :url OR thumbnail_url = :url)`,
+      { id: row.id, url },
+    );
+    if (Number(shared?.n || 0) > 0) continue;
+    filesRemoved.push(...(await deleteStoredFile(...group)));
+  }
+
+  await pool.execute(`DELETE FROM agent_learning_progress WHERE content_id = :id`, { id: row.id });
+  await pool.execute(`DELETE FROM employee_learning_progress WHERE content_id = :id`, { id: row.id });
+  await pool.execute(`DELETE FROM agent_learning_content WHERE id = :id`, { id: row.id });
+
+  return { filesRemoved };
 }
 
 export function buildConfigCircularId(fileUrl) {

@@ -1,7 +1,19 @@
 import { Router } from 'express';
 import { streamStoredUpload } from '../lib/uploadPaths.js';
+import { sendCibilReportPdf } from '../lib/cibilReportStore.js';
 
 export const uploadsRouter = Router();
+
+/** `/uploads/cibil-reports/*` — mounted for every storage provider; bureau reports survive redeploys via the DB copy. */
+export const cibilReportUploadsRouter = Router();
+
+cibilReportUploadsRouter.get('/:fileName', async (req, res, next) => {
+  try {
+    await sendCibilReportPdf(res, req.params.fileName, { disposition: 'inline', prefix: 'credit-report' });
+  } catch (err) {
+    next(err);
+  }
+});
 
 /** Stream objects from cloud storage through the same /uploads/* URLs clients already use. */
 uploadsRouter.get('/*', async (req, res, next) => {

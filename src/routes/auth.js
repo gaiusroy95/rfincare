@@ -944,9 +944,8 @@ authRouter.post('/forgot-password/lookup', async (req, res, next) => {
     const {
       normalizeForgotEmail,
       normalizeForgotPhone,
-      portalAllowsRole,
+      assertForgotPasswordAccount,
       buildForgotChannels,
-      maskEmail,
     } = await import('../lib/forgotPassword.js');
 
     const input = ForgotPasswordLookupSchema.parse(req.body);
@@ -962,32 +961,12 @@ authRouter.post('/forgot-password/lookup', async (req, res, next) => {
       { email },
     );
 
-    const inactive =
-      user
-      && (
-        user.is_active === false
-        || user.is_active === 0
-        || ['suspended', 'inactive', 'terminated', 'locked'].includes(
-          String(user.account_status || '').toLowerCase(),
-        )
-      );
+    // Client requirement: on Continue, fail early if the email is unknown for this
+    // portal or the account is inactive — do not continue into OTP.
+    assertForgotPasswordAccount(user, input.portal);
 
-    const roleOk = user && portalAllowsRole(input.portal, user.role);
-    const usable = Boolean(user && roleOk && !inactive);
-    const phone = usable ? normalizeForgotPhone(user.phone) : '';
-
-    // Anti-enumeration: always return a channel list. Unknown/wrong-role accounts
-    // only expose email (masked from the typed address).
-    const channels = usable
-      ? buildForgotChannels({ email, phone })
-      : [
-          {
-            id: 'email',
-            label: 'Email',
-            description: 'Send OTP to registered email',
-            masked: maskEmail(email),
-          },
-        ];
+    const phone = normalizeForgotPhone(user.phone);
+    const channels = buildForgotChannels({ email, phone });
 
     res.json({
       success: true,
@@ -1010,7 +989,7 @@ authRouter.post('/forgot-password/request-otp', async (req, res, next) => {
     const {
       normalizeForgotEmail,
       normalizeForgotPhone,
-      portalAllowsRole,
+      assertForgotPasswordAccount,
       assertForgotRequestAllowed,
       maskEmail,
       maskPhone,
@@ -1031,25 +1010,7 @@ authRouter.post('/forgot-password/request-otp', async (req, res, next) => {
       { email },
     );
 
-    const generic = {
-      success: true,
-      message: 'If an account exists for this portal, an OTP has been sent.',
-      expiresInSeconds: 600,
-    };
-
-    const inactive =
-      user
-      && (
-        user.is_active === false
-        || user.is_active === 0
-        || ['suspended', 'inactive', 'terminated', 'locked'].includes(
-          String(user.account_status || '').toLowerCase(),
-        )
-      );
-
-    if (!user || !portalAllowsRole(input.portal, user.role) || inactive) {
-      return res.json(generic);
-    }
+    assertForgotPasswordAccount(user, input.portal);
 
     const phone = normalizeForgotPhone(user.phone);
     let channel = input.channel;
@@ -1096,7 +1057,9 @@ authRouter.post('/forgot-password/request-otp', async (req, res, next) => {
       channel === 'email' ? maskEmail(email) : maskPhone(phone) || maskEmail(email);
 
     res.json({
-      ...generic,
+      success: true,
+      message: `OTP sent to ${destination}. Valid for 10 minutes.`,
+      expiresInSeconds: 600,
       channel,
       destination,
       ...(canExposeDevOtp() ? { devOtp: otp } : {}),
@@ -1119,7 +1082,7 @@ authRouter.post('/forgot-password/confirm', async (req, res, next) => {
   try {
     const {
       normalizeForgotEmail,
-      portalAllowsRole,
+      assertForgotPasswordAccount,
       assertPasswordStrength,
       assertForgotConfirmAllowed,
       clearForgotConfirmAttempts,
@@ -1152,9 +1115,8 @@ authRouter.post('/forgot-password/confirm', async (req, res, next) => {
        LIMIT 1`,
       { email },
     );
-    if (!user || !portalAllowsRole(input.portal, user.role)) {
-      return res.status(404).json({ error: 'Account not found for this portal' });
-    }
+    // Block password change for missing / wrong-portal / inactive accounts.
+    assertForgotPasswordAccount(user, input.portal);
 
     const hashed = await bcrypt.hash(input.newPassword, 12);
     await pool.execute(`UPDATE auth_users SET password_hash = :ph WHERE id = :id`, {

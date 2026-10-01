@@ -64,11 +64,24 @@ function canManageLeads(role) {
   return hasPermission(role, 'manage:*') || role === 'admin' || role === 'super_admin';
 }
 
+/** Rows written before the marketingLeads UPDATE fix may hold the text 'true'/'false'. */
+function cleanLeadText(value) {
+  const text = String(value ?? '').trim();
+  return /^(true|false)$/i.test(text) ? '' : text;
+}
+
 function formatProductType(value) {
-  if (!value) return '';
-  return String(value)
+  const text = cleanLeadText(value);
+  if (!text) return '';
+  return text
     .replace(/_/g, ' ')
     .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+/** Same label the Leads table shows under the contact column. */
+function formatLeadSource(row) {
+  const agentCode = String(row?.sourced_agent_code || '').trim();
+  return agentCode ? `Agent: ${agentCode}` : 'Direct';
 }
 
 function csvEscape(value) {
@@ -1516,6 +1529,8 @@ leadsRouter.get('/export.csv', authenticate, async (req, res, next) => {
       'Consent Verified At',
       'Created At',
       'Updated At',
+      'Lead Channel',
+      'Referral Code',
     ];
 
     const lines = rows.map((row) => [
@@ -1524,7 +1539,7 @@ leadsRouter.get('/export.csv', authenticate, async (req, res, next) => {
       row.email,
       row.phone,
       formatProductType(row.loan_type),
-      row.source,
+      formatLeadSource(row),
       row.status,
       row.eligibility_score,
       row.application_id,
@@ -1541,6 +1556,10 @@ leadsRouter.get('/export.csv', authenticate, async (req, res, next) => {
       row.consent_verified_at,
       row.created_at,
       row.updated_at,
+      formatProductType(row.source),
+      row.referral_code && row.referral_code !== row.sourced_agent_code
+        ? `${row.referral_code} (${row.referral_program || 'customer'})`
+        : '',
     ].map(csvEscape).join(','));
 
     const csv = [header.map(csvEscape).join(','), ...lines].join('\n');

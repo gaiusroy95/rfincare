@@ -5,11 +5,19 @@ export const healthRouter = Router();
 
 /** Bump when shipping API routes that frontends depend on (e.g. agent delete). */
 export const API_BUILD = {
-  id: '2026-09-04-agent-delete',
+  id: '2026-10-01-appointment-meet-email',
   features: {
     agentPermanentDelete: true,
     agentDeleteViaPatch: true,
     agentDeletePost: true,
+    flashTileImageUpload: true,
+    learningPermanentDelete: true,
+    leadCsvSourceLabel: true,
+    bureauRoutingExperianCibil: true,
+    agentExperianCheck: true,
+    cibilReportsInDb: true,
+    appointmentMeetLink: true,
+    appointmentMsg91EmailPreferred: true,
   },
 };
 

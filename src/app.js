@@ -78,7 +78,7 @@ import { mutualFundSipsRouter } from './routes/mutualFundSips.js';
 import { getCorsOptions } from './lib/corsOptions.js';
 import { getUploadDir } from './lib/uploadPaths.js';
 import { isCloudStorage } from './lib/storage/index.js';
-import { uploadsRouter } from './routes/uploads.js';
+import { uploadsRouter, cibilReportUploadsRouter } from './routes/uploads.js';
 
 export function createApp({ serveStatic = true } = {}) {
   const __filename = fileURLToPath(import.meta.url);
@@ -192,6 +192,7 @@ export function createApp({ serveStatic = true } = {}) {
   app.use('/engagement', engagementRouter);
   app.use('/api/engagement', engagementRouter);
 
+  app.use('/uploads/cibil-reports', cibilReportUploadsRouter);
   if (isCloudStorage()) {
     app.use('/uploads', uploadsRouter);
   } else {

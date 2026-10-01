@@ -26,7 +26,64 @@ import { sqlParamEquals } from './sqlCollation.js';
 const ENTITY_TYPES = new Set(['individual', 'proprietorship', 'partnership', 'private_limited']);
 const PARTY_ROLES = new Set(['partner', 'director', 'authorised_signatory', 'proprietor']);
 
+/** Applicant may edit application content only in these statuses. */
 const EDITABLE_STATUSES = new Set(['draft', 'sent_back', 'reupload_required']);
+
+/** Client-facing workflow: Submitted → Assigned → Under Verification → … */
+export const WORKFLOW_STAGE_ORDER = [
+  'submitted',
+  'assigned',
+  'under_verification',
+  'business_verification',
+  'compliance_review',
+  'approved',
+];
+
+/** Normalize legacy status names to the current workflow vocabulary. */
+export function normalizeWorkflowStatus(status) {
+  const s = String(status || '').trim().toLowerCase();
+  if (s === 'kyc_verification' || s === 'under_review') return 'under_verification';
+  return s;
+}
+
+export const DOC_STATUS_LABELS = {
+  uploaded: 'Pending Verification',
+  pending: 'Pending Verification',
+  pending_review: 'Pending Verification',
+  pending_verification: 'Pending Verification',
+  verified: 'Verified',
+  rejected: 'Rejected',
+  reupload_required: 'Resubmission Required',
+  missing: 'Missing',
+};
+
+export function documentStatusLabel(status) {
+  const key = String(status || '').toLowerCase();
+  return DOC_STATUS_LABELS[key] || (key ? key.replace(/_/g, ' ') : 'Pending Verification');
+}
+
+/** Actions an assigned employee may perform (admin can do all). */
+export const EMPLOYEE_REVIEW_ACTIONS = new Set([
+  'start_verification',
+  'verify_document',
+  'reject_document',
+  'send_back',
+  'request_document',
+  'hold',
+  'mark_bank_verified',
+  'verify_field',
+  'advance',
+  'advance_stage',
+]);
+
+export const ADMIN_ONLY_ACTIONS = new Set([
+  'assign',
+  'unassign',
+  'approve',
+  'reject',
+  'activate',
+  'suspend',
+]);
 
 function httpError(message, status = 400) {
   const e = new Error(message);
@@ -104,6 +161,7 @@ export function mapParty(row) {
 
 export function mapDocument(row) {
   if (!row) return null;
+  const status = row.status || 'uploaded';
   return {
     id: row.id,
     applicationId: row.application_id,
@@ -114,7 +172,8 @@ export function mapDocument(row) {
     expiryDate: row.expiry_date,
     fileUrl: docUrl(row.file_path),
     filePath: row.file_path || null,
-    status: row.status,
+    status,
+    statusLabel: documentStatusLabel(status),
     rejectionReason: row.rejection_reason,
     uploadedAt: row.uploaded_at,
     reviewedAt: row.reviewed_at,
@@ -400,7 +459,8 @@ export function mapApplication(row, { parties = [], documents = [], actions = []
     id: row.id,
     applicationId: row.application_id,
     entityType: row.entity_type,
-    workflowStatus: row.workflow_status,
+    workflowStatus: normalizeWorkflowStatus(row.workflow_status) || row.workflow_status,
+    workflowStatusRaw: row.workflow_status,
     email: row.email,
     phone: row.phone,
     fullName: row.full_name,
@@ -431,6 +491,10 @@ export function mapApplication(row, { parties = [], documents = [], actions = []
     submittedAt: row.submitted_at,
     activatedUserId: row.activated_user_id,
     assignedAgentCode: row.assigned_agent_code,
+    assignedEmployeeId: row.assigned_employee_id || null,
+    assignedAt: row.assigned_at || null,
+    assignedEmployeeName: row.assigned_employee_name || null,
+    assignedEmployeeEmail: row.assigned_employee_email || null,
     rejectionReason: row.rejection_reason,
     legacyPartnerRegistrationId: row.legacy_partner_registration_id,
     createdAt: row.created_at,
@@ -442,7 +506,7 @@ export function mapApplication(row, { parties = [], documents = [], actions = []
   };
   mapped.risk = computeApplicationRisk(mapped);
   mapped.kycStatus = mapped.entityPayload?.pan || mapped.entityPayload?.panNumber
-    ? (mapped.workflowStatus === 'kyc_verification' ? 'Pending' : 'Complete')
+    ? (['under_verification', 'kyc_verification', 'assigned', 'submitted'].includes(mapped.workflowStatus) ? 'Pending' : 'Complete')
     : (mapped.entityType ? 'Partial' : '—');
   return mapped;
 }
@@ -1115,7 +1179,7 @@ export async function submitApplication(applicationId, { ip = null, userAgent = 
 
   await pool.execute(
     `UPDATE agent_applications SET
-       workflow_status = 'kyc_verification',
+       workflow_status = 'submitted',
        submitted_at = NOW(),
        rejection_reason = NULL,
        updated_at = NOW()
@@ -1158,6 +1222,8 @@ export async function adminListApplications({
   status = null,
   entityType = null,
   q = null,
+  assignedEmployeeId = null,
+  unassignedOnly = false,
   limit = 100,
   offset = 0,
 } = {}) {
@@ -1166,26 +1232,42 @@ export async function adminListApplications({
   const lim = Math.min(Math.max(Number(limit) || 100, 1), 500);
   const off = Math.max(Number(offset) || 0, 0);
   const statusFilter = status ? String(status).trim() : '';
+  // Accept legacy KYC status as under_verification for filters.
+  const statusNormalized = normalizeWorkflowStatus(statusFilter);
   const entityFilter = entityType ? String(entityType).trim().toLowerCase() : '';
   const query = q ? `%${String(q).trim().toLowerCase()}%` : '';
+  const assignee = assignedEmployeeId ? String(assignedEmployeeId).trim() : '';
 
   const [rows] = await pool.execute(
-    `SELECT * FROM agent_applications
-     WHERE (:status = '' OR workflow_status = :status)
-       AND (:entity_type = '' OR entity_type = :entity_type)
+    `SELECT aa.*,
+            emp.full_name AS assigned_employee_name,
+            emp.email AS assigned_employee_email
+     FROM agent_applications aa
+     LEFT JOIN user_profiles emp ON emp.id = aa.assigned_employee_id
+     WHERE (
+         :status = ''
+         OR aa.workflow_status = :status
+         OR (:status_norm = 'under_verification' AND aa.workflow_status IN ('under_verification', 'kyc_verification', 'under_review'))
+       )
+       AND (:entity_type = '' OR aa.entity_type = :entity_type)
        AND (
          :q = ''
-         OR LOWER(email) LIKE :q
-         OR phone LIKE :q
-         OR LOWER(COALESCE(full_name, '')) LIKE :q
-         OR LOWER(application_id) LIKE :q
+         OR LOWER(aa.email) LIKE :q
+         OR aa.phone LIKE :q
+         OR LOWER(COALESCE(aa.full_name, '')) LIKE :q
+         OR LOWER(aa.application_id) LIKE :q
        )
-     ORDER BY created_at DESC
+       AND (:assignee = '' OR aa.assigned_employee_id = :assignee)
+       AND (:unassigned = 0 OR aa.assigned_employee_id IS NULL)
+     ORDER BY aa.created_at DESC
      LIMIT ${lim} OFFSET ${off}`,
     {
       status: statusFilter,
+      status_norm: statusNormalized,
       entity_type: entityFilter,
       q: query,
+      assignee,
+      unassigned: unassignedOnly ? 1 : 0,
     },
   );
 
@@ -1277,6 +1359,16 @@ export async function adminGetApplication(idOrPublicId) {
   const app = await loadApplicationBundle(idOrPublicId);
   if (!app) throw httpError('Application not found', 404);
   const pool = getPool();
+  if (app.assignedEmployeeId) {
+    const [[emp]] = await pool.execute(
+      `SELECT full_name, email FROM user_profiles WHERE id = :id LIMIT 1`,
+      { id: app.assignedEmployeeId },
+    ).catch(() => [[null]]);
+    if (emp) {
+      app.assignedEmployeeName = emp.full_name || null;
+      app.assignedEmployeeEmail = emp.email || null;
+    }
+  }
   const checklist = app.entityType ? await listChecklistForEntity(app.entityType) : [];
   app.actions = await attachActorNames(pool, app.actions || []);
   app.review = buildReviewSummary(app, checklist);
@@ -1576,11 +1668,14 @@ async function saveFieldCheck(pool, row, { field, result, remarks, actorUserId }
 
 async function notifyApplicantStatus(row, act, remarks) {
   const subjects = {
-    send_back: 'Action needed: your Rfincare partner application was sent back',
+    send_back: 'Action needed: correction required on your Rfincare partner application',
     request_document: 'Action needed: please re-upload documents for your Rfincare partner application',
     reject_document: 'Action needed: a document in your Rfincare partner application was rejected',
+    reject: 'Your Rfincare partner application was rejected',
     approve: 'Your Rfincare partner application is approved',
     hold: 'Your Rfincare partner application is on hold',
+    assign: 'Your Rfincare partner application is under review',
+    start_verification: 'Your Rfincare partner application is under verification',
   };
   const subject = subjects[act];
   if (!subject || !row?.email) return;
@@ -1593,11 +1688,19 @@ async function notifyApplicantStatus(row, act, remarks) {
     `Application ID: ${row.application_id}`,
     act === 'approve'
       ? 'Your application has been approved. Your agent account will be activated shortly.'
-      : act === 'hold'
-        ? 'Your application has been placed on hold by our review team.'
-        : 'Our review team needs you to update your application.',
+      : act === 'reject'
+        ? 'Your application has been rejected.'
+        : act === 'hold'
+          ? 'Your application has been placed on hold by our review team.'
+          : act === 'assign' || act === 'start_verification'
+            ? 'Our team has started reviewing your application.'
+            : 'Our review team needs you to update your application.',
     remarks ? `Remarks: ${remarks}` : '',
-    needsAction ? `Log in to update your application: ${statusUrl}` : `Track your status: ${statusUrl}`,
+    needsAction || act === 'reject'
+      ? needsAction
+        ? `Log in to update your application: ${statusUrl}`
+        : `Track your status: ${statusUrl}`
+      : `Track your status: ${statusUrl}`,
     '',
     '— Rfincare Team',
   ].filter((l) => l !== null);
@@ -1615,10 +1718,12 @@ export async function adminTransition(applicationId, {
   documentId = null,
   field = null,
   result = null,
+  assigneeUserId = null,
   actorUserId = null,
   actorLabel = 'admin',
   ip = null,
   userAgent = null,
+  allowAdminOnlyActions = true,
 } = {}) {
   await ensureSchema();
   const pool = getPool();
@@ -1626,33 +1731,92 @@ export async function adminTransition(applicationId, {
   if (!row) throw httpError('Application not found', 404);
 
   const act = String(action || '').trim().toLowerCase();
-  let nextStatus = row.workflow_status;
+  if (!allowAdminOnlyActions && ADMIN_ONLY_ACTIONS.has(act)) {
+    throw httpError('This action requires admin privileges', 403);
+  }
+  if (!allowAdminOnlyActions && !EMPLOYEE_REVIEW_ACTIONS.has(act)) {
+    throw httpError(`Unsupported action for employee reviewer: ${act}`, 403);
+  }
+
+  let nextStatus = normalizeWorkflowStatus(row.workflow_status) || row.workflow_status;
   let extra = null;
   let auditRemarks = remarks;
 
-  const STAGE_ORDER = [
-    'kyc_verification',
-    'business_verification',
-    'compliance_review',
-    'approved',
-  ];
-
   switch (act) {
+    case 'assign': {
+      const employeeId = String(assigneeUserId || '').trim();
+      if (!employeeId) throw httpError('assigneeUserId is required for assign');
+      const [[emp]] = await pool.execute(
+        `SELECT id, full_name, email, role FROM user_profiles
+         WHERE id = :id AND role = 'employee' AND COALESCE(is_active, TRUE) = TRUE LIMIT 1`,
+        { id: employeeId },
+      );
+      if (!emp) throw httpError('Assigned employee not found or inactive', 404);
+      await pool.execute(
+        `UPDATE agent_applications SET
+           assigned_employee_id = :emp,
+           assigned_at = NOW(),
+           workflow_status = CASE
+             WHEN workflow_status IN ('draft') THEN workflow_status
+             WHEN workflow_status IN ('submitted', 'sent_back', 'reupload_required', 'on_hold') THEN 'assigned'
+             ELSE workflow_status
+           END,
+           updated_at = NOW()
+         WHERE id = :id`,
+        { id: row.id, emp: employeeId },
+      );
+      nextStatus = ['submitted', 'sent_back', 'reupload_required', 'on_hold'].includes(
+        normalizeWorkflowStatus(row.workflow_status) || row.workflow_status,
+      )
+        ? 'assigned'
+        : (normalizeWorkflowStatus(row.workflow_status) || row.workflow_status);
+      auditRemarks = remarks
+        || `Assigned to ${emp.full_name || emp.email || employeeId}`;
+      // Skip generic status update below — already written.
+      await recordAction({
+        applicationId: row.id,
+        actorUserId,
+        actorLabel,
+        action: act,
+        remarks: auditRemarks,
+        ip,
+        userAgent,
+      });
+      await notifyApplicantStatus(row, act, auditRemarks)
+        .catch((err) => console.warn('[agent-onboarding-notify]', err?.message));
+      return { application: await adminGetApplication(row.id), result: null };
+    }
+    case 'unassign':
+      await pool.execute(
+        `UPDATE agent_applications SET
+           assigned_employee_id = NULL,
+           assigned_at = NULL,
+           updated_at = NOW()
+         WHERE id = :id`,
+        { id: row.id },
+      );
+      nextStatus = normalizeWorkflowStatus(row.workflow_status) || row.workflow_status;
+      auditRemarks = remarks || 'Assignment cleared';
+      break;
+    case 'start_verification':
+      nextStatus = 'under_verification';
+      break;
     case 'approve':
       await assertReadyForApproval(row.id, 'approve');
       nextStatus = 'approved';
       break;
     case 'advance':
     case 'advance_stage': {
-      // submitted (legacy) → kyc → business → compliance → approved
-      const current = row.workflow_status === 'submitted' || row.workflow_status === 'under_review'
-        ? 'kyc_verification'
-        : row.workflow_status;
-      const idx = STAGE_ORDER.indexOf(current);
-      if (idx < 0 || idx >= STAGE_ORDER.length - 1) {
+      const current = normalizeWorkflowStatus(row.workflow_status) || row.workflow_status;
+      const idx = WORKFLOW_STAGE_ORDER.indexOf(current);
+      if (idx < 0 || idx >= WORKFLOW_STAGE_ORDER.length - 1) {
         throw httpError(`Cannot advance from status '${row.workflow_status}'`);
       }
-      nextStatus = STAGE_ORDER[idx + 1];
+      nextStatus = WORKFLOW_STAGE_ORDER[idx + 1];
+      // Employees may advance through verification stages but not to final approve.
+      if (!allowAdminOnlyActions && nextStatus === 'approved') {
+        throw httpError('Only an admin can approve the application', 403);
+      }
       if (nextStatus === 'approved') await assertReadyForApproval(row.id, 'approve');
       break;
     }
@@ -1696,9 +1860,10 @@ export async function adminTransition(applicationId, {
          WHERE id = :id`,
         { id: row.id, by: actorUserId || null },
       );
-      nextStatus = ['submitted', 'under_review', 'kyc_verification'].includes(row.workflow_status)
+      nextStatus = ['submitted', 'assigned', 'under_verification', 'under_review', 'kyc_verification']
+        .includes(normalizeWorkflowStatus(row.workflow_status) || row.workflow_status)
         ? 'business_verification'
-        : row.workflow_status;
+        : (normalizeWorkflowStatus(row.workflow_status) || row.workflow_status);
       break;
     case 'verify_document':
       if (!documentId) throw httpError('documentId is required');
@@ -1706,13 +1871,17 @@ export async function adminTransition(applicationId, {
         status: 'verified',
         reviewerUserId: actorUserId,
       });
-      nextStatus = row.workflow_status === 'submitted' ? 'kyc_verification' : row.workflow_status;
+      {
+        const cur = normalizeWorkflowStatus(row.workflow_status) || row.workflow_status;
+        nextStatus = ['submitted', 'assigned'].includes(cur) ? 'under_verification' : cur;
+      }
       break;
     case 'reject_document':
       if (!documentId) throw httpError('documentId is required');
+      if (!remarks) throw httpError('Rejection reason/remarks are required');
       await setDocumentReview(pool, documentId, row.id, {
         status: 'rejected',
-        rejectionReason: remarks || 'Document rejected',
+        rejectionReason: remarks,
         reviewerUserId: actorUserId,
       });
       nextStatus = 'reupload_required';
@@ -1728,7 +1897,7 @@ export async function adminTransition(applicationId, {
       throw httpError(`Unsupported action: ${act}`);
   }
 
-  if (act !== 'activate' && act !== 'verify_field') {
+  if (act !== 'activate' && act !== 'verify_field' && act !== 'unassign') {
     const setsReason = ['rejected', 'sent_back', 'reupload_required'].includes(nextStatus);
     await pool.execute(
       `UPDATE agent_applications SET
@@ -1740,6 +1909,8 @@ export async function adminTransition(applicationId, {
         ? { id: row.id, status: nextStatus, remarks: remarks || null }
         : { id: row.id, status: nextStatus },
     );
+  } else if (act === 'unassign') {
+    // status unchanged; assignment cleared above
   }
 
   await recordAction({

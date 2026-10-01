@@ -13,7 +13,7 @@ export function smtpConfigured() {
 function smtpPassword() {
   let raw = process.env.SMTP_PASS || process.env.SMTP_PASSWORD || '';
   raw = String(raw).trim();
-  // Strip wrapping quotes that often get pasted into Cloud Run / .env
+  // Strip wrapping quotes that often get pasted into Render / .env
   if (
     (raw.startsWith('"') && raw.endsWith('"'))
     || (raw.startsWith("'") && raw.endsWith("'"))
@@ -43,13 +43,13 @@ function humanizeSmtpError(err) {
     return (
       'Gmail SMTP login failed (535 BadCredentials). Use a Google App Password (not your normal Gmail password), '
       + 'set SMTP_USER to the full Gmail address, set SMTP_PASS to the 16-character app password WITHOUT spaces or quotes, '
-      + 'and ensure 2-Step Verification is ON. Then update Cloud Run Variables & Secrets and redeploy/restart the service.'
+      + 'and ensure 2-Step Verification is ON. Then update Render Environment Variables and redeploy/restart the service.'
     );
   }
   if (/EAUTH/i.test(combined) || /Invalid login/i.test(combined)) {
     return (
       'SMTP authentication failed. Check SMTP_HOST, SMTP_USER, SMTP_PASS/SMTP_PASSWORD on the server '
-      + '(Cloud Run Variables). For Gmail you must use an App Password.'
+      + '(Render Environment). For Gmail you must use an App Password.'
     );
   }
   return (
@@ -198,6 +198,39 @@ async function trySendViaMsg91({
   };
 }
 
+async function msg91EmailReady() {
+  try {
+    const overrides = await resolveMsg91EmailOverrides();
+    const authKey = Boolean(String(process.env.MSG91_AUTH_KEY || '').trim());
+    const domain = Boolean(
+      String(overrides.msg91EmailDomain || process.env.MSG91_EMAIL_DOMAIN || '').trim(),
+    );
+    const from = Boolean(
+      String(
+        overrides.msg91EmailFromEmail
+          || process.env.MSG91_EMAIL_FROM_EMAIL
+          || process.env.MSG91_EMAIL_FROM
+          || '',
+      ).trim(),
+    );
+    return authKey && domain && from;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Prefer MSG91 when configured (Rfincare production uses MSG91).
+ * Override with EMAIL_PRIMARY=smtp|msg91 if needed.
+ */
+async function preferredEmailChannel() {
+  const forced = String(process.env.EMAIL_PRIMARY || '').trim().toLowerCase();
+  if (forced === 'smtp' || forced === 'msg91') return forced;
+  if (await msg91EmailReady()) return 'msg91';
+  if (smtpConfigured()) return 'smtp';
+  return 'none';
+}
+
 export async function sendEmail({
   to,
   subject,
@@ -219,8 +252,13 @@ export async function sendEmail({
     ? attachments.filter((a) => a?.path || a?.content)
     : [];
 
-  if (smtpConfigured()) {
-    // 1) SMTP with attachments
+  const primary = await preferredEmailChannel();
+  const warnings = [];
+
+  async function trySmtp() {
+    if (!smtpConfigured()) {
+      return { sent: false, reason: 'smtp_not_configured' };
+    }
     try {
       await sendViaSmtp({
         to: toAddress,
@@ -241,8 +279,8 @@ export async function sendEmail({
       };
     } catch (err) {
       console.error('[email:smtp]', err?.message || err);
+      warnings.push(humanizeSmtpError(err));
 
-      // 2) SMTP without attachments (ICS MIME can break some providers)
       if (mailAttachments.length) {
         try {
           await sendViaSmtp({
@@ -267,46 +305,61 @@ export async function sendEmail({
           };
         } catch (retryErr) {
           console.error('[email:smtp:retry-no-attach]', retryErr?.message || retryErr);
+          warnings.push(humanizeSmtpError(retryErr));
         }
       }
-
-      // 3) MSG91 fallback (with attachments when possible)
-      const msg91 = await trySendViaMsg91({
-        recipients,
-        subject,
-        text,
-        html,
-        recipientName,
-        attachments: mailAttachments,
-        smtpFallback: true,
-      });
-      if (msg91.sent) return msg91;
-
       return {
         sent: false,
         channel: 'smtp',
         reason: err?.code || 'smtp_error',
-        warningInternal:
-          [humanizeSmtpError(err), msg91.warningInternal].filter(Boolean).join(' | '),
-        attachmentCount: mailAttachments.length,
+        warningInternal: humanizeSmtpError(err),
       };
     }
   }
 
-  // No SMTP — MSG91 transactional (template-based) before log-only fallback.
-  const msg91 = await trySendViaMsg91({
-    recipients,
-    subject,
-    text,
-    html,
-    recipientName,
-    attachments: mailAttachments,
-  });
-  if (msg91.sent) return msg91;
-  if (msg91.warningInternal) {
-    console.error('[email:msg91]', msg91.warningInternal);
+  async function tryMsg91(smtpFallback = false) {
+    const msg91 = await trySendViaMsg91({
+      recipients,
+      subject,
+      text,
+      html,
+      recipientName,
+      attachments: mailAttachments,
+      smtpFallback,
+    });
+    if (!msg91.sent && msg91.warningInternal) warnings.push(msg91.warningInternal);
+    return msg91;
   }
 
+  if (primary === 'msg91') {
+    const msg91 = await tryMsg91(false);
+    if (msg91.sent) return msg91;
+    const smtp = await trySmtp();
+    if (smtp.sent) return { ...smtp, fallbackFrom: 'msg91' };
+    return {
+      sent: false,
+      channel: 'msg91',
+      reason: msg91.reason || smtp.reason || 'email_failed',
+      warningInternal: warnings.filter(Boolean).join(' | '),
+      attachmentCount: mailAttachments.length,
+    };
+  }
+
+  if (primary === 'smtp') {
+    const smtp = await trySmtp();
+    if (smtp.sent) return smtp;
+    const msg91 = await tryMsg91(true);
+    if (msg91.sent) return msg91;
+    return {
+      sent: false,
+      channel: 'smtp',
+      reason: smtp.reason || msg91.reason || 'email_failed',
+      warningInternal: warnings.filter(Boolean).join(' | '),
+      attachmentCount: mailAttachments.length,
+    };
+  }
+
+  // Neither channel configured — log only.
   console.log(
     '[email]',
     { to: toAddress, cc: ccAddress, bcc: bccAddress, subject },
@@ -315,10 +368,9 @@ export async function sendEmail({
   return {
     sent: false,
     channel: 'log',
-    reason: msg91.reason || 'smtp_not_configured',
+    reason: 'email_not_configured',
     warningInternal:
-      msg91.warningInternal
-      || 'Email was not delivered — configure SMTP_HOST and SMTP_FROM (or MSG91 email domain) on the server.',
+      'Email was not delivered — configure MSG91 email (preferred) or SMTP_* on the Render server.',
     attachmentCount: mailAttachments.length,
   };
 }
