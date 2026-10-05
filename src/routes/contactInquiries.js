@@ -20,7 +20,7 @@ export const contactInquiriesRouter = Router();
 
 let schemaReady = false;
 
-async function ensureContactInquirySchema() {
+export async function ensureContactInquirySchema() {
   if (schemaReady) return;
   const pool = getPool();
   await pool.execute(`
@@ -91,7 +91,7 @@ const OtpVerifySchema = z.object({
 });
 
 /** Always notify primary support inbox (ops can override / extend via env). */
-function supportInboxes(contact) {
+export function supportInboxes(contact) {
   const extras = [
     process.env.CONTACT_INQUIRY_EMAIL,
     process.env.SALES_TEAM_EMAIL,
