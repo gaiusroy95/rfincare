@@ -6,40 +6,109 @@ import {
   extractCreditScore,
   getSurepassConfig,
   surepassConfigured,
+  surepassLiveMode,
 } from '../src/lib/surepassCibil.js';
 
-test('buildSurepassCibilBody normalizes PAN, mobile, DOB, gender', () => {
+const PRODUCTION = 'https://kyc-api.surepass.io';
+const SANDBOX = 'https://sandbox.surepass.io';
+
+function fakeToken(identity) {
+  const claims = { identity, exp: Math.floor(Date.now() / 1000) + 86400 };
+  return ['h', Buffer.from(JSON.stringify(claims)).toString('base64url'), 's'].join('.');
+}
+
+function withEnv(vars, fn) {
+  const prev = {};
+  for (const [k, v] of Object.entries(vars)) {
+    prev[k] = process.env[k];
+    if (v == null) delete process.env[k];
+    else process.env[k] = v;
+  }
+  try {
+    return fn();
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v == null) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
+
+test('buildSurepassCibilBody normalizes PAN, mobile and gender', () => {
   const body = buildSurepassCibilBody({
-    name: 'Ramesh Kumar',
+    name: ' Ramesh Kumar ',
     pan: 'abcde1234f',
     mobile: '+91 9876543210',
-    dob: '1990-01-15',
     gender: 'M',
   });
+  assert.equal(body.name, 'Ramesh Kumar');
   assert.equal(body.pan, 'ABCDE1234F');
-  assert.equal(body.mobile_no, '9876543210');
-  assert.equal(body.dob, '15-01-1990');
+  assert.equal(body.mobile, '9876543210');
   assert.equal(body.gender, 'male');
   assert.equal(body.consent, 'Y');
 });
 
+test('buildSurepassCibilBody omits gender for Experian', () => {
+  const body = buildSurepassCibilBody(
+    { name: 'A B', pan: 'ABCDE1234F', mobile: '9876543210', gender: 'F' },
+    { vendor_key: 'experian' },
+  );
+  assert.equal(body.gender, undefined);
+});
+
 test('extractCreditScore reads nested Surepass-style payload', () => {
   assert.equal(extractCreditScore({ data: { credit_score: 742 } }), 742);
-  assert.equal(extractCreditScore({ data: { cibil_score: '801' } }), 801);
+  assert.equal(extractCreditScore({ data: { credit_score: '801' } }), 801);
   assert.equal(extractCreditScore({ data: { experian_score: 765 } }), 765);
   assert.equal(extractCreditScore({ score: 12 }), null);
 });
 
 test('surepassConfigured is false without env or vendor key', () => {
-  assert.equal(surepassConfigured({}), false);
-  assert.equal(surepassConfigured({ api_key: 'tok_test' }), true);
+  withEnv({ SUREPASS_TOKEN: null, SUREPASS_ID_NUMBER: null, SUREPASS_PASSWORD: null }, () => {
+    assert.equal(surepassConfigured({}), false);
+    assert.equal(surepassConfigured({ api_key: 'tok_test' }), true);
+  });
 });
 
-test('getSurepassConfig uses Experian path when vendor_key=experian', () => {
-  const prev = process.env.SUREPASS_EXPERIAN_PATH;
-  delete process.env.SUREPASS_EXPERIAN_PATH;
-  const cfg = getSurepassConfig({ vendor_key: 'experian' });
-  assert.equal(cfg.isExperian, true);
-  assert.equal(cfg.path, '/api/v1/credit-experian-pdf-report');
-  if (prev != null) process.env.SUREPASS_EXPERIAN_PATH = prev;
+test('getSurepassConfig uses the fetch-report-pdf path per bureau', () => {
+  withEnv({ SUREPASS_EXPERIAN_PATH: null, SUREPASS_CIBIL_PATH: '/api/v1/credit-cibil-pdf-report' }, () => {
+    const experian = getSurepassConfig({ vendor_key: 'experian' });
+    assert.equal(experian.isExperian, true);
+    assert.deepEqual(experian.paths, ['/api/v1/credit-report-experian/fetch-report-pdf']);
+    const cibil = getSurepassConfig({ vendor_key: 'transunion_cibil' });
+    assert.deepEqual(cibil.paths, ['/api/v1/credit-report-cibil/fetch-report-pdf']);
+  });
+});
+
+test('production token always calls the production host, even with a sandbox base URL', () => {
+  withEnv(
+    { SUREPASS_TOKEN: fakeToken('rfincare_1@surepass.io'), SUREPASS_BASE_URL: SANDBOX, SUREPASS_SANDBOX: 'true' },
+    () => {
+      const cfg = getSurepassConfig({ vendor_key: 'experian' });
+      assert.equal(cfg.baseUrl, PRODUCTION);
+      assert.equal(cfg.sandbox, false);
+      assert.equal(surepassLiveMode(), true);
+    },
+  );
+});
+
+test('sandbox token always calls the sandbox host', () => {
+  withEnv(
+    { SUREPASS_TOKEN: fakeToken('dev.rfincare_1@surepass.io'), SUREPASS_BASE_URL: PRODUCTION, SUREPASS_SANDBOX: 'false' },
+    () => {
+      const cfg = getSurepassConfig({ vendor_key: 'transunion_cibil' });
+      assert.equal(cfg.baseUrl, SANDBOX);
+      assert.equal(cfg.sandbox, true);
+      assert.equal(surepassLiveMode(), false);
+    },
+  );
+});
+
+test('custom gateway base URL is kept', () => {
+  withEnv(
+    { SUREPASS_TOKEN: fakeToken('rfincare_1@surepass.io'), SUREPASS_BASE_URL: 'https://proxy.example.com/' },
+    () => {
+      assert.equal(getSurepassConfig({}).baseUrl, 'https://proxy.example.com');
+    },
+  );
 });

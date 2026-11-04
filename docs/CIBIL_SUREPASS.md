@@ -8,16 +8,18 @@ Rfincare pulls credit score + PDF through Surepass.
 ## Env (backend/.env)
 
 ```env
-# Sandbox token → sandbox host; paid production token → kyc-api.surepass.io
-SUREPASS_BASE_URL=https://sandbox.surepass.io
+# Production (real bureau scores)
+SUREPASS_BASE_URL=https://kyc-api.surepass.io
 SUREPASS_CIBIL_PATH=/api/v1/credit-report-cibil/fetch-report-pdf
 SUREPASS_EXPERIAN_PATH=/api/v1/credit-report-experian/fetch-report-pdf
-SUREPASS_SANDBOX=true
-SUREPASS_TIMEOUT_MS=45000
-SUREPASS_TOKEN=
+SUREPASS_SANDBOX=false
+SUREPASS_TIMEOUT_MS=60000
+SUREPASS_TOKEN=<production token from the Surepass console>
 SUREPASS_ID_NUMBER=
 SUREPASS_PASSWORD=
 ```
+
+The API host follows the token: a production token always calls `https://kyc-api.surepass.io`, a sandbox token (identity starting with `dev.`) always calls `https://sandbox.surepass.io`, so a mismatched `SUREPASS_BASE_URL` cannot cause 401s. Sandbox tokens only return Surepass demo data, never a person's real score. Admin → CIBIL vendors shows the detected token environment and expiry.
 
 Use **either**:
 

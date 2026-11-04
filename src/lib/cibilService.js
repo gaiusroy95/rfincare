@@ -8,6 +8,7 @@ import {
   requestSurepassCibilPdf,
   saveCibilPdfBuffer,
   surepassConfigured,
+  surepassLiveMode,
 } from './surepassCibil.js';
 
 const VENDOR_KEYS = ['transunion_cibil', 'experian', 'equifax', 'crif_high_mark'];
@@ -157,11 +158,17 @@ async function getVendorByKey(pool, vendorKey) {
   return row || null;
 }
 
+/** Sandbox flag for bureau vendors: follows the configured token's environment when one exists. */
+function vendorSandboxMode() {
+  if (surepassConfigured()) return !surepassLiveMode();
+  return String(process.env.SUREPASS_SANDBOX || 'true') !== 'false';
+}
+
 /** Bureau vendor row by key; creates an inactive placeholder so routing never depends on `is_active`. */
 async function getBureauVendor(pool, vendorKey) {
   let vendor = await getVendorByKey(pool, vendorKey);
   if (!vendor) {
-    const sandbox = String(process.env.SUREPASS_SANDBOX || 'true') !== 'false';
+    const sandbox = vendorSandboxMode();
     await pool.execute(
       `INSERT INTO cibil_vendors (vendor_key, display_name, sandbox_mode, is_active, updated_at)
        VALUES (:key, :name, :sandbox, FALSE, NOW())
@@ -828,7 +835,7 @@ export async function getCibilCheckById(checkId) {
 
 export async function syncSurepassVendorFromEnv(pool = getPool()) {
   const token = String(process.env.SUREPASS_TOKEN || '').trim();
-  const sandbox = String(process.env.SUREPASS_SANDBOX || 'true') !== 'false';
+  const sandbox = vendorSandboxMode();
   await pool.execute(
     `INSERT INTO cibil_vendors (vendor_key, display_name, api_key, sandbox_mode, is_active, updated_at)
      VALUES ('transunion_cibil', 'TransUnion CIBIL (Surepass)', :api_key, :sandbox, TRUE, NOW())

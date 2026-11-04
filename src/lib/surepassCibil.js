@@ -64,13 +64,19 @@ export function getSurepassConfig(vendor = {}) {
   const bearerFromVendor = String(vendor.api_key || '').trim();
   const tokenInfo = getSurepassTokenInfo(token || bearerFromVendor);
 
-  // Sandbox tokens are rejected by the production host and vice versa.
+  // Sandbox tokens are rejected by the production host and vice versa, so a token whose
+  // environment is known always picks its own host; SUREPASS_BASE_URL only wins for custom gateways.
   const configuredBase = env('SUREPASS_BASE_URL').replace(/\/$/, '');
-  const defaultBase = tokenInfo.environment === 'sandbox' ? SANDBOX_BASE_URL : PRODUCTION_BASE_URL;
-  const baseUrl =
-    configuredBase && !(configuredBase === PRODUCTION_BASE_URL && tokenInfo.environment === 'sandbox')
-      ? configuredBase
-      : defaultBase;
+  const envSandbox = env('SUREPASS_SANDBOX', 'true') !== 'false';
+  const isKnownHost = [PRODUCTION_BASE_URL, SANDBOX_BASE_URL].includes(configuredBase);
+  let baseUrl;
+  if (configuredBase && !isKnownHost) baseUrl = configuredBase;
+  else if (tokenInfo.environment === 'production') baseUrl = PRODUCTION_BASE_URL;
+  else if (tokenInfo.environment === 'sandbox') baseUrl = SANDBOX_BASE_URL;
+  else baseUrl = configuredBase || (envSandbox ? SANDBOX_BASE_URL : PRODUCTION_BASE_URL);
+  const sandbox =
+    tokenInfo.environment === 'sandbox'
+    || (tokenInfo.environment !== 'production' && (baseUrl === SANDBOX_BASE_URL || envSandbox));
 
   const envPath = env(isExperian ? 'SUREPASS_EXPERIAN_PATH' : 'SUREPASS_CIBIL_PATH');
   const normalizedEnvPath = envPath ? (envPath.startsWith('/') ? envPath : `/${envPath}`) : '';
@@ -86,9 +92,9 @@ export function getSurepassConfig(vendor = {}) {
     idNumber: env('SUREPASS_ID_NUMBER'),
     password: env('SUREPASS_PASSWORD') || String(vendor.api_secret || '').trim(),
     bearerFromVendor,
-    sandbox: tokenInfo.environment === 'sandbox' || env('SUREPASS_SANDBOX', 'true') !== 'false',
+    sandbox,
     tokenInfo,
-    timeoutMs: Number(env('SUREPASS_TIMEOUT_MS', '45000')) || 45000,
+    timeoutMs: Number(env('SUREPASS_TIMEOUT_MS', '60000')) || 60000,
     vendorKey: key,
     isExperian,
   };
@@ -97,6 +103,11 @@ export function getSurepassConfig(vendor = {}) {
 export function surepassConfigured(vendor = {}) {
   const cfg = getSurepassConfig(vendor);
   return Boolean(cfg.token || cfg.bearerFromVendor || (cfg.idNumber && cfg.password));
+}
+
+/** True when server credentials point at the paid production bureau (real scores). */
+export function surepassLiveMode() {
+  return surepassConfigured() && !getSurepassConfig().sandbox;
 }
 
 /** Depth-limited search for the first non-empty value under any of `keys`. */
