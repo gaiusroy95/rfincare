@@ -1,8 +1,30 @@
+import { createHash } from 'node:crypto';
+
 import { fetchWithTimeout } from './fetchWithTimeout.js';
 import { isPdfBuffer, storeCibilReportPdf } from './cibilReportStore.js';
 
 const PRODUCTION_BASE_URL = 'https://kyc-api.surepass.io';
 const SANDBOX_BASE_URL = 'https://sandbox.surepass.io';
+
+/**
+ * Surepass uses "dev.<user>" identities for production tokens too, so the identity alone
+ * cannot tell sandbox from production. Trial / sandbox tokens are short-lived (~30 days);
+ * paid production tokens are long-lived (years).
+ */
+const PRODUCTION_MIN_LIFETIME_DAYS = 180;
+
+/** Host learned from Surepass itself ("signature invalid — use the other host"), per token. */
+const learnedEnvironment = new Map();
+
+function tokenFingerprint(token) {
+  return createHash('sha256').update(String(token || '')).digest('hex').slice(0, 24);
+}
+
+/** Surepass 401 meaning "valid token, wrong host (sandbox vs production)". */
+function isWrongHostError(status, message) {
+  return Number(status) === 401
+    && /signature\)?\s*is invalid|being used in\s*'?(sandbox|kyc-api)/i.test(String(message || ''));
+}
 
 /** Surepass bureau PDF endpoints (POST, JSON body, Bearer token). */
 const BUREAU_PATHS = {
@@ -44,9 +66,15 @@ export function getSurepassTokenInfo(token = env('SUREPASS_TOKEN')) {
   if (!claims) return { configured: true, environment: 'unknown' };
   const identity = String(claims.identity || claims.sub || '');
   const expiresAt = claims.exp ? new Date(claims.exp * 1000) : null;
+  const lifetimeDays = claims.iat && claims.exp ? (claims.exp - claims.iat) / 86400 : null;
+  let environment = learnedEnvironment.get(tokenFingerprint(token));
+  if (!environment) {
+    if (lifetimeDays != null && lifetimeDays > PRODUCTION_MIN_LIFETIME_DAYS) environment = 'production';
+    else environment = identity.startsWith('dev.') ? 'sandbox' : 'production';
+  }
   return {
     configured: true,
-    environment: identity.startsWith('dev.') ? 'sandbox' : 'production',
+    environment,
     expiresAt: expiresAt ? expiresAt.toISOString() : null,
     expired: Boolean(expiresAt && expiresAt.getTime() < Date.now()),
   };
@@ -291,7 +319,14 @@ function bureauLabel(cfg) {
 function friendlyProviderError(cfg, status, providerMessage) {
   const label = bureauLabel(cfg);
   if (status === 401 || status === 403) {
-    return `${label} service is not available: the credit bureau API token was rejected (${providerMessage || 'unauthorized'}). Renew the Surepass token on the server.`;
+    // Short, actionable text (long provider messages were hidden behind a generic error in the UI).
+    if (/expired/i.test(providerMessage)) {
+      return `${label}: the Surepass API token has expired. Save a valid production token in Admin → API Configuration.`;
+    }
+    if (/signature|being used in/i.test(providerMessage)) {
+      return `${label}: Surepass did not accept the API token on ${cfg.sandbox ? 'sandbox' : 'production'}. Check the token in Admin → API Configuration.`;
+    }
+    return `${label}: Surepass rejected the API token (${status}). Check the token in Admin → API Configuration.`;
   }
   if (status === 402) return `${label} service is not available: the credit bureau account has insufficient balance.`;
   if (status === 404) return `${label} service endpoint was not found on the bureau gateway.`;
@@ -304,7 +339,7 @@ function friendlyProviderError(cfg, status, providerMessage) {
 }
 
 export async function requestSurepassCibilPdf(demographics, vendor = {}) {
-  const cfg = getSurepassConfig(vendor);
+  const baseCfg = getSurepassConfig(vendor);
   if (!surepassConfigured(vendor)) {
     return {
       ok: false,
@@ -325,11 +360,31 @@ export async function requestSurepassCibilPdf(demographics, vendor = {}) {
   }
 
   let last = null;
+  let cfg = baseCfg;
   try {
     const token = await loginForToken(cfg);
-    for (const path of cfg.paths) {
-      last = await postBureau(cfg, token, body, path);
-      if (last.res.status !== 404) break;
+    const attempt = async () => {
+      for (const path of cfg.paths) {
+        last = await postBureau(cfg, token, body, path);
+        if (last.res.status !== 404) break;
+      }
+    };
+    await attempt();
+
+    // Valid token sent to the wrong host → Surepass says which host it belongs to. Switch
+    // once, remember it for this token, and retry (no report is produced by the 401 call).
+    const firstMessage = String(findDeep(last?.json || {}, ['message', 'error', 'msg']) || '');
+    const knownHost = [PRODUCTION_BASE_URL, SANDBOX_BASE_URL].includes(cfg.baseUrl);
+    if (knownHost && isWrongHostError(last?.res?.status, firstMessage)) {
+      const environment = cfg.baseUrl === SANDBOX_BASE_URL ? 'production' : 'sandbox';
+      learnedEnvironment.set(tokenFingerprint(token), environment);
+      cfg = {
+        ...cfg,
+        baseUrl: environment === 'production' ? PRODUCTION_BASE_URL : SANDBOX_BASE_URL,
+        sandbox: environment === 'sandbox',
+      };
+      console.warn(`[surepass] token belongs to the ${environment} host — retrying there`);
+      await attempt();
     }
 
     const json = last?.json || {};

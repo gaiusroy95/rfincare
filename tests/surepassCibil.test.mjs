@@ -5,6 +5,7 @@ import {
   buildSurepassCibilBody,
   extractCreditScore,
   getSurepassConfig,
+  requestSurepassCibilPdf,
   surepassConfigured,
   surepassLiveMode,
 } from '../src/lib/surepassCibil.js';
@@ -134,3 +135,79 @@ test('valid server token is kept when no admin key is saved', () => {
     assert.equal(getSurepassConfig({ vendor_key: 'experian' }).token, serverToken);
   });
 });
+
+function tokenWithLifetime(identity, lifetimeDays) {
+  const iat = Math.floor(Date.now() / 1000) - 86400;
+  const claims = { identity, iat, exp: iat + lifetimeDays * 86400 };
+  return ['h', Buffer.from(JSON.stringify(claims)).toString('base64url'), 's'].join('.');
+}
+
+test('long-lived "dev." token is a production token (Surepass uses dev. identities in production)', () => {
+  const paid = tokenWithLifetime('dev.rfincare_1@surepass.io', 3650);
+  withEnv({ SUREPASS_TOKEN: null }, () => {
+    const cfg = getSurepassConfig({ vendor_key: 'transunion_cibil', api_key: paid });
+    assert.equal(cfg.baseUrl, PRODUCTION);
+    assert.equal(cfg.sandbox, false);
+  });
+});
+
+test('short-lived trial "dev." token still uses the sandbox host', () => {
+  const trial = tokenWithLifetime('dev.rfincare_1@surepass.io', 30);
+  withEnv({ SUREPASS_TOKEN: null }, () => {
+    assert.equal(getSurepassConfig({ vendor_key: 'experian', api_key: trial }).baseUrl, SANDBOX);
+  });
+});
+
+test('"signature invalid / wrong host" from Surepass → retries on the other host and remembers it', async () => {
+  // Trial-looking token, but Surepass says it belongs to production.
+  const token = tokenWithLifetime('dev.rfincare_2@surepass.io', 30);
+  const calls = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    calls.push(String(url));
+    if (String(url).startsWith(SANDBOX)) {
+      return new Response(JSON.stringify({
+        message: "Your token(signature) is invalid. Please ensure that if it is a sandbox token then it is being used in 'sandbox.surepass.io' and if it is a production then it is being used in 'kyc-api.surepass.io'",
+      }), { status: 401, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({ success: true, status_code: 200, data: { credit_score: 781 } }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+  try {
+    await withEnvAsync({ SUREPASS_TOKEN: null }, async () => {
+      const vendor = { vendor_key: 'transunion_cibil', api_key: token };
+      const result = await requestSurepassCibilPdf(
+        { name: 'Test Person', pan: 'ABCDE1234F', mobile: '9876543210', gender: 'male' },
+        vendor,
+      );
+      assert.equal(result.ok, true);
+      assert.equal(result.creditScore, 781);
+      assert.equal(result.sandbox, false);
+      assert.ok(calls[0].startsWith(SANDBOX));
+      assert.ok(calls[calls.length - 1].startsWith(PRODUCTION));
+      // Remembered: the next request goes straight to production.
+      assert.equal(getSurepassConfig(vendor).baseUrl, PRODUCTION);
+    });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+async function withEnvAsync(vars, fn) {
+  const prev = {};
+  for (const [k, v] of Object.entries(vars)) {
+    prev[k] = process.env[k];
+    if (v == null) delete process.env[k];
+    else process.env[k] = v;
+  }
+  try {
+    await fn();
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
