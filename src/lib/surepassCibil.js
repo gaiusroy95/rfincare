@@ -30,6 +30,20 @@ function isWrongHostError(status, message) {
 const BUREAU_PATHS = {
   transunion_cibil: '/api/v1/credit-report-cibil/fetch-report-pdf',
   experian: '/api/v1/credit-report-experian/fetch-report-pdf',
+  // Surepass CRIF High Mark (fields: first_name, last_name, mobile, consent; pan optional).
+  crif_high_mark: '/api/v1/credit-report-crif/fetch-report-pdf',
+};
+
+const BUREAU_LABELS = {
+  experian: 'Experian',
+  transunion_cibil: 'TransUnion CIBIL',
+  crif_high_mark: 'CRIF High Mark',
+};
+
+const BUREAU_PATH_ENV = {
+  experian: 'SUREPASS_EXPERIAN_PATH',
+  transunion_cibil: 'SUREPASS_CIBIL_PATH',
+  crif_high_mark: 'SUREPASS_CRIF_PATH',
 };
 
 /** Paths used by earlier builds that Surepass answers with 404. */
@@ -82,7 +96,8 @@ export function getSurepassTokenInfo(token = env('SUREPASS_TOKEN')) {
 
 function bureauKey(vendor = {}) {
   const key = String(vendor.vendor_key || vendor.vendorKey || '').toLowerCase();
-  return key === 'experian' ? 'experian' : 'transunion_cibil';
+  if (key === 'experian' || key === 'crif_high_mark') return key;
+  return 'transunion_cibil';
 }
 
 export function getSurepassConfig(vendor = {}) {
@@ -116,7 +131,7 @@ export function getSurepassConfig(vendor = {}) {
     tokenInfo.environment === 'sandbox'
     || (tokenInfo.environment !== 'production' && (baseUrl === SANDBOX_BASE_URL || envSandbox));
 
-  const envPath = env(isExperian ? 'SUREPASS_EXPERIAN_PATH' : 'SUREPASS_CIBIL_PATH');
+  const envPath = env(BUREAU_PATH_ENV[key]);
   const normalizedEnvPath = envPath ? (envPath.startsWith('/') ? envPath : `/${envPath}`) : '';
   const paths = [
     ...(normalizedEnvPath && !LEGACY_PATHS.has(normalizedEnvPath) ? [normalizedEnvPath] : []),
@@ -171,6 +186,9 @@ export function extractCreditScore(payload) {
     'cibilScore',
     'experian_score',
     'experianScore',
+    'crif_score',
+    'crifScore',
+    'score_value',
     'creditScore',
     'score',
     'Score',
@@ -212,6 +230,20 @@ function formatMobile(value) {
 
 /** Request body documented by Surepass for the bureau PDF endpoints. */
 export function buildSurepassCibilBody({ name, pan, mobile, gender, consent = true }, vendor = {}) {
+  if (bureauKey(vendor) === 'crif_high_mark') {
+    const parts = String(name || '').trim().split(/\s+/).filter(Boolean);
+    const firstName = parts[0] || '';
+    // CRIF requires a last name; single-word names repeat the first name.
+    const lastName = parts.length > 1 ? parts.slice(1).join(' ') : firstName;
+    return {
+      first_name: firstName,
+      last_name: lastName,
+      name: parts.join(' '),
+      mobile: formatMobile(mobile),
+      pan: String(pan || '').toUpperCase().replace(/[^A-Z0-9]/g, ''),
+      consent: consent ? 'Y' : 'N',
+    };
+  }
   const body = {
     name: String(name || '').trim(),
     mobile: formatMobile(mobile),
@@ -313,7 +345,7 @@ async function postBureau(cfg, token, body, path) {
 }
 
 function bureauLabel(cfg) {
-  return cfg.isExperian ? 'Experian' : 'TransUnion CIBIL';
+  return BUREAU_LABELS[cfg.vendorKey] || (cfg.isExperian ? 'Experian' : 'TransUnion CIBIL');
 }
 
 function friendlyProviderError(cfg, status, providerMessage) {
@@ -363,10 +395,24 @@ export async function requestSurepassCibilPdf(demographics, vendor = {}) {
   let cfg = baseCfg;
   try {
     const token = await loginForToken(cfg);
+    // CRIF: send its own fields (+ PAN for matching); `name` is only used for validation here.
+    let sendBody = cfg.vendorKey === 'crif_high_mark'
+      ? (({ name: _unused, ...rest }) => rest)(body)
+      : body;
     const attempt = async () => {
       for (const path of cfg.paths) {
-        last = await postBureau(cfg, token, body, path);
+        last = await postBureau(cfg, token, sendBody, path);
         if (last.res.status !== 404) break;
+      }
+      // Surepass rejected an optional extra field → retry once with the required fields only.
+      const msg = String(findDeep(last?.json || {}, ['message', 'error', 'msg']) || JSON.stringify(last?.json?.errors || ''));
+      if (cfg.vendorKey === 'crif_high_mark' && last?.res?.status === 400 && /unknown|unexpected|not allowed|extra/i.test(msg) && sendBody.pan) {
+        const { pan: _pan, ...required } = sendBody;
+        sendBody = required;
+        for (const path of cfg.paths) {
+          last = await postBureau(cfg, token, sendBody, path);
+          if (last.res.status !== 404) break;
+        }
       }
     };
     await attempt();

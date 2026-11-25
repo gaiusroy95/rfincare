@@ -61,7 +61,11 @@ export async function resolveLiveCibilForCustomerEligibility(customerId, input =
       demographics.panNumber = String(input.panNumber).trim().toUpperCase();
     }
     // Experian pull; within the 30-day cooldown the 429 branch below reuses the cached score.
-    const pull = await pullCibilForCustomer(customerId, { demographics });
+    // Bureau follows the loan product (e.g. Business Loan → CRIF), else the default.
+    const pull = await pullCibilForCustomer(customerId, {
+      demographics,
+      productKey: input.loanType || input.loan_type || input.productType || null,
+    });
     if (pull?.creditScore) {
       return {
         creditScore: pull.creditScore,

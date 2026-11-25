@@ -169,6 +169,8 @@ portalAgentApplicationsRouter.post('/eligibility/calculate', async (req, res, ne
 });
 
 const AgentCibilPullSchema = z.object({
+  // Optional loan product — picks the bureau (e.g. Business Loan → CRIF High Mark).
+  loanType: z.string().max(64).optional().nullable(),
   fullName: z.string().min(2, 'Name is required'),
   fatherName: z.string().min(2, "Father's name is required"),
   panNumber: z.string().regex(/^[A-Z]{5}[0-9]{4}[A-Z]$/i, 'Enter a valid PAN number'),
@@ -223,7 +225,7 @@ portalAgentApplicationsRouter.post('/cibil/pull', async (req, res, next) => {
         consentAccepted: true,
       },
       req.auth.userId,
-      { source: 'agent_portal' },
+      { source: 'agent_portal', productKey: input.loanType || null },
     );
     res.json(result);
   } catch (err) {

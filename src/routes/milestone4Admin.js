@@ -26,6 +26,8 @@ function requireAdmin(req) {
 }
 
 const StaffCibilPullSchema = z.object({
+  // Optional loan product — picks the bureau (e.g. Business Loan → CRIF High Mark).
+  loanType: z.string().max(64).optional().nullable(),
   fullName: z.string().min(2, 'Name is required'),
   fatherName: z.string().min(2, "Father's name is required"),
   panNumber: z.string().regex(/^[A-Z]{5}[0-9]{4}[A-Z]$/i, 'Enter a valid PAN number'),
@@ -84,7 +86,7 @@ milestone4AdminRouter.post('/cibil/pull', async (req, res, next) => {
         consentAccepted: true,
       },
       req.auth.userId,
-      { source: 'admin_panel' },
+      { source: 'admin_panel', productKey: input.loanType || null },
     );
     res.json(result);
   } catch (err) {
@@ -109,6 +111,38 @@ milestone4AdminRouter.get('/cibil-vendors', async (req, res, next) => {
   try {
     requireAdmin(req);
     res.json({ vendors: await listCibilVendors() });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** Which bureau each check uses: default + per loan product (e.g. Business Loan → CRIF). */
+milestone4AdminRouter.get('/cibil-routing', async (req, res, next) => {
+  try {
+    requireAdmin(req);
+    const { getBureauRouting, ROUTABLE_BUREAUS } = await import('../lib/cibilBureauRouting.js');
+    res.json({ routing: await getBureauRouting(), bureaus: ROUTABLE_BUREAUS });
+  } catch (err) {
+    next(err);
+  }
+});
+
+milestone4AdminRouter.put('/cibil-routing', async (req, res, next) => {
+  try {
+    requireAdmin(req);
+    const { saveBureauRouting, ROUTABLE_BUREAUS } = await import('../lib/cibilBureauRouting.js');
+    const bureau = z.enum(ROUTABLE_BUREAUS);
+    const input = z
+      .object({
+        defaultBureau: bureau,
+        byProduct: z.record(z.union([bureau, z.literal('')])).optional(),
+      })
+      .parse(req.body);
+    const byProduct = Object.fromEntries(
+      Object.entries(input.byProduct || {}).filter(([, value]) => value),
+    );
+    const routing = await saveBureauRouting({ defaultBureau: input.defaultBureau, byProduct }, req.auth.userId);
+    res.json({ routing, vendors: await listCibilVendors() });
   } catch (err) {
     next(err);
   }

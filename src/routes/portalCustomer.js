@@ -75,7 +75,7 @@ portalCustomerRouter.get('/credit-score/report', authenticate, async (req, res, 
        WHERE customer_id = :id
          AND status = 'success'
          AND report_path IS NOT NULL
-         AND vendor_key IN ('experian', 'transunion_cibil')
+         AND vendor_key IN ('experian', 'transunion_cibil', 'crif_high_mark')
          AND COALESCE(response_payload->>'localFallback', 'false') <> 'true'
        ORDER BY checked_at DESC
        LIMIT 1`,

@@ -4,6 +4,11 @@ import { buildSimpleTextPdf } from './simplePdf.js';
 import { ensureMilestone4Schema } from '../db/ensureMilestone4Schema.js';
 import { storeCibilReportPdf } from './cibilReportStore.js';
 import {
+  applicationProductKey,
+  getBureauRouting,
+  resolveBureauKey,
+} from './cibilBureauRouting.js';
+import {
   getSurepassConfig,
   getSurepassTokenInfo,
   requestSurepassCibilPdf,
@@ -20,14 +25,20 @@ const VENDOR_KEYS = ['transunion_cibil', 'experian', 'equifax', 'crif_high_mark'
  * - Employee / admin staff check → TransUnion CIBIL (score + PDF)
  * - Customer dashboard, agent check, application submit → Experian (score + PDF)
  */
+/**
+ * Legacy flow → bureau map, kept for reference only. The bureau is now chosen by
+ * cibilBureauRouting (Admin → API Configuration → Bureau routing): Experian by default,
+ * per-loan-product overrides (e.g. Business Loan → CRIF High Mark).
+ */
 export const BUREAU_FOR = {
-  // Homepage "Check free CIBIL score" uses TransUnion CIBIL (client decision 2026-11-25).
-  guest: 'transunion_cibil',
-  staff: 'transunion_cibil',
+  guest: 'experian',
+  staff: 'experian',
   customer: 'experian',
   agent: 'experian',
   application: 'experian',
 };
+
+const SUREPASS_BUREAUS = ['transunion_cibil', 'experian', 'crif_high_mark'];
 
 const BUREAU_DISPLAY_NAMES = {
   experian: 'Experian',
@@ -84,9 +95,10 @@ export async function listCibilVendors() {
             updated_at
      FROM cibil_vendors ORDER BY vendor_key`,
   );
+  const routing = await getBureauRouting(pool);
   return rows.map((r) => {
     // Token actually used for this vendor (a valid key saved here wins over an expired env token).
-    const tokenInfo = ['transunion_cibil', 'experian'].includes(r.vendor_key)
+    const tokenInfo = SUREPASS_BUREAUS.includes(r.vendor_key)
       ? getSurepassConfig(r).tokenInfo || {}
       : getSurepassTokenInfo();
     return {
@@ -96,11 +108,14 @@ export async function listCibilVendors() {
     isActive: Boolean(r.is_active),
     hasCredentials:
       Boolean(r.has_key)
-      || (['transunion_cibil', 'experian'].includes(r.vendor_key) && surepassConfigured(r)),
-    usedFor: Object.entries(BUREAU_FOR)
-      .filter(([, key]) => key === r.vendor_key)
-      .map(([flow]) => flow),
-    provider: ['transunion_cibil', 'experian'].includes(r.vendor_key)
+      || (SUREPASS_BUREAUS.includes(r.vendor_key) && surepassConfigured(r)),
+    usedFor: [
+      ...(routing.defaultBureau === r.vendor_key ? ['default'] : []),
+      ...Object.entries(routing.byProduct)
+        .filter(([, key]) => key === r.vendor_key)
+        .map(([product]) => `product:${product}`),
+    ],
+    provider: SUREPASS_BUREAUS.includes(r.vendor_key)
       ? {
           name: 'Surepass',
           environment: tokenInfo.environment || null,
@@ -338,9 +353,12 @@ export async function pullCibilForApplication(applicationId, { forceSandbox = fa
     throw e;
   }
 
-  const vendor = await getBureauVendor(pool, BUREAU_FOR.application);
+  const vendor = await getBureauVendor(
+    pool,
+    await resolveBureauKey({ productKey: applicationProductKey(application) }, pool),
+  );
   if (!vendor) {
-    const e = new Error('Experian bureau is not configured');
+    const e = new Error('Credit bureau is not configured');
     e.status = 400;
     throw e;
   }
@@ -366,7 +384,7 @@ export async function pullCibilForApplication(applicationId, { forceSandbox = fa
       score: result.creditScore,
       path: result.reportPath,
       err: result.errorMessage || null,
-      resp: JSON.stringify({ ...(result.response || {}), source: 'application', pullRule: 'experian' }),
+      resp: JSON.stringify({ ...(result.response || {}), source: 'application', pullRule: vendor.vendor_key }),
     },
   );
 
@@ -464,7 +482,7 @@ export async function getLatestCustomerCibilCheck(customerId) {
 
 export async function pullCibilForCustomer(
   customerId,
-  { forceSandbox = false, demographics = null, skipCooldown = false } = {},
+  { forceSandbox = false, demographics = null, skipCooldown = false, productKey = null } = {},
 ) {
   await ensureMilestone4Schema();
   const pool = getPool();
@@ -483,9 +501,9 @@ export async function pullCibilForCustomer(
     throw e;
   }
 
-  const vendor = await getBureauVendor(pool, BUREAU_FOR.customer);
+  const vendor = await getBureauVendor(pool, await resolveBureauKey({ productKey }, pool));
   if (!vendor) {
-    const e = new Error('Experian bureau is not configured');
+    const e = new Error('Credit bureau is not configured');
     e.status = 400;
     throw e;
   }
@@ -503,7 +521,7 @@ export async function pullCibilForCustomer(
           Math.max(1, Math.ceil(CUSTOMER_PULL_COOLDOWN_DAYS - daysSince)),
         );
         const e = new Error(
-          `Your Experian score was checked recently. You can refresh it again in ${daysLeft} day(s).`,
+          `Your ${vendor.display_name || 'credit'} score was checked recently. You can refresh it again in ${daysLeft} day(s).`,
         );
         e.status = 429;
         e.latestCheck = latest;
@@ -563,13 +581,13 @@ export async function pullCibilForCustomer(
       resp: JSON.stringify({
         ...result.response,
         source: 'customer_portal',
-        pullRule: 'experian',
+        pullRule: vendor.vendor_key,
       }),
     },
   );
 
   if (result.status !== 'success') {
-    const e = new Error(result.errorMessage || 'Could not fetch your Experian credit score');
+    const e = new Error(result.errorMessage || `Could not fetch your ${vendor.display_name || 'credit'} score`);
     e.status = 422;
     throw e;
   }
@@ -579,7 +597,7 @@ export async function pullCibilForCustomer(
     vendorKey: vendor.vendor_key,
     vendorName: vendor.display_name,
     sandboxMode: useSandbox,
-    pullRule: 'experian',
+    pullRule: vendor.vendor_key,
     ...result,
   };
 }
@@ -606,13 +624,14 @@ const STAFF_REPORT_URL_PREFIX = {
 
 /**
  * Staff CIBIL pull — minimal demographics (no customer account required).
- * Employee/admin → TransUnion CIBIL; agent → Experian.
+ * Bureau from routing: the selected loan product's bureau, else the default (Experian).
  */
 export async function pullCibilForEmployee(demographics, employeeUserId, options = {}) {
   await ensureMilestone4Schema();
   const pool = getPool();
   const source = options.source || 'employee_portal';
-  const vendorKey = options.vendorKey || (source === 'agent_portal' ? BUREAU_FOR.agent : BUREAU_FOR.staff);
+  const vendorKey = options.vendorKey
+    || await resolveBureauKey({ productKey: options.productKey || demographics?.loanType || null }, pool);
   const vendor = await getBureauVendor(pool, vendorKey);
   if (!vendor) {
     const e = new Error('Credit bureau check is temporarily unavailable. Please try again later.');
@@ -708,13 +727,13 @@ export async function getCibilCheckInitiator(checkId) {
 }
 
 /**
- * Guest / homepage credit check — TransUnion CIBIL via BUREAU_FOR.guest (score + PDF report).
+ * Guest / homepage credit check — default bureau from routing (score + PDF report).
  * Captures demographics, stores lead, returns score + download URL.
  */
 export async function pullCibilForGuest(demographics, { upsertLead } = {}) {
   await ensureMilestone4Schema();
   const pool = getPool();
-  const vendor = await getBureauVendor(pool, BUREAU_FOR.guest);
+  const vendor = await getBureauVendor(pool, await resolveBureauKey({}, pool));
   if (!vendor) {
     const e = new Error('Credit score check is temporarily unavailable. Please try again later.');
     e.status = 503;
@@ -843,35 +862,29 @@ export async function getCibilCheckById(checkId) {
 export async function syncSurepassVendorFromEnv(pool = getPool()) {
   const token = String(process.env.SUREPASS_TOKEN || '').trim();
   const sandbox = vendorSandboxMode();
-  await pool.execute(
-    `INSERT INTO cibil_vendors (vendor_key, display_name, api_key, sandbox_mode, is_active, updated_at)
-     VALUES ('transunion_cibil', 'TransUnion CIBIL (Surepass)', :api_key, :sandbox, TRUE, NOW())
-     ON CONFLICT (vendor_key) DO UPDATE SET
-       display_name = EXCLUDED.display_name,
-       api_key = COALESCE(NULLIF(EXCLUDED.api_key, ''), cibil_vendors.api_key),
-       sandbox_mode = EXCLUDED.sandbox_mode,
-       is_active = TRUE,
-       updated_at = NOW()`,
-    {
-      api_key: token || null,
-      sandbox: sandbox ? 1 : 0,
-    },
-  );
-  // Keep Experian available for customer refresh pulls (selected by key, not is_active)
-  await pool.execute(
-    `INSERT INTO cibil_vendors (vendor_key, display_name, api_key, sandbox_mode, is_active, updated_at)
-     VALUES ('experian', 'Experian', :api_key, :sandbox, FALSE, NOW())
-     ON CONFLICT (vendor_key) DO UPDATE SET
-       display_name = EXCLUDED.display_name,
-       api_key = COALESCE(NULLIF(EXCLUDED.api_key, ''), cibil_vendors.api_key),
-       sandbox_mode = EXCLUDED.sandbox_mode,
-       updated_at = NOW()`,
-    {
-      api_key: token || null,
-      sandbox: sandbox ? 1 : 0,
-    },
-  );
-  await pool.execute(
-    `UPDATE cibil_vendors SET is_active = FALSE WHERE vendor_key NOT IN ('transunion_cibil')`,
-  );
+  // Ensure the Surepass bureaus exist. A key saved in Admin → API Configuration is NEVER
+  // overwritten here (previously every restart replaced it with the server env token, so a
+  // renewed production key was lost on the next deploy); the env token only fills empty keys.
+  for (const [vendorKey, displayName] of [
+    ['experian', 'Experian'],
+    ['transunion_cibil', 'TransUnion CIBIL (Surepass)'],
+    ['crif_high_mark', 'CRIF High Mark'],
+  ]) {
+    await pool.execute(
+      `INSERT INTO cibil_vendors (vendor_key, display_name, api_key, sandbox_mode, is_active, updated_at)
+       VALUES (:vendor_key, :display_name, :api_key, :sandbox, FALSE, NOW())
+       ON CONFLICT (vendor_key) DO UPDATE SET
+         api_key = COALESCE(NULLIF(cibil_vendors.api_key, ''), EXCLUDED.api_key),
+         sandbox_mode = CASE
+           WHEN COALESCE(cibil_vendors.api_key, '') = '' THEN EXCLUDED.sandbox_mode
+           ELSE cibil_vendors.sandbox_mode
+         END`,
+      {
+        vendor_key: vendorKey,
+        display_name: displayName,
+        api_key: token || null,
+        sandbox: sandbox ? 1 : 0,
+      },
+    );
+  }
 }
