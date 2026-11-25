@@ -614,7 +614,7 @@ documentsRouter.get(
       if (!opened?.stream) {
         return res.status(404).json({
           error:
-            'Document file not found on server. The upload was lost from ephemeral disk — ask the customer to re-upload. Ops: set STORAGE_PROVIDER=s3 so new uploads are retained.',
+            'This document file was uploaded before durable storage was enabled and is no longer on the server. Please ask the customer to re-upload it — new uploads are kept permanently.',
           code: 'FILE_MISSING',
           reuploadRequired: true,
           documentId: doc.id,

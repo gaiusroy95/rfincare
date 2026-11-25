@@ -109,24 +109,29 @@ export async function sendCibilConsentOtpSms({ phone, otp }) {
       }
     }
 
-    // Dedicated transactional SMS so the consent URL is always included
-    // (standard OTP template often has no link slot).
-    try {
-      getMsg91Config(cfg);
-      await sendMsg91TransactionalSms({
-        phone: mobile,
-        message,
-        otp,
-        config: cfg,
-      });
-      return {
-        sent: true,
-        provider: 'msg91',
-        mode: 'cibil_consent_sms',
-        consentLink,
-      };
-    } catch (err) {
-      console.warn('[cibil-consent-otp] transactional SMS failed, falling back to OTP channel:', err?.message);
+    // Free-text SMS with a URL is accepted by MSG91 but dropped by operators unless it matches
+    // a DLT-registered template — that is why the mobile OTP never arrived on CIBIL screens.
+    // Default: deliver the OTP through the DLT-approved OTP template (same as eligibility);
+    // the consent link is shown on screen and sent by email. Opt back in to the free-text
+    // consent SMS only with a registered template: MSG91_CIBIL_CONSENT_PLAIN_SMS=true.
+    if (String(process.env.MSG91_CIBIL_CONSENT_PLAIN_SMS || '').toLowerCase() === 'true') {
+      try {
+        getMsg91Config(cfg);
+        await sendMsg91TransactionalSms({
+          phone: mobile,
+          message,
+          otp,
+          config: cfg,
+        });
+        return {
+          sent: true,
+          provider: 'msg91',
+          mode: 'cibil_consent_sms',
+          consentLink,
+        };
+      } catch (err) {
+        console.warn('[cibil-consent-otp] transactional SMS failed, falling back to OTP channel:', err?.message);
+      }
     }
   }
 
@@ -326,6 +331,20 @@ export async function requestHomepageCibilContactOtp({ phone, email }) {
     throw e;
   }
 
+  // Send email and SMS in parallel (was sequential — "Sending…" took the sum of both).
+  const emailOtp = requireEmailOtp ? generateOtp() : null;
+  const emailSend = requireEmailOtp
+    ? sendOtpNotification({
+      email: normalizedEmail,
+      otp: emailOtp,
+      channel: 'email',
+      settings,
+    }).then(
+      (result) => ({ result }),
+      (error) => ({ error }),
+    )
+    : null;
+
   if (requireMobileOtp) {
     const mobileOtp = generateOtp();
     const smsId = newId();
@@ -360,19 +379,13 @@ export async function requestHomepageCibilContactOtp({ phone, email }) {
   }
 
   if (requireEmailOtp) {
-    const emailOtp = generateOtp();
     let emailDelivered = false;
-    try {
-      const emailResult = await sendOtpNotification({
-        email: normalizedEmail,
-        otp: emailOtp,
-        channel: 'email',
-        settings,
-      });
-      emailDelivered = !(emailResult?.sent === false && emailResult?.delivered === false);
-    } catch (err) {
-      console.warn('[homepage-cibil-otp:email]', err?.message || err);
+    const { result: emailResult, error: emailError } = await emailSend;
+    if (emailError) {
+      console.warn('[homepage-cibil-otp:email]', emailError?.message || emailError);
       emailDelivered = false;
+    } else {
+      emailDelivered = !(emailResult?.sent === false && emailResult?.delivered === false);
     }
 
     if (emailDelivered) {

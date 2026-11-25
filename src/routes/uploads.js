@@ -9,7 +9,12 @@ export const cibilReportUploadsRouter = Router();
 
 cibilReportUploadsRouter.get('/:fileName', async (req, res, next) => {
   try {
-    await sendCibilReportPdf(res, req.params.fileName, { disposition: 'inline', prefix: 'credit-report' });
+    // ?download=1 saves the file; default opens it in the browser's PDF viewer.
+    const download = ['1', 'true'].includes(String(req.query.download || '').toLowerCase());
+    await sendCibilReportPdf(res, req.params.fileName, {
+      disposition: download ? 'attachment' : 'inline',
+      prefix: 'credit-report',
+    });
   } catch (err) {
     next(err);
   }

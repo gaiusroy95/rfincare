@@ -2,6 +2,7 @@ import { Router } from 'express';
 import multer from 'multer';
 
 import { getPool } from '../db/pool.js';
+import { withTransaction } from '../db/transaction.js';
 import { ensureOnboardingSchema } from '../db/ensureOnboardingSchema.js';
 import { createAgentAccount, createEmployeeAccount } from '../lib/staffOnboarding.js';
 import { backfillMissingAgentCodes, ensureAgentCodeForUser } from '../lib/agentCode.js';
@@ -794,19 +795,20 @@ adminRouter.delete(
         });
       }
 
-      await pool.execute('BEGIN');
-      await pool.execute(`DELETE FROM employee_access_controls WHERE employee_user_id = :id`, { id: employeeId });
-      await pool.execute(`DELETE FROM employee_onboarding WHERE user_id = :id`, { id: employeeId });
-      await pool.execute(`DELETE FROM agent_employee_hierarchy WHERE employee_user_id = :id`, { id: employeeId });
-      await pool.execute(`UPDATE loan_applications SET assigned_employee_id = NULL WHERE assigned_employee_id = :id`, {
-        id: employeeId,
+      // One dedicated connection — pool.execute('BEGIN') is not a transaction with pg's Pool.
+      await withTransaction(async (tx) => {
+        await tx.execute(`DELETE FROM employee_access_controls WHERE employee_user_id = :id`, { id: employeeId });
+        await tx.execute(`DELETE FROM employee_onboarding WHERE user_id = :id`, { id: employeeId });
+        await tx.execute(`DELETE FROM agent_employee_hierarchy WHERE employee_user_id = :id`, { id: employeeId });
+        await tx.execute(`UPDATE loan_applications SET assigned_employee_id = NULL WHERE assigned_employee_id = :id`, {
+          id: employeeId,
+        });
+        await tx.execute(`UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = :id AND revoked_at IS NULL`, {
+          id: employeeId,
+        });
+        await tx.execute(`DELETE FROM auth_users WHERE id = :id`, { id: employeeId });
+        await tx.execute(`DELETE FROM user_profiles WHERE id = :id AND role = 'employee'`, { id: employeeId });
       });
-      await pool.execute(`UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = :id AND revoked_at IS NULL`, {
-        id: employeeId,
-      });
-      await pool.execute(`DELETE FROM auth_users WHERE id = :id`, { id: employeeId });
-      await pool.execute(`DELETE FROM user_profiles WHERE id = :id AND role = 'employee'`, { id: employeeId });
-      await pool.execute('COMMIT');
 
       await writeAuditLog({
         userId: req.auth.userId,
@@ -822,11 +824,6 @@ adminRouter.delete(
 
       res.json({ success: true, message: 'Employee profile deleted successfully' });
     } catch (err) {
-      try {
-        await pool.execute('ROLLBACK');
-      } catch {
-        /* ignore rollback error */
-      }
       next(err);
     }
   },

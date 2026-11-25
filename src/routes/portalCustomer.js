@@ -75,16 +75,16 @@ portalCustomerRouter.get('/credit-score/report', authenticate, async (req, res, 
        WHERE customer_id = :id
          AND status = 'success'
          AND report_path IS NOT NULL
-         AND vendor_key = 'experian'
+         AND vendor_key IN ('experian', 'transunion_cibil')
          AND COALESCE(response_payload->>'localFallback', 'false') <> 'true'
        ORDER BY checked_at DESC
        LIMIT 1`,
       { id: req.auth.userId },
     );
     if (!check?.report_path) {
-      return res.status(404).json({ error: 'Experian credit report not available yet. Refresh your score first.' });
+      return res.status(404).json({ error: 'Your credit report is not available yet. Use "Check my score" first.' });
     }
-    await sendCibilReportPdf(res, check.report_path, { prefix: 'experian-report' });
+    await sendCibilReportPdf(res, check.report_path, { prefix: 'credit-report' });
   } catch (err) {
     next(err);
   }

@@ -1,10 +1,15 @@
 import multer from 'multer';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { mkdirSync } from 'node:fs';
 import { getUploadDir } from './uploadPaths.js';
 import { isCloudStorage } from './storage/index.js';
 import { buildObjectKey } from './storage/keys.js';
 import { saveUploadedFile } from './storage/index.js';
+import {
+  copyDiskFileToDb,
+  isDbUploadStoreEnabled,
+  storageKeyForDiskPath,
+} from './storage/dbProvider.js';
 
 const DEFAULT_MAX_BYTES = Number(process.env.UPLOAD_MAX_BYTES || 25 * 1024 * 1024);
 
@@ -66,6 +71,46 @@ export function persistCloudUpload(subfolder = '') {
   };
 }
 
+function collectFiles(req) {
+  const files = [];
+  if (req.file) files.push(req.file);
+  if (Array.isArray(req.files)) files.push(...req.files);
+  else if (req.files && typeof req.files === 'object') {
+    for (const group of Object.values(req.files)) {
+      if (Array.isArray(group)) files.push(...group);
+    }
+  }
+  return files.filter(Boolean);
+}
+
+/**
+ * After a disk-storage multer middleware: keep a durable copy of each uploaded file in
+ * Postgres (stored_files) so it survives restarts of hosts with ephemeral disks.
+ * Use right after any route-specific `multer({ storage: multer.diskStorage(...) })`.
+ */
+export function persistDiskUploadsToDb() {
+  return async (req, _res, next) => {
+    try {
+      if (isCloudStorage() || !isDbUploadStoreEnabled()) return next();
+      const roots = [...new Set([getUploadDir(), resolve(process.env.UPLOAD_DIR || './uploads')])];
+      for (const file of collectFiles(req)) {
+        if (!file.path) continue;
+        const key = file.storageKey || storageKeyForDiskPath(file.path, roots);
+        if (!key) continue;
+        await copyDiskFileToDb({
+          key,
+          diskPath: file.path,
+          mimeType: file.mimetype,
+          originalName: file.originalname,
+        });
+      }
+      next();
+    } catch (err) {
+      next(err);
+    }
+  };
+}
+
 /**
  * Drop-in multer factory for all upload routes.
  * Local dev uses disk; production cloud uses memory + S3-compatible storage.
@@ -107,10 +152,11 @@ export function createUploadMiddleware({
     }
     next();
   };
+  const persist = persistDiskUploadsToDb();
   return {
-    single: (field) => [disk.single(field), attachLocalStoredPath],
-    array: (field, maxCount) => [disk.array(field, maxCount), attachLocalStoredPath],
-    fields: (fields) => [disk.fields(fields), attachLocalStoredPath],
+    single: (field) => [disk.single(field), attachLocalStoredPath, persist],
+    array: (field, maxCount) => [disk.array(field, maxCount), attachLocalStoredPath, persist],
+    fields: (fields) => [disk.fields(fields), attachLocalStoredPath, persist],
   };
 }
 

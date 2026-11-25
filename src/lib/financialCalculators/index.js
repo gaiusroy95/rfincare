@@ -284,6 +284,14 @@ function affordabilityResult(input) {
   return { ...elig, maxAffordableHomePrice: round2(maxHome) };
 }
 
+/** Select inputs arrive as strings ('true' / 'false'). */
+function toBool(value, fallback) {
+  if (value === undefined || value === null || value === '') return fallback;
+  if (typeof value === 'boolean') return value;
+  return !['false', '0', 'no', 'off'].includes(String(value).trim().toLowerCase());
+}
+
+// Math helpers take positional arguments; adapt the calculator input object to them.
 const ENGINE_RUNNERS = {
   emi: emiResult,
   sip: sipResult,
@@ -298,34 +306,34 @@ const ENGINE_RUNNERS = {
     return { ...r, principal: toNum(input.principal), summary: `Maturity: ₹${r.amount.toLocaleString('en-IN')}` };
   },
   cagr: (input) => cagr(input.beginValue, input.endValue, input.years),
-  'loan-eligibility': loanEligibility,
-  'debt-consolidation': debtConsolidation,
+  'loan-eligibility': (i) => loanEligibility(i.monthlyIncome, i.existingEmi, i.interestRate, i.tenureYears, i.foir != null ? toNum(i.foir, 0.5) : 0.5),
+  'debt-consolidation': (i) => debtConsolidation(i.loans, toNum(i.newRate), toNum(i.newTenureYears)),
   'loan-prepayment': loanPrepaymentResult,
   'balance-transfer': balanceTransferResult,
   'income-tax': incomeTaxResult,
-  hra: hraExemption,
-  'capital-gain': capitalGain,
+  hra: (i) => hraExemption(i.basicSalary, i.hraReceived, i.rentPaid, toBool(i.metro, true)),
+  'capital-gain': (i) => capitalGain(i.purchasePrice, i.salePrice, toNum(i.holdingMonths), i.assetType || 'equity'),
   gst: (input) => gstAmount(input.amount, input.gstRate, input.inclusive),
   tds: tdsResult,
   'section-80c': section80cResult,
   'section-80d': section80dResult,
   'advance-tax': advanceTaxResult,
-  'retirement-corpus': retirementCorpus,
-  pension: pensionPayout,
-  nps: npsProjection,
-  annuity: annuityPayout,
-  epf: epfCorpus,
-  gratuity: gratuity,
-  'goal-sip': goalSip,
-  'net-worth': netWorth,
-  fire: fireNumber,
+  'retirement-corpus': (i) => retirementCorpus(i.monthlyExpense, i.inflationRate, i.yearsToRetirement, i.postRetirementYears, i.returnRate),
+  pension: (i) => pensionPayout(i.corpus, i.annualRate, i.payoutYears),
+  nps: (i) => npsProjection(i.age, i.retirementAge, i.monthlyContribution, i.employerContribution, i.expectedReturn),
+  annuity: (i) => annuityPayout(i.principal, i.annualRate, i.payoutYears),
+  epf: (i) => epfCorpus(i.monthlyBasic, i.employeePct, i.employerPct, i.annualIncrease, i.years, i.epfRate),
+  gratuity: (i) => gratuity(i.basicSalary, i.yearsOfService, toBool(i.isCovered, true)),
+  'goal-sip': (i) => goalSip(i.goalAmount, i.years, i.expectedReturn),
+  'net-worth': (i) => netWorth(i.assets, i.liabilities),
+  fire: (i) => fireNumber(i.annualExpense, i.withdrawalRate != null ? toNum(i.withdrawalRate, 4) : 4),
   inflation: (input) => ({
     todayValue: inflationAdjustedValue(input.futureValue, input.inflationRate, input.years),
     futureValue: toNum(input.futureValue),
     inflationRate: toNum(input.inflationRate),
     years: toNum(input.years),
   }),
-  'rent-vs-buy': rentVsBuy,
+  'rent-vs-buy': (i) => rentVsBuy(i.rent, i.homePrice, i.downPayment, i.loanRate, i.tenureYears, i.appreciation),
   'stamp-duty': stampDutyResult,
   'property-registration': propertyRegistrationResult,
   'salary-breakup': salaryBreakupResult,

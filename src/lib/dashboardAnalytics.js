@@ -1,4 +1,8 @@
 import { getPool, isNoSuchTableError, isBadFieldError } from '../db/pool.js';
+import { laLoanAmountSql, laLoanTypeSql } from './loanApplicationSql.js';
+
+const LA_TYPE = laLoanTypeSql('la');
+const LA_AMOUNT = laLoanAmountSql('la');
 
 function pad2(n) {
   return String(n).padStart(2, '0');
@@ -87,35 +91,35 @@ export async function buildDashboardAnalytics(pool = getPool(), periodInput = {}
     pool,
     `SELECT
        COUNT(*)::int AS total,
-       SUM(CASE WHEN LOWER(COALESCE(status, '')) IN ('submitted', 'pending', 'under_review', 'documents_pending') THEN 1 ELSE 0 END)::int AS pending,
-       SUM(CASE WHEN LOWER(COALESCE(status, '')) IN ('approved', 'disbursed') THEN 1 ELSE 0 END)::int AS approved,
+       SUM(CASE WHEN LOWER(COALESCE(la.status, '')) IN ('submitted', 'pending', 'under_review', 'documents_pending') THEN 1 ELSE 0 END)::int AS pending,
+       SUM(CASE WHEN LOWER(COALESCE(la.status, '')) IN ('approved', 'disbursed') THEN 1 ELSE 0 END)::int AS approved,
        COALESCE(SUM(
          CASE
-           WHEN LOWER(COALESCE(status, '')) = 'disbursed'
-             OR disbursed_amount IS NOT NULL
-           THEN COALESCE(disbursed_amount, loan_amount, 0)
+           WHEN LOWER(COALESCE(la.status, '')) = 'disbursed'
+             OR la.disbursed_amount IS NOT NULL
+           THEN COALESCE(la.disbursed_amount, ${LA_AMOUNT}, 0)
            ELSE 0
          END
        ), 0)::float AS disbursed,
        COALESCE(SUM(
          CASE
-           WHEN LOWER(COALESCE(loan_type, '')) IN ('post_office', 'fixed_income', 'investment', 'mutual_fund', 'sip')
-             OR LOWER(COALESCE(loan_type, '')) LIKE '%invest%'
-           THEN COALESCE(loan_amount, disbursed_amount, 0)
+           WHEN LOWER(COALESCE(${LA_TYPE}, '')) IN ('post_office', 'fixed_income', 'investment', 'mutual_fund', 'sip')
+             OR LOWER(COALESCE(${LA_TYPE}, '')) LIKE '%invest%'
+           THEN COALESCE(${LA_AMOUNT}, la.disbursed_amount, 0)
            ELSE 0
          END
        ), 0)::float AS investments
-     FROM loan_applications
-     WHERE ${DATE_BETWEEN('created_at')}`,
+     FROM loan_applications la
+     WHERE ${DATE_BETWEEN('la.created_at')}`,
     params,
   );
 
   const disbursedWindow = await safeScalar(
     pool,
-    `SELECT COALESCE(SUM(COALESCE(disbursed_amount, loan_amount, 0)), 0)::float AS disbursed
-     FROM loan_applications
-     WHERE LOWER(COALESCE(status, '')) = 'disbursed'
-       AND COALESCE(disbursed_at, updated_at, created_at)::date BETWEEN :start::date AND :end::date`,
+    `SELECT COALESCE(SUM(COALESCE(la.disbursed_amount, ${LA_AMOUNT}, 0)), 0)::float AS disbursed
+     FROM loan_applications la
+     WHERE LOWER(COALESCE(la.status, '')) = 'disbursed'
+       AND COALESCE(la.disbursed_at, la.updated_at, la.created_at)::date BETWEEN :start::date AND :end::date`,
     params,
   );
 
@@ -146,9 +150,9 @@ export async function buildDashboardAnalytics(pool = getPool(), periodInput = {}
 
   const byType = await safeRows(
     pool,
-    `SELECT COALESCE(NULLIF(TRIM(loan_type), ''), 'Other') AS name, COUNT(*)::int AS value
-     FROM loan_applications
-     WHERE ${DATE_BETWEEN('created_at')}
+    `SELECT COALESCE(${LA_TYPE}, 'Other') AS name, COUNT(*)::int AS value
+     FROM loan_applications la
+     WHERE ${DATE_BETWEEN('la.created_at')}
      GROUP BY 1
      ORDER BY value DESC
      LIMIT 8`,
@@ -157,7 +161,7 @@ export async function buildDashboardAnalytics(pool = getPool(), periodInput = {}
 
   const recent = await safeRows(
     pool,
-    `SELECT la.id, la.application_number, la.loan_type, la.status, la.loan_amount, la.created_at,
+    `SELECT la.id, la.application_number, ${LA_TYPE} AS loan_type, la.status, ${LA_AMOUNT} AS loan_amount, la.created_at,
             c.full_name AS customer_name
      FROM loan_applications la
      LEFT JOIN user_profiles c ON c.id = la.customer_id
@@ -178,10 +182,10 @@ export async function buildDashboardAnalytics(pool = getPool(), periodInput = {}
     };
     const loanRev = await safeScalar(
       pool,
-      `SELECT COALESCE(SUM(COALESCE(disbursed_amount, loan_amount, 0)), 0)::float AS total
-       FROM loan_applications
-       WHERE LOWER(COALESCE(status, '')) IN ('approved', 'disbursed')
-         AND created_at::date BETWEEN :start::date AND :end::date`,
+      `SELECT COALESCE(SUM(COALESCE(la.disbursed_amount, ${LA_AMOUNT}, 0)), 0)::float AS total
+       FROM loan_applications la
+       WHERE LOWER(COALESCE(la.status, '')) IN ('approved', 'disbursed')
+         AND la.created_at::date BETWEEN :start::date AND :end::date`,
       p,
     );
     const premRev = await safeScalar(

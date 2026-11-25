@@ -199,6 +199,8 @@ export function createApp({ serveStatic = true } = {}) {
     app.use('/uploads', uploadsRouter);
   } else {
     app.use('/uploads', express.static(getUploadDir()));
+    // Disk copy missing (restart / other instance): serve the durable Postgres copy.
+    app.use('/uploads', uploadsRouter);
   }
   app.use('/uploads', (_req, res) => {
     res.status(404).json({ error: 'Upload not found' });

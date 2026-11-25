@@ -6,10 +6,12 @@ import { sendStaffWelcomeEmail, sendEmployeeTerminationEmail } from './email.js'
 import { ensureAgentCodeForUser } from './agentCode.js';
 import { sqlCastParam, sqlCoalescePatch, sqlLiteralEquals, sqlParamEqualsLower } from './sqlCollation.js';
 import {
+  deleteApplicationFiles,
   hardDeleteApplications,
   listApplicationIdsForAgent,
   listApplicationIdsForCustomer,
 } from './hardDeleteApplications.js';
+import { executeIgnoringMissing, withTransaction } from '../db/transaction.js';
 
 function pick(body, ...keys) {
   for (const key of keys) {
@@ -464,12 +466,8 @@ export async function resetStaffPassword({ userId, password, role, fullName, ema
 }
 
 async function deleteIfTableExists(pool, sql, params) {
-  try {
-    await pool.execute(sql, params);
-  } catch (err) {
-    if (err?.code === '42P01' || err?.code === '42703') return; // undefined_table / undefined_column
-    throw err;
-  }
+  // Transaction-safe: missing tables/columns are skipped via SAVEPOINT inside a transaction.
+  await executeIgnoringMissing(pool, sql, params);
 }
 
 /**
@@ -489,89 +487,99 @@ export async function deleteAgentPermanently(agentId) {
   const detail = await fetchAgentDetail(id);
   const agentCode = detail.agentCode || null;
 
-  await pool.execute('BEGIN');
-  try {
-    const applicationIds = await listApplicationIdsForAgent(pool, id, agentCode);
-    if (applicationIds.length) {
-      await hardDeleteApplications(pool, applicationIds);
-    }
+  // One dedicated connection: pool.execute('BEGIN') is not a transaction with pg's Pool.
+  const removedFiles = await withTransaction(async (tx) => {
+    let removedFiles = [];
+      const applicationIds = await listApplicationIdsForAgent(tx, id, agentCode);
+      if (applicationIds.length) {
+        const removed = await hardDeleteApplications(tx, applicationIds);
+        removedFiles = removed.filePaths || [];
+      }
 
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM agent_commission_config WHERE agent_user_id = :id`,
-      { id },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM agent_commission_ledger WHERE agent_user_id = :id`,
-      { id },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM agent_commission_bills WHERE agent_user_id = :id`,
-      { id },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM agent_employee_hierarchy WHERE agent_user_id = :id`,
-      { id },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM agent_learning_progress WHERE agent_user_id = :id`,
-      { id },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM agent_profile_otps WHERE agent_user_id = :id`,
-      { id },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM agent_onboarding WHERE user_id = :id`,
-      { id },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM oauth_identities WHERE user_id = :id`,
-      { id },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM notifications WHERE user_id = :id`,
-      { id },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM staff_messages WHERE sender_id = :id OR recipient_id = :id`,
-      { id },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM marketing_leads WHERE assigned_to = :id`,
-      { id },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM leads WHERE assigned_to = :id`,
-      { id },
-    );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM agent_commission_config WHERE agent_user_id = :id`,
+        { id },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM agent_commission_ledger WHERE agent_user_id = :id`,
+        { id },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM agent_commission_bills WHERE agent_user_id = :id`,
+        { id },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM agent_employee_hierarchy WHERE agent_user_id = :id`,
+        { id },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM agent_learning_progress WHERE agent_user_id = :id`,
+        { id },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM agent_profile_otps WHERE agent_user_id = :id`,
+        { id },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM agent_onboarding WHERE user_id = :id`,
+        { id },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM oauth_identities WHERE user_id = :id`,
+        { id },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM notifications WHERE user_id = :id`,
+        { id },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM staff_messages WHERE sender_id = :id OR recipient_id = :id`,
+        { id },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM marketing_leads WHERE assigned_to = :id`,
+        { id },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM leads WHERE assigned_to = :id`,
+        { id },
+      );
 
-    await pool.execute(
-      `UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = :id AND revoked_at IS NULL`,
-      { id },
-    );
-    await pool.execute(`DELETE FROM auth_users WHERE id = :id`, { id });
-    await pool.execute(`DELETE FROM user_profiles WHERE id = :id AND role = 'agent'`, { id });
-    await pool.execute('COMMIT');
-  } catch (err) {
-    try {
-      await pool.execute('ROLLBACK');
-    } catch {
-      /* ignore */
-    }
-    throw err;
-  }
+      await tx.execute(
+        `UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = :id AND revoked_at IS NULL`,
+        { id },
+      );
+      // Become-a-Partner applications with the same email/phone — otherwise re-applying
+      // fails with "An application already exists for this email or phone".
+      const agentEmail = String(detail.email || '').trim();
+      const agentPhone = String(detail.phone || detail.mobileNumber || '').replace(/\D/g, '').slice(-10);
+      for (const table of ['agent_applications', 'partner_registrations']) {
+        await deleteIfTableExists(
+          tx,
+          `DELETE FROM ${table}
+           WHERE (:email <> '' AND LOWER(email) = LOWER(:email))
+              OR (:phone <> '' AND RIGHT(REGEXP_REPLACE(COALESCE(phone, ''), '\\D', '', 'g'), 10) = :phone)`,
+          { email: agentEmail, phone: agentPhone },
+        );
+      }
+
+      await tx.execute(`DELETE FROM auth_users WHERE id = :id`, { id });
+      await tx.execute(`DELETE FROM user_profiles WHERE id = :id AND role = 'agent'`, { id });
+    return removedFiles;
+  });
+  await deleteApplicationFiles(removedFiles);
 
   return {
     success: true,
@@ -615,175 +623,172 @@ export async function deleteCustomerPermanently(customerId) {
   const email = String(before.email || '').trim();
   const phone = String(before.phone || '').replace(/\D/g, '').slice(-10);
 
-  await pool.execute('BEGIN');
-  try {
-    const applicationIds = await listApplicationIdsForCustomer(pool, id);
-    if (applicationIds.length) {
-      await hardDeleteApplications(pool, applicationIds);
-    }
+  // One dedicated connection: pool.execute('BEGIN') is not a transaction with pg's Pool.
+  const removedFiles = await withTransaction(async (tx) => {
+    let removedFiles = [];
+      const applicationIds = await listApplicationIdsForCustomer(tx, id);
+      if (applicationIds.length) {
+        const removed = await hardDeleteApplications(tx, applicationIds);
+        removedFiles = removed.filePaths || [];
+      }
 
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM oauth_identities WHERE user_id = :id`,
-      { id },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM push_device_tokens WHERE user_id = :id`,
-      { id },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM customer_notifications WHERE customer_id = :id`,
-      { id },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM customer_support_messages WHERE customer_id = :id`,
-      { id },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM customer_financial_goals WHERE customer_id = :id`,
-      { id },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM customer_registrations
-       WHERE (:email <> '' AND LOWER(email) = LOWER(:email))
-          OR (:phone <> '' AND RIGHT(REGEXP_REPLACE(COALESCE(phone, ''), '\\D', '', 'g'), 10) = :phone)`,
-      { email, phone },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM cibil_checks WHERE customer_id = :id`,
-      { id },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM customer_documents WHERE customer_id = :id`,
-      { id },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM documents WHERE customer_id = :id`,
-      { id },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM marketing_leads
-       WHERE customer_id = :id
-          OR (:email <> '' AND LOWER(email) = LOWER(:email))
-          OR (:phone <> '' AND RIGHT(REGEXP_REPLACE(COALESCE(phone, ''), '\\D', '', 'g'), 10) = :phone)`,
-      { id, email, phone },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM eligibility_assessments WHERE customer_id = :id`,
-      { id },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM application_resume_tokens
-       WHERE session_key IN (
-         SELECT session_key FROM application_form_drafts WHERE customer_id = :id OR user_id = :id
-       )`,
-      { id },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM application_form_drafts WHERE customer_id = :id OR user_id = :id`,
-      { id },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM notifications WHERE user_id = :id OR customer_id = :id`,
-      { id },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM staff_messages WHERE sender_id = :id OR recipient_id = :id`,
-      { id },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM referral_invites WHERE referrer_user_id = :id`,
-      { id },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM referral_codes WHERE owner_user_id = :id`,
-      { id },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM referral_transactions
-       WHERE referrer_user_id = :id OR referred_user_id = :id`,
-      { id },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM referral_attributions
-       WHERE referrer_user_id = :id OR referred_user_id = :id`,
-      { id },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM referral_clicks WHERE referrer_user_id = :id`,
-      { id },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM expert_appointments
-       WHERE (:email <> '' AND LOWER(email) = LOWER(:email))
-          OR (:phone <> '' AND RIGHT(REGEXP_REPLACE(COALESCE(phone, ''), '\\D', '', 'g'), 10) = :phone)`,
-      { email, phone },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM mutual_fund_sip_orders
-       WHERE (:email <> '' AND LOWER(customer_email) = LOWER(:email))
-          OR (:phone <> '' AND RIGHT(REGEXP_REPLACE(COALESCE(customer_phone, ''), '\\D', '', 'g'), 10) = :phone)`,
-      { email, phone },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM insurance_purchase_orders
-       WHERE (:email <> '' AND LOWER(customer_email) = LOWER(:email))
-          OR (:phone <> '' AND RIGHT(REGEXP_REPLACE(COALESCE(customer_phone, ''), '\\D', '', 'g'), 10) = :phone)`,
-      { email, phone },
-    );
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM credit_card_leads
-       WHERE customer_id = :id
-          OR (:email <> '' AND LOWER(email) = LOWER(:email))
-          OR (:phone <> '' AND RIGHT(REGEXP_REPLACE(COALESCE(phone, ''), '\\D', '', 'g'), 10) = :phone)`,
-      { id, email, phone },
-    );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM oauth_identities WHERE user_id = :id`,
+        { id },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM push_device_tokens WHERE user_id = :id`,
+        { id },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM customer_notifications WHERE customer_id = :id`,
+        { id },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM customer_support_messages WHERE customer_id = :id`,
+        { id },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM customer_financial_goals WHERE customer_id = :id`,
+        { id },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM customer_registrations
+         WHERE (:email <> '' AND LOWER(email) = LOWER(:email))
+            OR (:phone <> '' AND RIGHT(REGEXP_REPLACE(COALESCE(phone, ''), '\\D', '', 'g'), 10) = :phone)`,
+        { email, phone },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM cibil_checks WHERE customer_id = :id`,
+        { id },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM customer_documents WHERE customer_id = :id`,
+        { id },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM documents WHERE customer_id = :id`,
+        { id },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM marketing_leads
+         WHERE customer_id = :id
+            OR (:email <> '' AND LOWER(email) = LOWER(:email))
+            OR (:phone <> '' AND RIGHT(REGEXP_REPLACE(COALESCE(phone, ''), '\\D', '', 'g'), 10) = :phone)`,
+        { id, email, phone },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM eligibility_assessments WHERE customer_id = :id`,
+        { id },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM application_resume_tokens
+         WHERE session_key IN (
+           SELECT session_key FROM application_form_drafts WHERE customer_id = :id OR user_id = :id
+         )`,
+        { id },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM application_form_drafts WHERE customer_id = :id OR user_id = :id`,
+        { id },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM notifications WHERE user_id = :id OR customer_id = :id`,
+        { id },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM staff_messages WHERE sender_id = :id OR recipient_id = :id`,
+        { id },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM referral_invites WHERE referrer_user_id = :id`,
+        { id },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM referral_codes WHERE owner_user_id = :id`,
+        { id },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM referral_transactions
+         WHERE referrer_user_id = :id OR referred_user_id = :id`,
+        { id },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM referral_attributions
+         WHERE referrer_user_id = :id OR referred_user_id = :id`,
+        { id },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM referral_clicks WHERE referrer_user_id = :id`,
+        { id },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM expert_appointments
+         WHERE (:email <> '' AND LOWER(email) = LOWER(:email))
+            OR (:phone <> '' AND RIGHT(REGEXP_REPLACE(COALESCE(phone, ''), '\\D', '', 'g'), 10) = :phone)`,
+        { email, phone },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM mutual_fund_sip_orders
+         WHERE (:email <> '' AND LOWER(customer_email) = LOWER(:email))
+            OR (:phone <> '' AND RIGHT(REGEXP_REPLACE(COALESCE(customer_phone, ''), '\\D', '', 'g'), 10) = :phone)`,
+        { email, phone },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM insurance_purchase_orders
+         WHERE (:email <> '' AND LOWER(customer_email) = LOWER(:email))
+            OR (:phone <> '' AND RIGHT(REGEXP_REPLACE(COALESCE(customer_phone, ''), '\\D', '', 'g'), 10) = :phone)`,
+        { email, phone },
+      );
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM credit_card_leads
+         WHERE customer_id = :id
+            OR (:email <> '' AND LOWER(email) = LOWER(:email))
+            OR (:phone <> '' AND RIGHT(REGEXP_REPLACE(COALESCE(phone, ''), '\\D', '', 'g'), 10) = :phone)`,
+        { id, email, phone },
+      );
 
-    // Kill all sessions so deleted customers cannot access portals.
-    await deleteIfTableExists(
-      pool,
-      `DELETE FROM refresh_tokens WHERE user_id = :id`,
-      { id },
-    );
-    await pool.execute(
-      `UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = :id AND revoked_at IS NULL`,
-      { id },
-    ).catch(() => {});
+      // Kill all sessions so deleted customers cannot access portals.
+      await deleteIfTableExists(
+        tx,
+        `DELETE FROM refresh_tokens WHERE user_id = :id`,
+        { id },
+      );
+      await executeIgnoringMissing(
+        tx,
+        `UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = :id AND revoked_at IS NULL`,
+        { id },
+      );
 
-    await pool.execute(`DELETE FROM auth_users WHERE id = :id`, { id });
-    await pool.execute(`DELETE FROM user_profiles WHERE id = :id AND role = 'customer'`, { id });
-    await pool.execute('COMMIT');
-  } catch (err) {
-    try {
-      await pool.execute('ROLLBACK');
-    } catch {
-      /* ignore */
-    }
-    throw err;
-  }
+      await tx.execute(`DELETE FROM auth_users WHERE id = :id`, { id });
+      await tx.execute(`DELETE FROM user_profiles WHERE id = :id AND role = 'customer'`, { id });
+    return removedFiles;
+  });
+  await deleteApplicationFiles(removedFiles);
 
   return {
     success: true,

@@ -489,6 +489,7 @@ export function mapApplication(row, { parties = [], documents = [], actions = []
     agreementsIp: row.agreements_ip || null,
     agreementsUserAgent: row.agreements_user_agent || null,
     submittedAt: row.submitted_at,
+    resubmittedAt: row.resubmitted_at || null,
     activatedUserId: row.activated_user_id,
     assignedAgentCode: row.assigned_agent_code,
     assignedEmployeeId: row.assigned_employee_id || null,
@@ -1177,10 +1178,14 @@ export async function submitApplication(applicationId, { ip = null, userAgent = 
     throw httpError(`Missing mandatory documents: ${missing.join(', ')}`);
   }
 
+  // Corrected documents sent back after "Document Correction Required" → re-verification.
+  const isResubmission = ['sent_back', 'reupload_required'].includes(String(row.workflow_status || ''));
+
   await pool.execute(
     `UPDATE agent_applications SET
        workflow_status = 'submitted',
-       submitted_at = NOW(),
+       submitted_at = ${isResubmission ? 'COALESCE(submitted_at, NOW())' : 'NOW()'},
+       ${isResubmission ? 'resubmitted_at = NOW(),' : ''}
        rejection_reason = NULL,
        updated_at = NOW()
      WHERE id = :id`,
@@ -1190,13 +1195,22 @@ export async function submitApplication(applicationId, { ip = null, userAgent = 
   await recordAction({
     applicationId: row.id,
     actorLabel: 'applicant',
-    action: 'submit',
-    remarks: 'Application submitted — KYC verification pending',
+    action: isResubmission ? 'resubmit' : 'submit',
+    remarks: isResubmission
+      ? 'Corrected documents resubmitted — re-verification pending'
+      : 'Application submitted — KYC verification pending',
     ip,
     userAgent,
   });
 
   const application = await loadApplicationBundle(row.id);
+
+  // Automatic welcome email on the first submission: confirmation, Application ID,
+  // login link and instructions (the account created at signup is the agent's login).
+  if (!isResubmission) {
+    await sendAgentApplicationWelcomeEmail(row, application)
+      .catch((err) => console.warn('[agent-onboarding-welcome-submit]', err?.message || err));
+  }
 
   try {
     const recipients = await getSuperAdminRecipientEmails(pool);
@@ -1666,6 +1680,58 @@ async function saveFieldCheck(pool, row, { field, result, remarks, actorUserId }
   return key;
 }
 
+function applicantPortalLinks() {
+  const base = (
+    process.env.APP_PUBLIC_URL
+    || process.env.PUBLIC_APP_URL
+    || process.env.FRONTEND_URL
+    || 'https://rfincare.com'
+  ).replace(/\/$/, '');
+  return { loginUrl: `${base}/agent-login`, statusUrl: `${base}/agent-application-status` };
+}
+
+function escapeHtml(value) {
+  return String(value || '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+/** Sent automatically right after the first successful application submission. */
+async function sendAgentApplicationWelcomeEmail(row, application) {
+  if (!row?.email) return;
+  const { loginUrl } = applicantPortalLinks();
+  const appId = application?.applicationId || row.application_id;
+  const name = row.full_name || application?.fullName || row.email;
+  const lines = [
+    `Hello ${name},`,
+    '',
+    'Welcome to Rfincare! Your Business Partner / Agent registration has been received successfully.',
+    '',
+    `Application ID: ${appId}`,
+    'Status: Submitted – Pending Verification',
+    '',
+    'Your login is ready — use the email or mobile number and the password you created during registration:',
+    `Login / dashboard: ${loginUrl}`,
+    '',
+    'After signing in you can:',
+    '• Track your application status at any time',
+    '• See remarks for any document that needs correction',
+    '• Re-upload only the rejected documents and resubmit — no new application is needed',
+    '',
+    'Please note: your agent account and Agent Code will be activated only after our back-office team has verified and approved your documents. We will email you at every stage.',
+    '',
+    '— Rfincare Team',
+  ];
+  const html = lines
+    .map((line) => (line ? `<p>${escapeHtml(line).replace(escapeHtml(loginUrl), `<a href="${loginUrl}">${escapeHtml(loginUrl)}</a>`)}</p>` : ''))
+    .join('');
+  await sendEmail({
+    to: row.email,
+    subject: `Welcome to Rfincare — application ${appId} received`,
+    text: lines.join('\n'),
+    html,
+    recipientName: name,
+  });
+}
+
 async function notifyApplicantStatus(row, act, remarks) {
   const subjects = {
     send_back: 'Action needed: correction required on your Rfincare partner application',
@@ -1679,13 +1745,38 @@ async function notifyApplicantStatus(row, act, remarks) {
   };
   const subject = subjects[act];
   if (!subject || !row?.email) return;
-  const base = (process.env.APP_PUBLIC_URL || process.env.FRONTEND_URL || '').replace(/\/$/, '');
-  const statusUrl = `${base}/agent-application-status`;
+  const { loginUrl: statusUrl } = applicantPortalLinks();
   const needsAction = ['send_back', 'request_document', 'reject_document'].includes(act);
+
+  // Name the specific documents that need correction.
+  let documentsLine = '';
+  if (needsAction) {
+    try {
+      const [docs] = await getPool().execute(
+        `SELECT d.document_type, d.rejection_reason, c.label
+         FROM agent_application_documents d
+         LEFT JOIN agent_document_checklist_templates c
+           ON c.document_type = d.document_type
+          AND c.entity_type = (SELECT a.entity_type FROM agent_applications a WHERE a.id = :id)
+         WHERE d.application_id = :id AND d.status IN ('rejected', 'reupload_required')`,
+        { id: row.id },
+      );
+      const names = [...new Set((docs || []).map((d) => {
+        const label = d.label || String(d.document_type || '').replace(/_/g, ' ');
+        return d.rejection_reason ? `${label} (${d.rejection_reason})` : label;
+      }))];
+      if (names.length) documentsLine = `Documents to re-upload: ${names.join('; ')}`;
+    } catch {
+      /* document list is a convenience */
+    }
+  }
+
   const lines = [
     `Hello ${row.full_name || row.email},`,
     '',
     `Application ID: ${row.application_id}`,
+    needsAction ? 'Status: Document Correction Required – Action Required' : '',
+    documentsLine,
     act === 'approve'
       ? 'Your application has been approved. Your agent account will be activated shortly.'
       : act === 'reject'
@@ -1696,10 +1787,8 @@ async function notifyApplicantStatus(row, act, remarks) {
             ? 'Our team has started reviewing your application.'
             : 'Our review team needs you to update your application.',
     remarks ? `Remarks: ${remarks}` : '',
-    needsAction || act === 'reject'
-      ? needsAction
-        ? `Log in to update your application: ${statusUrl}`
-        : `Track your status: ${statusUrl}`
+    needsAction
+      ? `Sign in with your existing login (no new application needed), re-upload only the documents listed above and resubmit: ${statusUrl}`
       : `Track your status: ${statusUrl}`,
     '',
     '— Rfincare Team',

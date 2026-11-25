@@ -12,6 +12,7 @@ import {
   getImportJob,
   getTemplateBuffer,
   buildErrorReportCsv,
+  buildLivePolicyWorkbook,
 } from '../lib/lenderPolicyBulkImport.js';
 
 export const lenderPolicyImportRouter = Router();
@@ -61,6 +62,31 @@ lenderPolicyImportRouter.get(
       res.setHeader(
         'Content-Disposition',
         'attachment; filename="loan-advisory-lender-product-bulk-upload.xlsx"',
+      );
+      res.setHeader('Cache-Control', 'no-store');
+      res.send(Buffer.from(buffer));
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+/** Live policy configuration in the bulk-upload format — edit and re-upload to update. */
+lenderPolicyImportRouter.get(
+  '/live-export',
+  authenticate,
+  authorize({ resource: 'banks', action: 'read' }),
+  async (_req, res, next) => {
+    try {
+      const buffer = await buildLivePolicyWorkbook();
+      const stamp = new Date().toISOString().slice(0, 10);
+      res.setHeader(
+        'Content-Type',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      );
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="live-policy-configuration-${stamp}.xlsx"`,
       );
       res.setHeader('Cache-Control', 'no-store');
       res.send(Buffer.from(buffer));

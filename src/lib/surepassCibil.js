@@ -60,8 +60,18 @@ function bureauKey(vendor = {}) {
 export function getSurepassConfig(vendor = {}) {
   const key = bureauKey(vendor);
   const isExperian = key === 'experian';
-  const token = env('SUREPASS_TOKEN');
+  const envToken = env('SUREPASS_TOKEN');
   const bearerFromVendor = String(vendor.api_key || '').trim();
+  // An expired (or sandbox) server token must not override a valid production token saved
+  // under Admin → API Configuration — otherwise renewing the token in the portal has no effect.
+  const envInfo = getSurepassTokenInfo(envToken);
+  const vendorInfo = getSurepassTokenInfo(bearerFromVendor);
+  const preferVendor = Boolean(bearerFromVendor) && !vendorInfo.expired && (
+    !envToken
+    || envInfo.expired
+    || (vendorInfo.environment === 'production' && envInfo.environment === 'sandbox')
+  );
+  const token = preferVendor ? bearerFromVendor : envToken;
   const tokenInfo = getSurepassTokenInfo(token || bearerFromVendor);
 
   // Sandbox tokens are rejected by the production host and vice versa, so a token whose

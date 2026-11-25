@@ -28,6 +28,8 @@ const MSG91_SMS_HTTP_URL = 'https://control.msg91.com/api/sendhttp.php';
 const MSG91_NOTIFICATION_TEMPLATE_SLUG = 'rfincare_notification';
 /** Cached after first successful ensure/create of the transactional email template. */
 let cachedNotificationTemplateId = null;
+/** Set once MSG91 reports the configured notification template is not registered. */
+let notificationTemplateMissing = false;
 /** Official WhatsApp bulk endpoint (MSG91 OTP docs). control.msg91.com kept as fallback. */
 const MSG91_WHATSAPP_URLS = [
   'https://api.msg91.com/api/v5/whatsapp/whatsapp-outbound-message/bulk/',
@@ -635,6 +637,10 @@ function toMsg91Attachment(attachment) {
  * MSG91 Email API requires a template_id. Ensure a reusable {{SUBJECT}}/{{BODY}}
  * template exists (create once, cache slug). Falls back to configured IDs.
  */
+function isTemplateMissingError(err) {
+  return /not\s+registered|template[^"]*not\s+(found|exist)|invalid\s+template/i.test(String(err?.message || err || ''));
+}
+
 async function resolveMsg91TransactionalTemplateId(config) {
   const explicit = String(
     config.transactionalTemplateId
@@ -790,22 +796,25 @@ export async function sendMsg91TransactionalEmail({
   const templateId = await resolveMsg91TransactionalTemplateId(config);
   const attempts = [];
 
-  // 1) Template-based send (required by MSG91 Email API).
-  attempts.push({
-    label: 'template',
-    body: {
-      ...basePayload,
-      template_id: templateId,
-    },
-  });
+  // 1) Template-based send — skipped once MSG91 said the template is not registered.
+  if (!notificationTemplateMissing) {
+    attempts.push({
+      label: 'template',
+      body: {
+        ...basePayload,
+        template_id: templateId,
+      },
+    });
+  }
 
-  // 2) Free-form body (rare accounts); tried only if template fails.
+  // 2) Free-form body. MSG91 requires `body: { type, data }` when no template_id is sent
+  //    (the old `{ html, text }` shape was always rejected, so non-OTP emails never went out).
   attempts.push({
     label: 'raw_body',
     body: {
       ...basePayload,
       subject: subjectLine,
-      body: { html: htmlBody, text: textBody },
+      body: { type: 'text/html', data: htmlBody },
     },
   });
 
@@ -822,7 +831,13 @@ export async function sendMsg91TransactionalEmail({
   let lastError = null;
   for (const attempt of attempts) {
     try {
-      await postMsg91Email({ _authKey: config.authKey, body: attempt.body });
+      try {
+        await postMsg91Email({ _authKey: config.authKey, body: attempt.body });
+      } catch (err) {
+        // e.g. "rfincare_notification is not registered" — use the free-form body from now on.
+        if (attempt.body.template_id && isTemplateMissingError(err)) notificationTemplateMissing = true;
+        throw err;
+      }
       return {
         sent: true,
         provider: 'msg91',

@@ -9,6 +9,7 @@ import { authorize } from '../middleware/authorize.js';
 import { generateReportSection } from '../lib/reportGenerators.js';
 import { buildMasterReport } from '../lib/masterReport.js';
 import { assertEmployeeAccess } from '../lib/employeeAccessControls.js';
+import { laLoanTypeSql } from '../lib/loanApplicationSql.js';
 
 export const reportsRouter = Router();
 
@@ -193,7 +194,7 @@ reportsRouter.get(
            AND (
              created_at IS NULL
              OR created_at::date BETWEEN :start::date AND :end::date
-             OR updated_at::date BETWEEN :start::date AND :end::date
+             OR COALESCE(verified_at, uploaded_at)::date BETWEEN :start::date AND :end::date
            )`,
           rangeParams,
         );
@@ -383,30 +384,16 @@ reportsRouter.get(
       await enforceReportsAccess(req);
       const pool = getPool();
       const { start, end } = dateRangeFromQuery(req.query);
-      let rows = [];
-      try {
-        const [r] = await pool.execute(
-          `SELECT COALESCE(NULLIF(TRIM(loan_type), ''), NULLIF(TRIM(data->>'loan_type'), ''), 'other') AS loan_type,
-                  COUNT(*)::int AS count
-           FROM loan_applications
-           WHERE created_at::date BETWEEN :start::date AND :end::date
-           GROUP BY 1
-           ORDER BY count DESC`,
-          { start, end },
-        );
-        rows = r;
-      } catch {
-        const [r] = await pool.execute(
-          `SELECT COALESCE(NULLIF(TRIM(loan_type), ''), 'other') AS loan_type,
-                  COUNT(*)::int AS count
-           FROM loan_applications
-           WHERE created_at::date BETWEEN :start::date AND :end::date
-           GROUP BY 1
-           ORDER BY count DESC`,
-          { start, end },
-        );
-        rows = r;
-      }
+      // loan_type lives in the data JSON (there is no loan_type column on loan_applications).
+      const [rows] = await pool.execute(
+        `SELECT COALESCE(${laLoanTypeSql('la')}, 'other') AS loan_type,
+                COUNT(*)::int AS count
+         FROM loan_applications la
+         WHERE la.created_at::date BETWEEN :start::date AND :end::date
+         GROUP BY 1
+         ORDER BY count DESC`,
+        { start, end },
+      );
       const colors = ['#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#ef4444'];
       res.json(
         rows.map((r, i) => ({

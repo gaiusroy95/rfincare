@@ -1937,3 +1937,201 @@ export function getTemplateBuffer() {
   }
   return { buffer: buildPolicyTemplateWorkbook(), path: null, generated: true };
 }
+
+// ——— Live configuration export (download → edit → re-upload) ———
+
+const LENDER_TYPE_EXPORT = {
+  hfc: 'HFC',
+  nbfc: 'NBFC',
+  public: 'PUBLIC',
+  foreign: 'FOREIGN',
+  cooperative: 'COOPERATIVE',
+  private: 'BANK',
+};
+
+function exportList(value) {
+  if (Array.isArray(value)) return value.map((v) => String(v ?? '').trim()).filter(Boolean).join(' | ');
+  return value == null ? '' : String(value);
+}
+
+function exportDate(value) {
+  if (!value) return '';
+  const d = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(d.getTime()) ? String(value) : d.toISOString().slice(0, 10);
+}
+
+function exportCode(raw, fallback) {
+  const code = String(raw || '')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  return code || fallback;
+}
+
+/** Order columns like the template sample, then any extra keys present in the rows. */
+function orderedSheet(name, rows) {
+  const sample = SHEET_HEADER_SAMPLES[name]?.[0] || {};
+  const header = [...Object.keys(sample)];
+  for (const row of rows) {
+    for (const key of Object.keys(row)) if (!header.includes(key)) header.push(key);
+  }
+  return XLSX.utils.json_to_sheet(rows, { header });
+}
+
+/**
+ * Current live policy configuration as an editable bulk-upload workbook.
+ * - Lenders / Products: read from the live banks / bank_products tables (includes admin UI edits).
+ * - Rule sheets (pricing, documents, fees, eligibility, geo, …): rows of the most recent
+ *   committed upload containing that sheet — the configuration currently in force.
+ * Re-uploading the file (unchanged or edited) upserts by Lender_Code / Product_Code.
+ */
+export async function buildLivePolicyWorkbook() {
+  const pool = getPool();
+  await ensureImportSchema(pool);
+
+  // 1) Rule sheets from committed uploads, newest first.
+  const [jobs] = await pool.execute(
+    `SELECT sheet_payload_json
+     FROM lender_policy_import_jobs
+     WHERE status = 'committed'
+     ORDER BY COALESCE(committed_at, updated_at, created_at) DESC
+     LIMIT 50`,
+  );
+  const committedSheets = {};
+  for (const job of jobs || []) {
+    let payload = job.sheet_payload_json;
+    if (typeof payload === 'string') {
+      try {
+        payload = JSON.parse(payload);
+      } catch {
+        payload = null;
+      }
+    }
+    for (const [name, rows] of Object.entries(payload || {})) {
+      if (committedSheets[name] || !Array.isArray(rows) || !rows.length) continue;
+      committedSheets[name] = rows;
+    }
+  }
+
+  // Keep the Lender_ID keys used by the committed rule sheets.
+  const lenderIdByCode = new Map();
+  for (const row of committedSheets.Lenders || []) {
+    const code = exportCode(row.Lender_Code, '');
+    if (code && row.Lender_ID) lenderIdByCode.set(code, String(row.Lender_ID));
+  }
+
+  // 2) Lenders from the live banks table.
+  const [banks] = await pool.execute(
+    `SELECT id, name, bank_type, status, display_priority, lender_code, effective_from, policy_source
+     FROM banks
+     ORDER BY display_priority DESC NULLS LAST, name ASC`,
+  );
+  const lenderIdByBank = new Map();
+  const lenders = (banks || []).map((bank, i) => {
+    const code = exportCode(bank.lender_code || bank.name, `LENDER_${i + 1}`);
+    const lenderId = lenderIdByCode.get(code) || code;
+    lenderIdByBank.set(bank.id, lenderId);
+    return {
+      Lender_ID: lenderId,
+      Lender_Code: code,
+      Lender_Name: bank.name || code,
+      Lender_Type: LENDER_TYPE_EXPORT[String(bank.bank_type || '').toLowerCase()] || 'BANK',
+      Status: String(bank.status || 'active').toLowerCase() === 'active' ? 'ACTIVE' : 'INACTIVE',
+      Priority: bank.display_priority ?? '',
+      Effective_From: exportDate(bank.effective_from),
+      Policy_Source: bank.policy_source || '',
+    };
+  });
+
+  // 3) Products from the live bank_products table.
+  const [products] = await pool.execute(
+    `SELECT id, bank_id, name, is_active, data FROM bank_products ORDER BY bank_id, name`,
+  );
+  const usedCodes = new Set();
+  const productRows = [];
+  for (const product of products || []) {
+    const lenderId = lenderIdByBank.get(product.bank_id);
+    if (!lenderId) continue;
+    const d = parseProductData(product.data);
+    let code = exportCode(d.product_code || d.productCode || product.name, `PRODUCT_${productRows.length + 1}`);
+    if (usedCodes.has(code)) code = `${code}_${String(product.id).slice(0, 6).toUpperCase()}`;
+    usedCodes.add(code);
+    const category = String(d.product_category_slug || d.loan_type || d.loanType || 'personal_loan')
+      .toUpperCase()
+      .replace(/[\s-]+/g, '_');
+    productRows.push({
+      Product_ID: String(d.external_product_id || d.Product_ID || code),
+      Lender_ID: lenderId,
+      Product_Code: code,
+      Product_Name: product.name || code,
+      Product_Category: category,
+      Status: product.is_active === false ? 'INACTIVE' : 'ACTIVE',
+      Apply_URL: d.apply_url || d.applyUrl || '',
+      Interest_Rate_From: d.interest_rate_min ?? '',
+      Interest_Rate_To: d.interest_rate_max ?? '',
+      Processing_Fee_Percentage: d.processing_fee_percentage ?? d.processingFeePercentage ?? '',
+      Processing_Fee_Fixed: d.processing_fee_fixed ?? d.processingFeeFixed ?? '',
+      Minimum_Loan_Amount: d.min_loan_amount ?? d.minAmount ?? '',
+      Maximum_Loan_Amount: d.max_loan_amount ?? d.maxAmount ?? '',
+      Minimum_Tenure_Months: d.min_tenure_months ?? '',
+      Maximum_Tenure_Months: d.max_tenure_months ?? '',
+      Product_Type: d.product_type || '',
+      Target_Customer: d.target_customer || '',
+      Purpose: d.purpose || '',
+      Policy_Version: d.policy_version || '',
+      Other_Charges: d.other_charges || '',
+      Prepayment_Charges: d.prepayment_charges || '',
+      Foreclosure_Charges: d.foreclosure_charges || '',
+      Foreclosure_Fee_Pct: d.foreclosure_fee_pct ?? '',
+      Foreclosure_Allowed_After_Months: d.foreclosure_allowed_after_months ?? '',
+      Part_Payment_Fee_Pct: d.part_payment_fee_pct ?? '',
+      Bouncing_Charges: d.bouncing_charges ?? '',
+      Late_Fee_Pct: d.late_fee_pct ?? '',
+      Late_Payment_Fee_Fixed: d.late_payment_fee_fixed ?? '',
+      Late_Payment_Charges: d.late_payment_charges || '',
+      Documentation_Charges: d.documentation_charges || '',
+      Disbursal_Timeline: d.disbursal_timeline || '',
+      Collateral_Required: d.collateral_required || '',
+      Features: exportList(d.features),
+      Eligibility_Criteria: exportList(d.eligibility_criteria),
+      Policies: exportList(d.policies),
+      Documentation_Required: exportList(d.documentation_required),
+    });
+  }
+
+  // Rule rows must point at products / lenders that exist in this file.
+  const productIds = new Set(productRows.map((p) => String(p.Product_ID)));
+  const lenderIds = new Set(lenders.map((l) => String(l.Lender_ID)));
+
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(
+    wb,
+    XLSX.utils.aoa_to_sheet([
+      ['Rfincare — LIVE policy configuration export'],
+      [`Exported: ${new Date().toISOString()}`],
+      ['Lenders and Products reflect the live portal (including edits made in the admin screens).'],
+      ['Rule sheets reflect the latest published (committed) bulk upload for each sheet.'],
+      ['Edit the cells you need, then upload this same file under Policy bulk upload → Upload & validate → Publish.'],
+      ['Rows are matched by Lender_Code / Product_Code, so existing lenders and products are updated, not duplicated.'],
+    ]),
+    'README',
+  );
+  for (const name of EXPECTED_SHEETS) {
+    if (name === 'README') continue;
+    let rows;
+    if (name === 'Lenders') rows = lenders;
+    else if (name === 'Products') rows = productRows;
+    else {
+      rows = (committedSheets[name] || []).filter((row) => {
+        const pid = String(row.Product_ID ?? row.product_id ?? '').trim();
+        const lid = String(row.Lender_ID ?? row.lender_id ?? '').trim();
+        if (PRODUCT_FK_SHEETS.includes(name) && pid) return productIds.has(pid);
+        if (lid && !pid) return lenderIds.has(lid);
+        return true;
+      });
+    }
+    XLSX.utils.book_append_sheet(wb, orderedSheet(name, rows), name);
+  }
+  return XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+}

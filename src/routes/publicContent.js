@@ -360,7 +360,8 @@ publicContentRouter.post('/cibil/check', async (req, res, next) => {
       panNumber: z.string().regex(/^[A-Z]{5}[0-9]{4}[A-Z]$/i, 'Enter a valid PAN number'),
       city: z.string().min(2, 'City is required'),
       pincode: z.string().regex(/^\d{6}$/, 'Enter a valid 6-digit pincode'),
-      gender: z.enum(['male', 'female', 'other']).optional(),
+      // TransUnion CIBIL (homepage bureau) matches on gender, so it is mandatory.
+      gender: z.enum(['male', 'female', 'other'], { errorMap: () => ({ message: 'Please select gender' }) }),
       consentAccepted: z.literal(true, { errorMap: () => ({ message: 'Consent is required' }) }),
       consentToken: z.string().min(16, 'Contact OTP verification is required'),
       otpId: z.string().min(1).optional().nullable(),

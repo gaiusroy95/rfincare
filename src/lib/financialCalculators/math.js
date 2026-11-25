@@ -114,12 +114,17 @@ export function retirementCorpus(monthlyExpense, inflationRate, yearsToRetiremen
 }
 
 export function pensionPayout(corpus, annualRate, payoutYears) {
+  // Monthly pension that draws the corpus down to zero over the payout period while the
+  // remaining balance keeps earning `annualRate` (previously the rate was ignored).
   const c = toNum(corpus);
-  const monthly = c / Math.max(1, toNum(payoutYears, 20) * 12);
-  const annuityMonthly = swpCorpus(monthly, annualRate, payoutYears) > 0 ? monthly : 0;
+  const n = Math.max(1, Math.round(toNum(payoutYears, 20) * 12));
+  const r = toNum(annualRate) / 100 / 12;
+  let monthly = c / n;
+  if (r > 0) monthly = (c * r) / (1 - (1 + r) ** -n);
   return {
     monthlyPension: round2(monthly),
     annualPension: round2(monthly * 12),
+    totalPayout: round2(monthly * n),
     corpus: round2(c),
   };
 }

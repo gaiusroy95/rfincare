@@ -8,6 +8,20 @@ const PROVIDER_LEAK_RE =
 const DB_LEAK_RE =
   /foreign key|violates|constraint|refresh_tokens|fk_|relation |duplicate key|syntax error|ECONNREFUSED|postgres|sqlstate/i;
 
+/** Bureau configuration / provider details that customers must not see. */
+const BUREAU_INTERNAL_RE =
+  /surepass|token|credential|insufficient balance|gateway|endpoint|service is not available|could not be reached|not configured|returned no credit score/i;
+
+/** Customer / guest credit-report endpoints (staff portals keep detailed messages). */
+function isCustomerCreditPath(url) {
+  return /\/portal\/customer\/credit|\/public\/cibil\/check|\/portal\/customer\/cibil/i.test(url);
+}
+
+/** Only OTP / verification endpoints should ever answer with an OTP message. */
+function isOtpPath(url) {
+  return /otp|verif|consent|signup|forgot|password-reset|register|status-check|draft-recovery|enquir|contact/i.test(url);
+}
+
 function isAdminDiagnosticPath(req) {
   const url = String(req?.originalUrl || req?.url || '');
   // Staff dashboards need real DB/provider messages (e.g. TAT settings save).
@@ -36,8 +50,15 @@ export function errorMiddleware(err, req, res, _next) {
 
   // Customer-facing APIs: never leak MSG91/SMTP/sender-ID or raw DB internals.
   if (!isAdminDiagnosticPath(req)) {
-    if (PROVIDER_LEAK_RE.test(String(message))) {
-      message = toPublicOtpMessage(message);
+    const url = String(req?.originalUrl || req?.url || '');
+    if (isCustomerCreditPath(url) && BUREAU_INTERNAL_RE.test(String(message))) {
+      // e.g. expired Surepass token — previously surfaced as "Could not send OTP".
+      message = 'The credit report service is temporarily unavailable. Please try again later.';
+      if (status < 500) status = 503;
+    } else if (PROVIDER_LEAK_RE.test(String(message))) {
+      message = isOtpPath(url)
+        ? toPublicOtpMessage(message)
+        : 'This service is temporarily unavailable. Please try again in a moment.';
     } else if (DB_LEAK_RE.test(String(message))) {
       status = status >= 500 ? 409 : status;
       message = 'Something went wrong while verifying. Please try again in a moment.';

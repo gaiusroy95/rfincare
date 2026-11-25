@@ -32,7 +32,9 @@ const SignupSchema = z.object({
   password: z.string().min(8),
   fullName: z.string().min(1).optional(),
   phone: z.string().min(6).optional(),
-  role: z.enum(['customer', 'agent', 'employee', 'admin', 'super_admin']).optional(),
+  // Public self-signup creates customers only. Agents use agent onboarding and staff are
+  // created by admins — accepting other roles here let anyone create an admin account.
+  role: z.enum(['customer']).optional(),
   referralCode: z.string().trim().max(64).optional(),
   referral_code: z.string().trim().max(64).optional(),
   referralProgram: z.enum(['agent', 'customer']).optional(),
@@ -275,7 +277,33 @@ authRouter.post('/signup', async (req, res, next) => {
     const userId = newId();
     const passwordHash = await bcrypt.hash(input.password, 12);
 
-    const role = input.role || 'customer';
+    const role = 'customer';
+
+    // Explain *why* an email is taken (e.g. it belongs to an agent account), and reclaim
+    // logins left behind by an incomplete delete (auth row without a profile).
+    const [[taken]] = await pool.execute(
+      `SELECT a.id, p.role
+       FROM auth_users a
+       LEFT JOIN user_profiles p ON p.id = a.id
+       WHERE LOWER(a.email) = LOWER(:email)
+       LIMIT 1`,
+      { email: input.email },
+    );
+    if (taken && !taken.role) {
+      await pool.execute(`DELETE FROM refresh_tokens WHERE user_id = :id`, { id: taken.id }).catch(() => {});
+      await pool.execute(`DELETE FROM auth_users WHERE id = :id`, { id: taken.id });
+    } else if (taken) {
+      const e = new Error(
+        taken.role === 'customer'
+          ? 'An account with this email already exists. Please sign in.'
+          : taken.role === 'agent'
+            ? 'This email is already registered as a Rfincare Agent / Business Partner account. Please use a different email address for your customer account.'
+            : 'This email is already used by a Rfincare staff account. Please use a different email address.',
+      );
+      e.status = 409;
+      e.code = taken.role === 'customer' ? 'EMAIL_EXISTS_CUSTOMER' : 'EMAIL_EXISTS_OTHER_ROLE';
+      throw e;
+    }
 
     await pool.execute(
       `INSERT INTO auth_users (id, email, password_hash) VALUES (:id, :email, :ph)`,
@@ -339,7 +367,7 @@ authRouter.post('/signup', async (req, res, next) => {
   } catch (err) {
     if (isDuplicateEntryError(err)) {
       err.status = 409;
-      err.message = 'Email already exists';
+      err.message = 'An account with this email already exists. Please sign in.';
     }
     next(err);
   }

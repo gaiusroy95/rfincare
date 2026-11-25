@@ -280,7 +280,19 @@ async function buildEmailFileAttachments(pool, documentIds = []) {
       doc.document_name,
       doc.document_url,
     ]);
-    if (!resolvedPath) continue;
+    if (!resolvedPath) {
+      // Disk copy gone after a restart — attach the durable copy from Postgres.
+      const { getDbObject } = await import('../lib/storage/dbProvider.js');
+      const stored = await getDbObject(doc.file_path).catch(() => null);
+      if (stored?.buffer) {
+        files.push({
+          filename: doc.document_name || `document-${docId}`,
+          content: stored.buffer,
+          contentType: doc.mime_type || stored.contentType || undefined,
+        });
+      }
+      continue;
+    }
     files.push({
       filename: doc.document_name || `document-${docId}`,
       path: resolvedPath,

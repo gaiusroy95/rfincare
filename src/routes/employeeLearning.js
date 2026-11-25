@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import multer from 'multer';
+import { persistDiskUploadsToDb } from '../lib/multerUpload.js';
 import { mkdirSync } from 'node:fs';
 import { resolve, extname } from 'node:path';
 import { z } from 'zod';
@@ -154,6 +155,7 @@ adminEmployeeLearningRouter.post(
   authenticate,
   authorize({ resource: 'employees', action: 'update' }),
   staffUpload.single('file'),
+  persistDiskUploadsToDb(),
   async (req, res, next) => {
     try {
       await ensureAgentLearningSchema();

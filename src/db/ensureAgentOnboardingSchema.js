@@ -165,6 +165,8 @@ const CREATE_STATEMENTS = [
   `ALTER TABLE agent_applications ADD COLUMN IF NOT EXISTS field_checks_json JSONB NULL`,
   `ALTER TABLE agent_applications ADD COLUMN IF NOT EXISTS assigned_employee_id CHAR(36) NULL`,
   `ALTER TABLE agent_applications ADD COLUMN IF NOT EXISTS assigned_at TIMESTAMPTZ NULL`,
+  // Set when corrected documents are resubmitted (client stage "Documents Resubmitted").
+  `ALTER TABLE agent_applications ADD COLUMN IF NOT EXISTS resubmitted_at TIMESTAMPTZ NULL`,
   `CREATE INDEX IF NOT EXISTS idx_agent_applications_assigned_employee
     ON agent_applications (assigned_employee_id)`,
 ];

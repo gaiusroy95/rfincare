@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import multer from 'multer';
+import { persistDiskUploadsToDb } from '../lib/multerUpload.js';
 import { mkdirSync } from 'node:fs';
 import { resolve, extname } from 'node:path';
 import { z } from 'zod';
@@ -202,6 +203,7 @@ adminAgentLearningRouter.post(
     { name: 'file', maxCount: 1 },
     { name: 'thumbnail', maxCount: 1 },
   ]),
+  persistDiskUploadsToDb(),
   async (req, res, next) => {
     try {
       await ensureAgentLearningSchema();

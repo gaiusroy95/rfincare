@@ -101,23 +101,27 @@ export async function sendCallConsentOtpSms({ phone, otp }) {
       }
     }
 
-    try {
-      getMsg91Config(cfg);
-      await sendMsg91TransactionalSms({
-        phone: mobile,
-        message,
-        otp,
-        config: cfg,
-      });
-      return {
-        sent: true,
-        provider: 'msg91',
-        mode: 'call_consent_sms',
-        termsLink,
-        privacyLink,
-      };
-    } catch (err) {
-      console.warn('[call-consent-otp] transactional SMS failed, falling back to OTP channel:', err?.message);
+    // Free-text SMS (with links) is dropped by operators unless DLT-registered; default to the
+    // DLT-approved OTP template. Opt in to the free-text version: MSG91_CALL_CONSENT_PLAIN_SMS=true.
+    if (String(process.env.MSG91_CALL_CONSENT_PLAIN_SMS || '').toLowerCase() === 'true') {
+      try {
+        getMsg91Config(cfg);
+        await sendMsg91TransactionalSms({
+          phone: mobile,
+          message,
+          otp,
+          config: cfg,
+        });
+        return {
+          sent: true,
+          provider: 'msg91',
+          mode: 'call_consent_sms',
+          termsLink,
+          privacyLink,
+        };
+      } catch (err) {
+        console.warn('[call-consent-otp] transactional SMS failed, falling back to OTP channel:', err?.message);
+      }
     }
   }
 

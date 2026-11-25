@@ -3,6 +3,7 @@ import { resolve } from 'node:path';
 
 import { getPool } from '../db/pool.js';
 import { getUploadDir } from './uploadPaths.js';
+import { putDbObject } from './storage/dbProvider.js';
 import { buildBankLoanApplicationFormPdf } from './bankLoanApplicationFormPdf.js';
 import { sendEmail } from './email.js';
 import { sendMsg91TransactionalSms } from './msg91.js';
@@ -86,6 +87,13 @@ export async function finalizeApplicationSubmission({
     const fileName = `${safeNumber}.pdf`;
     const absolutePath = resolve(packageDir, fileName);
     writeFileSync(absolutePath, pdfBuffer);
+    // Durable copy — the local disk on Render is wiped on restart.
+    await putDbObject({
+      key: `application-packages/${fileName}`,
+      buffer: Buffer.from(pdfBuffer),
+      mimeType: 'application/pdf',
+      originalName: fileName,
+    }).catch((err) => console.warn('[submission-pdf] durable copy failed:', err.message));
 
     publicPath = `/uploads/application-packages/${fileName}`;
     pdfGenerated = true;

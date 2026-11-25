@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { mkdirSync } from 'node:fs';
 import { extname } from 'node:path';
 import multer from 'multer';
+import { persistDiskUploadsToDb } from '../lib/multerUpload.js';
 import { z } from 'zod';
 
 import { getPool } from '../db/pool.js';
@@ -785,6 +786,7 @@ insuranceProductsRouter.post(
   authenticate,
   authorize({ resource: 'banks', action: 'update' }),
   wrapMulter(logoUpload.single('logo')),
+  persistDiskUploadsToDb(),
   async (req, res, next) => {
     try {
       await ensureInsuranceSchema();

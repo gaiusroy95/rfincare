@@ -97,6 +97,10 @@ async function bootstrap() {
     await ensureMarketingSchema();
     await ensureReferralSchema(getPool());
     await ensureAgentLearningSchema();
+    if (!isCloudStorage()) {
+      const { ensureStoredFilesSchema, isDbUploadStoreEnabled } = await import('./lib/storage/dbProvider.js');
+      if (isDbUploadStoreEnabled()) await ensureStoredFilesSchema(getPool());
+    }
   } catch (err) {
     // eslint-disable-next-line no-console
     console.warn('[api] milestone4 schema bootstrap:', err.message);

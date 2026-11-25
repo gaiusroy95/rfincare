@@ -67,26 +67,66 @@ async function deliverChannels({ phone, email, title, message, settings, userId 
     }
   }
 
+  // Each channel is independent — one provider failure must not silence the others.
   if (settings.channels?.email && email) {
-    await sendEmail({ to: email, subject: title, text: body });
-    channels.push('email');
+    try {
+      const mail = await sendEmail({ to: email, subject: title, text: body });
+      if (mail?.sent) channels.push('email');
+      else console.warn('[file-notify:email]', mail?.warningInternal || mail?.reason || 'not sent', { to: email });
+    } catch (err) {
+      console.warn('[file-notify:email]', err?.message || err);
+    }
   }
   if (allowSms && phone) {
-    const { sendOtpNotification } = await import('./otp.js');
-    await sendOtpNotification({ phone, otp: message.slice(0, 160), channel: 'sms', settings: otpSettings });
-    channels.push('sms');
+    try {
+      await sendStatusSms({ phone, title, message, otpSettings });
+      channels.push('sms');
+    } catch (err) {
+      console.warn('[file-notify:sms]', err?.message || err);
+    }
   }
   if (allowWhatsapp && phone) {
-    const { sendOtpNotification } = await import('./otp.js');
-    await sendOtpNotification({
-      phone,
-      otp: message.slice(0, 160),
-      channel: 'whatsapp',
-      settings: otpSettings,
-    });
-    channels.push('whatsapp');
+    try {
+      const { sendOtpNotification } = await import('./otp.js');
+      await sendOtpNotification({
+        phone,
+        otp: message.slice(0, 160),
+        channel: 'whatsapp',
+        settings: otpSettings,
+      });
+      channels.push('whatsapp');
+    } catch (err) {
+      console.warn('[file-notify:whatsapp]', err?.message || err);
+    }
   }
   return channels;
+}
+
+/**
+ * Status / stage SMS. The OTP API only accepts a numeric code, so free-text updates sent
+ * through it never arrived. Use a DLT-approved MSG91 Flow template when configured
+ * (MSG91_STATUS_FLOW_TEMPLATE_ID, variables: message / app / stage), else plain
+ * transactional SMS.
+ */
+async function sendStatusSms({ phone, title, message, otpSettings }) {
+  const { sendMsg91Flow, sendMsg91TransactionalSms } = await import('./msg91.js');
+  const text = `Rfincare: ${title}. ${String(message || '').replace(/\s*\n\s*/g, '. ')}`
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 300);
+  const flowTemplateId = String(
+    process.env.MSG91_STATUS_FLOW_TEMPLATE_ID
+      || otpSettings?.providerConfig?.msg91StatusFlowTemplateId
+      || '',
+  ).trim();
+  if (flowTemplateId) {
+    return sendMsg91Flow({
+      phone,
+      variables: { message: text, var1: text, VAR1: text },
+      config: { msg91FlowTemplateId: flowTemplateId },
+    });
+  }
+  return sendMsg91TransactionalSms({ phone, message: text });
 }
 
 function shouldNotify(rule, roleKey) {

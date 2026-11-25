@@ -14,6 +14,8 @@ export const FLASH_TILE_CATEGORIES = [
   { id: 'retirement_planning', label: 'Retirement Planning', icon: 'Clock' },
   { id: 'wealth_management', label: 'Wealth Management', icon: 'Briefcase' },
   { id: 'customer_referral_scheme', label: 'Customer Referral scheme', icon: 'Gift' },
+  // Shown on the agent portal (dashboard banner space + referral pages) — not to customers.
+  { id: 'agent_monthly_contest', label: 'Agent Monthly Contest', icon: 'Trophy' },
 ];
 
 const CATEGORY_IDS = new Set(FLASH_TILE_CATEGORIES.map((c) => c.id));
@@ -178,6 +180,10 @@ export function normalizeFlashCategory(raw) {
     customer_referral_schemes: 'customer_referral_scheme',
     referral_scheme: 'customer_referral_scheme',
     referral_schemes: 'customer_referral_scheme',
+    agent_contest: 'agent_monthly_contest',
+    agent_monthly_contests: 'agent_monthly_contest',
+    monthly_contest: 'agent_monthly_contest',
+    agent_scheme: 'agent_monthly_contest',
   };
   const mapped = aliases[key] || key;
   return CATEGORY_IDS.has(mapped) ? mapped : null;

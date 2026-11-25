@@ -9,6 +9,7 @@ import { newId } from '../lib/ids.js';
 import { writeAuditLog } from '../lib/audit.js';
 import { sendEmail } from '../lib/email.js';
 import { resolveUploadFilePath } from '../lib/uploadPaths.js';
+import { getDbObject, putDbObject } from '../lib/storage/dbProvider.js';
 import {
   getPaymentGatewaySettingsPublic,
   savePaymentGatewaySettings,
@@ -177,6 +178,12 @@ adminIntegrationsRouter.post(
           const safeNumber = String(app.application_number || app.id).replace(/[^\w-]/g, '_');
           const fileName = `${safeNumber}.pdf`;
           writeFileSync(resolve(packageDir, fileName), pdfBuffer);
+          await putDbObject({
+            key: `application-packages/${fileName}`,
+            buffer: Buffer.from(pdfBuffer),
+            mimeType: 'application/pdf',
+            originalName: fileName,
+          }).catch((err) => console.warn('[share-to-bank] durable copy failed:', err.message));
           packagePath = `/uploads/application-packages/${fileName}`;
           const merged = {
             ...data,
@@ -196,7 +203,8 @@ adminIntegrationsRouter.post(
         try {
           const rel = String(packagePath).replace(/^\/uploads\//, '');
           const full = resolveUploadFilePath(rel);
-          const content = await readFile(full);
+          const content = full ? await readFile(full) : (await getDbObject(rel))?.buffer;
+          if (!content) throw new Error('Application package PDF not found');
           attachments.push({
             filename: `${app.application_number || app.id.slice(0, 8)}-Rfincare_Bank_Loan_Application_Form.pdf`,
             content,

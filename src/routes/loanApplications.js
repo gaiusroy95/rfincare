@@ -328,8 +328,20 @@ loanApplicationsRouter.get(
   authenticate,
   async (req, res, next) => {
     try {
-      await assertEmployeeAccess(req, 'applications', 'read');
       const pool = getPool();
+      // Customers and agents see the applications they own/sourced. The employee
+      // assignment resolver below never matches a customer, which left
+      // "My Applications" empty even after a successful submission.
+      if (req.auth.role === 'customer' || req.auth.role === 'agent') {
+        const { where, params } = await buildListQuery(pool, req.auth.role, req.auth.userId, {});
+        const [rows] = await pool.execute(
+          `${LIST_SELECT} ${where} ORDER BY la.created_at DESC`,
+          params,
+        );
+        return res.json(rows.map(formatApplication));
+      }
+
+      await assertEmployeeAccess(req, 'applications', 'read');
       const ownedIds = await fetchEmployeeOwnedApplicationIds(pool, req.auth.userId);
       if (!ownedIds.size) {
         return res.json([]);
@@ -712,6 +724,218 @@ loanApplicationsRouter.get(
   },
 );
 
+const EligibilityDraftSchema = z.object({
+  leadId: z.string().optional().nullable(),
+  loanType: z.string().optional().nullable(),
+  sessionKey: z.string().min(8).max(128).optional().nullable(),
+  formData: z.record(z.unknown()).default({}),
+  eligibility: z
+    .object({
+      status: z.string().optional().nullable(),
+      score: z.union([z.number(), z.string()]).optional().nullable(),
+      eligibleAmount: z.union([z.number(), z.string()]).optional().nullable(),
+    })
+    .partial()
+    .optional()
+    .nullable(),
+});
+
+function eligibilityDraftData(formData, input, profile) {
+  const fd = formData || {};
+  const pick = (...keys) => {
+    for (const key of keys) {
+      const v = fd[key];
+      if (v !== undefined && v !== null && String(v).trim() !== '') return v;
+    }
+    return null;
+  };
+  const toNumber = (v) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  const loanType = input.loanType || pick('loanPurpose', 'loanType');
+  return normalizeApplicationPayload({
+    first_name: pick('firstName'),
+    middle_name: pick('middleName'),
+    last_name: pick('lastName'),
+    email: pick('email') || profile?.email || null,
+    phone: pick('phone') || profile?.phone || null,
+    pan_number: pick('pan'),
+    gender: pick('gender'),
+    pin_code: pick('pinCode'),
+    employment_type: pick('employmentType'),
+    monthly_income: toNumber(pick('monthlyIncome')),
+    extra_income: toNumber(pick('extraIncome')),
+    credit_score_range: pick('creditScoreRange'),
+    loan_type: loanType,
+    loan_purpose: loanType,
+    loan_amount: toNumber(pick('loanAmount')),
+    requested_loan_amount: toNumber(pick('loanAmount')),
+    lead_id: input.leadId || null,
+    source: 'eligibility_check',
+    eligibility_score: input.eligibility?.score ?? null,
+    eligible_amount: toNumber(input.eligibility?.eligibleAmount),
+    // Camel-case snapshot so the Loan Assessment Portal can resume this draft exactly.
+    form_data: fd,
+  });
+}
+
+/**
+ * Customer entered the Loan Assessment Portal from an eligibility check (Apply Now).
+ * Persist it as a draft application so it is listed under My Applications straight away,
+ * and reuse the same draft when the customer comes back (no duplicates per lead / loan type).
+ */
+loanApplicationsRouter.post(
+  '/eligibility-draft',
+  authenticate,
+  async (req, res, next) => {
+    try {
+      if (req.auth.role !== 'customer') {
+        const e = new Error('Only customers can create an eligibility draft');
+        e.status = 403;
+        throw e;
+      }
+      const input = EligibilityDraftSchema.parse(req.body || {});
+      const pool = getPool();
+      const [[profile]] = await pool.execute(
+        `SELECT full_name, email, phone FROM user_profiles WHERE id = :id LIMIT 1`,
+        { id: req.auth.userId },
+      );
+      const data = eligibilityDraftData(input.formData, input, profile);
+      const loanType = data.loan_type || null;
+
+      const [[existing]] = await pool.execute(
+        `SELECT id, data FROM loan_applications
+         WHERE customer_id = :customer_id
+           AND status = 'draft'
+           AND (
+             (CAST(:lead_id AS TEXT) <> '' AND COALESCE(data->>'lead_id', '') = CAST(:lead_id AS TEXT))
+             OR COALESCE(data->>'loan_type', data->>'loan_purpose', '') = COALESCE(CAST(:loan_type AS TEXT), '')
+           )
+         ORDER BY created_at DESC
+         LIMIT 1`,
+        { customer_id: req.auth.userId, lead_id: input.leadId || '', loan_type: loanType },
+      );
+
+      let id = existing?.id || null;
+      if (id) {
+        // Merge only filled values so a partial re-entry never blanks saved details.
+        const isFilled = ([, v]) => v !== null && v !== undefined && v !== '';
+        const previous = parseJson(existing.data);
+        const filled = Object.fromEntries(Object.entries(data).filter(isFilled));
+        filled.form_data = {
+          ...(previous.form_data && typeof previous.form_data === 'object' ? previous.form_data : {}),
+          ...Object.fromEntries(Object.entries(input.formData || {}).filter(isFilled)),
+        };
+        await pool.execute(
+          `UPDATE loan_applications
+           SET data = (COALESCE(data::jsonb, '{}'::jsonb) || CAST(:data AS jsonb))::json,
+               eligibility_status = COALESCE(:eligibility_status, eligibility_status),
+               updated_at = NOW()
+           WHERE id = :id`,
+          {
+            id,
+            data: JSON.stringify(filled),
+            eligibility_status: input.eligibility?.status || null,
+          },
+        );
+      } else {
+        id = newId();
+        await pool.execute(
+          `INSERT INTO loan_applications (
+             id, application_number, customer_id, status, document_stage_status,
+             bank_approval_status, eligibility_status, data
+           ) VALUES (
+             :id, :application_number, :customer_id, 'draft', 'documents_pending',
+             'submitted_to_bank', :eligibility_status, :data
+           )`,
+          {
+            id,
+            application_number: `RFC${Date.now()}`,
+            customer_id: req.auth.userId,
+            eligibility_status: input.eligibility?.status || null,
+            data: JSON.stringify(data),
+          },
+        );
+        try {
+          const { attachAttributionToApplication } = await import('../lib/referralEngine.js');
+          await attachAttributionToApplication(pool, id, req.body || {});
+        } catch {
+          /* best-effort */
+        }
+      }
+
+      if (input.leadId) {
+        await pool.execute(
+          `UPDATE marketing_leads
+           SET application_id = :app_id, status = 'application_in_progress', updated_at = NOW()
+           WHERE id = :lead_id`,
+          { app_id: id, lead_id: input.leadId },
+        ).catch(() => {});
+      }
+
+      if (input.sessionKey) {
+        await pool.execute(
+          `UPDATE application_form_drafts
+           SET application_id = :app_id, customer_id = COALESCE(customer_id, :customer_id)
+           WHERE session_key = :sk`,
+          { app_id: id, customer_id: req.auth.userId, sk: input.sessionKey },
+        ).catch(() => {});
+      }
+
+      const row = await fetchApplicationById(pool, id);
+      res.status(existing ? 200 : 201).json(formatApplication(row));
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+/** Saved Loan Assessment Portal form for a draft (used by "Complete application"). */
+loanApplicationsRouter.get(
+  '/:id/form-draft',
+  authenticate,
+  async (req, res, next) => {
+    try {
+      const pool = getPool();
+      const row = await fetchApplicationById(pool, req.params.id);
+      if (!row) {
+        const e = new Error('Application not found');
+        e.status = 404;
+        throw e;
+      }
+      const isOwner = row.customer_id === req.auth.userId;
+      if (!isOwner && !canReadAllApplications(req.auth.role) && row.agent_id !== req.auth.userId) {
+        const e = new Error('Insufficient permissions');
+        e.status = 403;
+        throw e;
+      }
+      const [[draft]] = await pool.execute(
+        `SELECT session_key, form_data, current_step, updated_at
+         FROM application_form_drafts
+         WHERE application_id = :id
+         ORDER BY updated_at DESC
+         LIMIT 1`,
+        { id: row.id },
+      );
+      const data = parseJson(row.data);
+      const draftForm = draft?.form_data ? parseJson(draft.form_data) : null;
+      const formData = (draftForm && Object.keys(draftForm).length ? draftForm : null)
+        || (data.form_data && typeof data.form_data === 'object' ? data.form_data : null);
+      res.json({
+        applicationId: row.id,
+        status: row.status,
+        sessionKey: draft?.session_key || null,
+        currentStep: draft?.current_step ?? 0,
+        formData,
+        data,
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
 loanApplicationsRouter.post(
   '/',
   authenticate,
@@ -1016,18 +1240,32 @@ loanApplicationsRouter.patch(
         /* referral payout is best-effort */
       }
 
-      if (
-        (document_stage_status || bank_approval_status)
-        && existing.status === 'submitted'
-        && existing.submitted_at
-      ) {
+      // Customer must hear about every QC / bank stage change on a submitted application
+      // (previously only when status was exactly 'submitted', so most updates were silent).
+      const humanStage = (value) =>
+        String(value || '')
+          .replace(/_/g, ' ')
+          .replace(/\b\w/g, (c) => c.toUpperCase());
+      const docStageChanged =
+        Boolean(document_stage_status) && document_stage_status !== existing.document_stage_status;
+      const bankStageChanged =
+        Boolean(bank_approval_status) && bank_approval_status !== existing.bank_approval_status;
+      if ((docStageChanged || bankStageChanged) && existing.status !== 'draft' && notifyCustomer !== false) {
+        const appNo = row.application_number || req.params.id.slice(0, 8);
         dispatchFileUpdateNotification('application_stage_after_bank', {
           applicationId: req.params.id,
           extra: {
             title: 'Application stage updated',
-            message: `Bank processing stage is now ${bank_approval_status || document_stage_status}.`,
+            message: [
+              `Your loan application ${appNo} has a new update.`,
+              docStageChanged ? `Document stage: ${humanStage(document_stage_status)}` : null,
+              bankStageChanged ? `Bank stage: ${humanStage(bank_approval_status)}` : null,
+              status_notes ? `Remarks: ${status_notes}` : null,
+            ]
+              .filter(Boolean)
+              .join('\n'),
           },
-        }).catch(() => {});
+        }).catch((err) => console.warn('[stage-notify]', err?.message || err));
       }
 
       const shouldNotifyCustomer =
@@ -1109,6 +1347,13 @@ loanApplicationsRouter.get('/:id/summary-pdf', authenticate, async (req, res, ne
       const safeNumber = String(row.application_number || row.id).replace(/[^\w-]/g, '_');
       const fileName = `${safeNumber}.pdf`;
       writeFileSync(resolve(packageDir, fileName), pdf);
+      const { putDbObject } = await import('../lib/storage/dbProvider.js');
+      await putDbObject({
+        key: `application-packages/${fileName}`,
+        buffer: Buffer.from(pdf),
+        mimeType: 'application/pdf',
+        originalName: fileName,
+      }).catch((err) => console.warn('[application-pdf] durable copy failed:', err.message));
       const publicPath = `/uploads/application-packages/${fileName}`;
       const merged = {
         ...data,

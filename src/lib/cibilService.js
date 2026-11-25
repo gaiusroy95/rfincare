@@ -4,6 +4,7 @@ import { buildSimpleTextPdf } from './simplePdf.js';
 import { ensureMilestone4Schema } from '../db/ensureMilestone4Schema.js';
 import { storeCibilReportPdf } from './cibilReportStore.js';
 import {
+  getSurepassConfig,
   getSurepassTokenInfo,
   requestSurepassCibilPdf,
   saveCibilPdfBuffer,
@@ -20,7 +21,8 @@ const VENDOR_KEYS = ['transunion_cibil', 'experian', 'equifax', 'crif_high_mark'
  * - Customer dashboard, agent check, application submit → Experian (score + PDF)
  */
 export const BUREAU_FOR = {
-  guest: 'experian',
+  // Homepage "Check free CIBIL score" uses TransUnion CIBIL (client decision 2026-11-25).
+  guest: 'transunion_cibil',
   staff: 'transunion_cibil',
   customer: 'experian',
   agent: 'experian',
@@ -77,13 +79,17 @@ export async function listCibilVendors() {
   await ensureMilestone4Schema();
   const pool = getPool();
   const [rows] = await pool.execute(
-    `SELECT vendor_key, display_name, sandbox_mode, is_active,
+    `SELECT vendor_key, display_name, sandbox_mode, is_active, api_key,
             CASE WHEN api_key IS NOT NULL AND api_key != '' THEN 1 ELSE 0 END AS has_key,
             updated_at
      FROM cibil_vendors ORDER BY vendor_key`,
   );
-  const tokenInfo = getSurepassTokenInfo();
-  return rows.map((r) => ({
+  return rows.map((r) => {
+    // Token actually used for this vendor (a valid key saved here wins over an expired env token).
+    const tokenInfo = ['transunion_cibil', 'experian'].includes(r.vendor_key)
+      ? getSurepassConfig(r).tokenInfo || {}
+      : getSurepassTokenInfo();
+    return {
     vendorKey: r.vendor_key,
     displayName: r.display_name,
     sandboxMode: Boolean(r.sandbox_mode),
@@ -103,7 +109,8 @@ export async function listCibilVendors() {
         }
       : null,
     updatedAt: r.updated_at,
-  }));
+    };
+  });
 }
 
 export async function updateCibilVendor(vendorKey, payload, updatedBy) {
@@ -701,7 +708,7 @@ export async function getCibilCheckInitiator(checkId) {
 }
 
 /**
- * Guest / homepage credit check — Experian only (score + PDF report).
+ * Guest / homepage credit check — TransUnion CIBIL via BUREAU_FOR.guest (score + PDF report).
  * Captures demographics, stores lead, returns score + download URL.
  */
 export async function pullCibilForGuest(demographics, { upsertLead } = {}) {
@@ -771,7 +778,7 @@ export async function pullCibilForGuest(demographics, { upsertLead } = {}) {
               sandboxMode: useSandbox,
               reportPath: result.reportPath || null,
               pdfUrl: result.pdfUrl || null,
-              pullRule: 'guest_experian',
+              pullRule: `guest_${vendor?.vendor_key || 'bureau'}`,
               attempts,
               checkedAt: new Date().toISOString(),
             },
@@ -802,7 +809,7 @@ export async function pullCibilForGuest(demographics, { upsertLead } = {}) {
     reportPath: result.reportPath || null,
     reportUrl: downloadUrl,
     pdfUrl: downloadUrl,
-    pullRule: 'guest_experian',
+    pullRule: `guest_${vendor?.vendor_key || 'bureau'}`,
     checkedAt: new Date().toISOString(),
   };
 }

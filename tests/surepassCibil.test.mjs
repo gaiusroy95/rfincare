@@ -112,3 +112,25 @@ test('custom gateway base URL is kept', () => {
     },
   );
 });
+
+function expiredToken(identity) {
+  const claims = { identity, exp: Math.floor(Date.now() / 1000) - 86400 };
+  return ['h', Buffer.from(JSON.stringify(claims)).toString('base64url'), 's'].join('.');
+}
+
+test('valid production key saved in Admin wins over an expired sandbox server token', () => {
+  const adminKey = fakeToken('rfincare_1@surepass.io');
+  withEnv({ SUREPASS_TOKEN: expiredToken('dev.rfincare_1@surepass.io') }, () => {
+    const cfg = getSurepassConfig({ vendor_key: 'transunion_cibil', api_key: adminKey });
+    assert.equal(cfg.token, adminKey);
+    assert.equal(cfg.baseUrl, PRODUCTION);
+    assert.equal(cfg.sandbox, false);
+  });
+});
+
+test('valid server token is kept when no admin key is saved', () => {
+  const serverToken = fakeToken('rfincare_1@surepass.io');
+  withEnv({ SUREPASS_TOKEN: serverToken }, () => {
+    assert.equal(getSurepassConfig({ vendor_key: 'experian' }).token, serverToken);
+  });
+});

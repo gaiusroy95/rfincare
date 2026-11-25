@@ -1,15 +1,24 @@
-import { unlink } from 'node:fs/promises';
+import { executeIgnoringMissing } from '../db/transaction.js';
 
 /**
  * Hard-delete loan applications and all dependent rows.
- * Safe on older schemas: missing tables are ignored.
+ * Safe on older schemas: missing tables are ignored (transaction-safe via SAVEPOINT).
  */
 async function deleteIfExists(pool, sql, params) {
+  await executeIgnoringMissing(pool, sql, params);
+}
+
+/** Remove stored document files (disk + durable Postgres copy). Best-effort. */
+export async function deleteApplicationFiles(filePaths = []) {
+  const paths = [...new Set((filePaths || []).filter((p) => p && !String(p).startsWith('http')))];
+  if (!paths.length) return;
   try {
-    await pool.execute(sql, params);
-  } catch (err) {
-    if (err?.code === '42P01' || err?.code === '42703') return;
-    throw err;
+    const { deleteStoredFile } = await import('./storage/index.js');
+    for (const path of paths) {
+      await deleteStoredFile(path).catch(() => {});
+    }
+  } catch {
+    /* storage cleanup is best-effort */
   }
 }
 
@@ -25,24 +34,15 @@ export async function hardDeleteApplications(pool, applicationIds) {
   });
   const inClause = placeholders.join(', ');
 
-  // Remove uploaded files from disk when paths are local.
-  try {
-    const [docs] = await pool.execute(
-      `SELECT id, file_path, document_url FROM customer_documents WHERE application_id IN (${inClause})`,
-      params,
-    );
-    for (const doc of docs || []) {
-      for (const path of [doc.file_path, doc.document_url]) {
-        if (!path || String(path).startsWith('http')) continue;
-        try {
-          await unlink(path);
-        } catch {
-          /* file may already be gone */
-        }
-      }
-    }
-  } catch (err) {
-    if (err?.code !== '42P01' && err?.code !== '42703') throw err;
+  // Collect stored files; they are removed after the rows (after COMMIT for transactions).
+  const filePaths = [];
+  const docsResult = await executeIgnoringMissing(
+    pool,
+    `SELECT id, file_path FROM customer_documents WHERE application_id IN (${inClause})`,
+    params,
+  );
+  for (const doc of docsResult?.[0] || []) {
+    if (doc.file_path) filePaths.push(doc.file_path);
   }
 
   await deleteIfExists(pool, `DELETE FROM customer_documents WHERE application_id IN (${inClause})`, params);
@@ -77,7 +77,11 @@ export async function hardDeleteApplications(pool, applicationIds) {
     params,
   );
 
-  return { deleted: result.affectedRows ?? ids.length };
+  // Outside a transaction the rows are already gone — remove the files now. Inside one,
+  // the caller removes them after COMMIT (see `filePaths`).
+  if (!pool?.inTransaction) await deleteApplicationFiles(filePaths);
+
+  return { deleted: result.affectedRows ?? ids.length, filePaths };
 }
 
 export async function listApplicationIdsForCustomer(pool, customerId) {

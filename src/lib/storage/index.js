@@ -17,6 +17,13 @@ import {
   s3ObjectExists,
 } from './s3Provider.js';
 import { normalizeStorageKey, toStoredPath } from './keys.js';
+import {
+  dbObjectExists,
+  deleteDbObject,
+  getDbObjectStream,
+  isDbUploadStoreEnabled,
+  putDbObject,
+} from './dbProvider.js';
 import { getUploadDir } from '../uploadPaths.js';
 
 export { getStorageProviderName, isCloudStorage, getS3Config, isEphemeralUploadHost } from './config.js';
@@ -33,7 +40,12 @@ export async function saveUploadedFile({ buffer, originalName, folder = '', mime
   if (isCloudStorage()) {
     return putS3Object({ buffer, originalName, folder, mimeType });
   }
-  return putLocalObject({ buffer, originalName, folder, mimeType });
+  const saved = await putLocalObject({ buffer, originalName, folder, mimeType });
+  if (isDbUploadStoreEnabled()) {
+    // Durable copy: local disk on Render/Cloud Run is wiped on restart.
+    await putDbObject({ key: saved.key, buffer, mimeType, originalName });
+  }
+  return saved;
 }
 
 /** Open a readable stream for a stored object (local disk or S3). */
@@ -48,7 +60,16 @@ export async function openStoredFile(storedPath) {
     if (local?.stream) return local;
     return null;
   }
-  return getLocalObjectStream(key);
+  const local = await getLocalObjectStream(key);
+  if (local?.stream) {
+    // Disk copy has no type information; infer it from the extension for inline previews.
+    if (!local.contentType || local.contentType === 'application/octet-stream') {
+      const { guessMimeType } = await import('./dbProvider.js');
+      local.contentType = guessMimeType(key);
+    }
+    return local;
+  }
+  return getDbObjectStream(key);
 }
 
 /** Public or app-relative URL for previews and API responses. */
@@ -69,7 +90,8 @@ export async function storedFileExists(storedPath) {
     if (await s3ObjectExists(key)) return true;
     return localObjectExists(key);
   }
-  return localObjectExists(key);
+  if (localObjectExists(key)) return true;
+  return dbObjectExists(key);
 }
 
 /** Upload roots a stored file may live under (multer routes resolve UPLOAD_DIR from cwd). */
@@ -127,6 +149,10 @@ export async function deleteStoredFile(...storedPaths) {
     for (const key of keys) {
       if (await deleteS3Object(key)) removed.push(`s3:${key}`);
     }
+  } else {
+    for (const key of keys) {
+      if (await deleteDbObject(key)) removed.push(`db:${key}`);
+    }
   }
 
   return removed;
@@ -138,10 +164,11 @@ export function getStorageArchitecture() {
     provider: getStorageProviderName(),
     cloud: isCloudStorage(),
     ephemeralHost: isEphemeralUploadHost(),
-    durable: isCloudStorage() || !isEphemeralUploadHost(),
+    durable: isCloudStorage() || !isEphemeralUploadHost() || isDbUploadStoreEnabled(),
+    databaseCopy: !isCloudStorage() && isDbUploadStoreEnabled(),
     bucket: isCloudStorage() ? process.env.S3_BUCKET || null : null,
     warning:
-      !isCloudStorage() && isEphemeralUploadHost()
+      !isCloudStorage() && isEphemeralUploadHost() && !isDbUploadStoreEnabled()
         ? 'Local disk on ephemeral host — set STORAGE_PROVIDER=s3 or documents will vanish after restart'
         : null,
   };

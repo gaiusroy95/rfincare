@@ -50,7 +50,7 @@ export async function getCustomerCreditProfile(customerId, email) {
        WHERE cc.customer_id = :id
          AND cc.status = 'success'
          AND cc.credit_score IS NOT NULL
-         AND cc.vendor_key = 'experian'
+         AND cc.vendor_key IN ('experian', 'transunion_cibil')
          AND COALESCE(cc.response_payload->>'localFallback', 'false') <> 'true'
        ORDER BY cc.checked_at DESC
        LIMIT 1`,

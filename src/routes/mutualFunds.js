@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { mkdirSync } from 'node:fs';
 import { extname } from 'node:path';
 import multer from 'multer';
+import { persistDiskUploadsToDb } from '../lib/multerUpload.js';
 import { z } from 'zod';
 
 import { getPool } from '../db/pool.js';
@@ -387,7 +388,7 @@ mutualFundsRouter.put('/:id', authenticate, authorize({ resource: 'banks', actio
   }
 });
 
-mutualFundsRouter.post('/:id/logo', authenticate, authorize({ resource: 'banks', action: 'update' }), wrapMulter(logoUpload.single('logo')), async (req, res, next) => {
+mutualFundsRouter.post('/:id/logo', authenticate, authorize({ resource: 'banks', action: 'update' }), wrapMulter(logoUpload.single('logo')), persistDiskUploadsToDb(), async (req, res, next) => {
   try {
     await ensureMutualFundSchema();
     if (!req.file) return res.status(400).json({ error: 'Logo image file is required (field name: logo)' });
